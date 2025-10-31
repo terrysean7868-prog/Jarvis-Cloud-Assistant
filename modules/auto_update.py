@@ -1,131 +1,98 @@
 # modules/auto_update.py
-DESCRIPTION = 'AI-powered self-updater: create or update modules via Telegram or voice.'
+import os, openai, logging, importlib, sys
+from utils.auto_sync import git_commit_and_push
 
-def register(dp, services, scheduler):
-    from telegram.ext import CommandHandler
-    import os, openai
-    from utils.auto_sync import git_commit_and_push
+logger = logging.getLogger("jarvis.auto_update")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    if not OPENAI_API_KEY:
-        print("⚠️ OPENAI_API_KEY not set — AI module generation disabled.")
-        return
+MODULES_DIR = os.path.join(os.path.dirname(__file__))
 
-    openai.api_key = OPENAI_API_KEY
-
-    def generate_module_code(prompt):
-        """Generate module code using OpenAI."""
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a Jarvis AI assistant that writes clean Telegram bot modules."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3
-        )
-        return response.choices[0].message["content"]
-
-    def write_module_file(name, code):
-        """Write AI-generated module to /modules."""
-        safe_name = name.lower().replace(' ', '_')
-        path = f"modules/{safe_name}.py"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(code)
-        return path
-
-    # --- Manual /addmodule command ---
-    def add_module(update, context):
-        if not context.args:
-            update.message.reply_text("Usage: /addmodule <name> <short description>")
-            return
-        name = context.args[0]
-        desc = " ".join(context.args[1:]) or "AI-generated Jarvis module."
-        update.message.reply_text(f"🧠 Generating new module: {name}...")
-
-        prompt = f"Create a Jarvis Telegram bot module named '{name}'. Description: {desc}. Include DESCRIPTION and register(dp, services, scheduler)."
-        code = generate_module_code(prompt)
-        path = write_module_file(name, code)
-        update.message.reply_text(f"✅ Module {name} created successfully.")
-
-        success, msg = git_commit_and_push(path, f"Added module {name}")
-        update.message.reply_text(f"🔄 {msg}" if success else f"❌ {msg}")
-
-    # --- Manual /updatemodule command ---
-    def update_module(update, context):
-        if not context.args:
-            update.message.reply_text("Usage: /updatemodule <name> <update description>")
-            return
-        name = context.args[0]
-        desc = " ".join(context.args[1:]) or "Improve existing module."
-        fname = f"modules/{name.lower().replace(' ', '_')}.py"
-
-        if not os.path.exists(fname):
-            update.message.reply_text(f"⚠️ Module '{name}' not found.")
-            return
-
-        with open(fname, "r", encoding="utf-8") as f:
-            old_code = f.read()
-
-        prompt = f"Improve this Jarvis Telegram module named '{name}' based on: {desc}. Keep the same register(dp, services, scheduler) function.\n\n{old_code}"
-        code = generate_module_code(prompt)
-
-        with open(fname, "w", encoding="utf-8") as f:
-            f.write(code)
-
-        update.message.reply_text(f"✅ Module {name} updated.")
-        success, msg = git_commit_and_push(fname, f"Updated module {name}")
-        update.message.reply_text(f"🔄 {msg}" if success else f"❌ {msg}")
-
-    dp.add_handler(CommandHandler("addmodule", add_module))
-    dp.add_handler(CommandHandler("updatemodule", update_module))
-
-# --- Voice helpers for voice.py ---
-def create_module_from_voice(update, module_name):
-    import os, openai
-    from utils.auto_sync import git_commit_and_push
-
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    prompt = f"Create a Jarvis Telegram bot module named '{module_name}'. Include DESCRIPTION and register(dp, services, scheduler)."
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
-    )
-    code = response.choices[0].message["content"]
-    safe_name = module_name.lower().replace(' ', '_')
-    path = f"modules/{safe_name}.py"
+def _write_module_file(module_name, code):
+    safe_name = module_name.lower().replace(" ", "_")
+    path = os.path.join(MODULES_DIR, f"{safe_name}.py")
     with open(path, "w", encoding="utf-8") as f:
         f.write(code)
-    update.message.reply_text(f"✅ Module {module_name} created successfully.")
-    success, msg = git_commit_and_push(path, f"Added module {module_name} (via voice)")
-    update.message.reply_text(f"🔄 {msg}" if success else f"❌ {msg}")
+    return path
+
+def _generate_module_code(module_name, instruction):
+    prompt = f"""
+You are an expert Python developer.
+Generate a Telegram-compatible Jarvis module for '{module_name}'.
+
+Each module must:
+- define DESCRIPTION (string)
+- define register(dp, services, scheduler)
+- use clean, production-safe Python
+- never include secrets or hardcoded tokens
+- respond with meaningful messages
+
+The purpose of this module is: {instruction}
+    """
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.5,
+    )
+    return resp.choices[0].message.content
+
+
+def _reload_module(module_name, update):
+    """Reload or import a module dynamically."""
+    safe_name = module_name.lower().replace(" ", "_")
+    try:
+        if safe_name in sys.modules:
+            importlib.reload(sys.modules[safe_name])
+        else:
+            sys.path.insert(0, MODULES_DIR)
+            importlib.import_module(safe_name)
+        update.message.reply_text(f"♻️ Module '{module_name}' reloaded successfully.")
+    except Exception as e:
+        update.message.reply_text(f"⚠️ Reload failed for {module_name}: {e}")
+        logger.exception(e)
+
+
+def create_module_from_voice(update, module_name):
+    update.message.reply_text(f"🧠 Generating new module: {module_name}")
+    try:
+        code = _generate_module_code(module_name, f"Create a new Jarvis feature named {module_name}.")
+        path = _write_module_file(module_name, code)
+        success, msg = git_commit_and_push(path, f"Add new module: {module_name}")
+        update.message.reply_text(f"✅ Module '{module_name}' created and synced.\n{msg}")
+        _reload_module(module_name, update)
+    except Exception as e:
+        logger.exception(e)
+        update.message.reply_text(f"❌ Failed to create module: {e}")
+
 
 def update_module_from_voice(update, module_name):
-    import os, openai
-    from utils.auto_sync import git_commit_and_push
-
-    safe_name = module_name.lower().replace(' ', '_')
-    path = f"modules/{safe_name}.py"
-
+    safe_name = module_name.lower().replace(" ", "_")
+    path = os.path.join(MODULES_DIR, f"{safe_name}.py")
     if not os.path.exists(path):
-        update.message.reply_text(f"⚠️ Module {module_name} not found.")
+        update.message.reply_text(f"⚠️ Module '{module_name}' not found.")
         return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing_code = f.read()
 
-    with open(path, "r", encoding="utf-8") as f:
-        old_code = f.read()
+        prompt = f"""
+Improve and refactor this Jarvis module code while keeping its purpose same.
+File name: {module_name}
+Existing code:
+{existing_code}
+        """
 
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    prompt = f"Improve this Jarvis Telegram bot module named '{module_name}'. Keep the same function structure.\n\n{old_code}"
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
-    )
-    code = response.choices[0].message["content"]
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+        )
+        new_code = resp.choices[0].message.content
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_code)
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(code)
-
-    update.message.reply_text(f"✅ Module {module_name} updated successfully.")
-    success, msg = git_commit_and_push(path, f"Updated module {module_name} (via voice)")
-    update.message.reply_text(f"🔄 {msg}" if success else f"❌ {msg}")
+        success, msg = git_commit_and_push(path, f"Update module: {module_name}")
+        update.message.reply_text(f"✅ Module '{module_name}' updated and synced.\n{msg}")
+        _reload_module(module_name, update)
+    except Exception as e:
+        logger.exception(e)
+        update.message.reply_text(f"❌ Failed to update module: {e}")
