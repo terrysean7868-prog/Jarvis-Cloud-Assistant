@@ -1,3 +1,4 @@
+# module/note.py
 DESCRIPTION = 'Save quick notes to MongoDB or sqlite'
 
 def register(dp, services, scheduler):
