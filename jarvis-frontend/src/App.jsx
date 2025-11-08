@@ -329,7 +329,7 @@ export default function App() {
     };
 
     utterance.onerror = (event) => {
-      console.error("Speech error:", event.error);
+      console.log("Speech error");
       setStatus("listening");
     };
 
