@@ -1,119 +1,126 @@
-:root {
-  --bg: #000;
-  --green: #00ffcc;
-  --violet: #5c04ba;
-  --dark-metal: #111;
-}
-
-html, body, #root {
-  height: 100%;
+body, html {
   margin: 0;
-  background: radial-gradient(circle at 50% 30%, #040404 0%, #000 100%);
-  color: white;
-  font-family: "Orbitron", sans-serif;
+  height: 100%;
+  background: radial-gradient(circle at center, #000000 60%, #050505 100%);
+  color: #e0e0e0;
+  font-family: 'Orbitron', sans-serif;
+  overflow: hidden;
 }
 
 .app-root {
-  height: 100vh;
   display: flex;
   justify-content: center;
   align-items: center;
+  height: 100%;
 }
 
 .card {
-  position: relative;
-  text-align: center;
-  width: 90%;
-  max-width: 800px;
-  background: rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(92, 4, 186, 0.2);
+  background: rgba(15, 15, 15, 0.9);
+  border: 2px solid #5c04ba;
   border-radius: 20px;
-  padding: 30px;
-  box-shadow: 0 0 30px rgba(92, 4, 186, 0.3);
-  backdrop-filter: blur(6px);
+  width: 90%;
+  max-width: 700px;
+  height: 80%;
+  box-shadow: 0 0 40px rgba(92, 4, 186, 0.4);
+  position: relative;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
-/* ---- 3D suit ---- */
+.title {
+  text-align: center;
+  color: #5c04ba;
+  font-size: 2rem;
+  letter-spacing: 2px;
+  text-shadow: 0 0 15px #5c04ba;
+  margin-top: 10px;
+}
+
+.chat {
+  flex: 1;
+  overflow-y: auto;
+  width: 100%;
+  padding: 10px;
+  margin-top: 15px;
+}
+
+.msg {
+  margin: 8px 0;
+}
+
+.msg.jarvis .bubble {
+  background: rgba(92, 4, 186, 0.2);
+  border-left: 3px solid #5c04ba;
+  color: #d7c6ff;
+}
+
+.msg.you .bubble {
+  background: rgba(2, 166, 51, 0.2);
+  border-right: 3px solid #02a633;
+  text-align: right;
+  color: #b2ffb2;
+}
+
+.bubble {
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 1rem;
+  display: inline-block;
+}
+
+.who {
+  font-size: 0.75rem;
+  opacity: 0.6;
+  margin-bottom: 3px;
+}
+
+.hint {
+  margin-top: 10px;
+  color: #02a633;
+  font-size: 0.9rem;
+  text-align: center;
+}
+
 .suit3d {
   position: relative;
-  width: 280px;
-  height: 280px;
-  margin: 0 auto 30px;
-  filter: drop-shadow(0 0 30px rgba(92,4,186,0.3));
+  width: 160px;
+  height: 160px;
+  margin-top: 10px;
+  animation: float 4s ease-in-out infinite;
 }
 
-.helmet {
-  position: absolute;
-  top: 0;
-  left: 50%;
-  width: 120px;
-  height: 90px;
-  transform: translateX(-50%);
-  background: radial-gradient(circle at 50% 20%, #2a1a2a, #090009 80%);
-  border-radius: 80% 80% 60% 60% / 80% 80% 30% 30%;
-  box-shadow: inset 0 0 20px rgba(92, 4, 186, 0.4),
-              0 0 25px rgba(92,4,186,0.3);
-}
-
-.helmet::after {
-  content: "";
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 80px;
-  height: 12px;
-  transform: translate(-50%, -50%);
-  border-radius: 8px;
-  background: linear-gradient(90deg, #00ffcc, #02a633);
-  box-shadow: 0 0 15px #00ffcc;
-}
-
-/* shoulders / chest plating */
-.shoulders {
-  position: absolute;
-  top: 80px;
-  left: 50%;
-  width: 240px;
-  height: 120px;
-  transform: translateX(-50%);
-  background: radial-gradient(circle at 50% 40%, #160016, #070008 80%);
-  border-radius: 50% / 60%;
-  box-shadow: inset 0 0 40px rgba(92,4,186,0.6),
-              0 0 50px rgba(92,4,186,0.3);
-}
-
-/* Arc reactor (center) */
 .reactor {
   position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
   bottom: 0;
-  left: 50%;
-  transform: translateX(-50%) translateY(30%);
-  width: 110px;
-  height: 110px;
   display: flex;
-  align-items: center;
   justify-content: center;
-}
-
-.reactor-core {
-  width: 50px;
-  height: 50px;
-  border-radius: 50%;
-  background: radial-gradient(circle, #00ffcc 0%, #008877 70%, #001111 100%);
-  box-shadow: 0 0 30px #00ffcc, 0 0 80px #00ffcc;
+  align-items: center;
 }
 
 .reactor-ring {
-  position: absolute;
-  width: 90px;
-  height: 90px;
-  border: 3px solid rgba(0,255,204,0.4);
+  width: 140px;
+  height: 140px;
+  border: 4px solid #5c04ba;
   border-radius: 50%;
-  animation: spin 5s linear infinite;
+  box-shadow: 0 0 20px #5c04ba, inset 0 0 25px #5c04ba;
+  animation: spin 6s linear infinite;
 }
 
-.reactor.pulsing .reactor-core {
-  animation: pulse 1.5s ease-in-out infinite;
+.reactor-core {
+  width: 60px;
+  height: 60px;
+  background: radial-gradient(circle, #02a633 0%, #003a10 70%);
+  border-radius: 50%;
+  box-shadow: 0 0 25px #02a633, 0 0 60px #02a633;
+}
+
+.pulsing .reactor-core {
+  animation: pulse 1s ease-in-out infinite;
 }
 
 @keyframes spin {
@@ -122,53 +129,16 @@ html, body, #root {
 }
 
 @keyframes pulse {
-  0%,100% { transform: scale(1); box-shadow: 0 0 40px #00ffcc, 0 0 100px #00ffcc; }
-  50% { transform: scale(1.2); box-shadow: 0 0 60px #00ffcc, 0 0 140px #00ffcc; }
+  0%, 100% { box-shadow: 0 0 25px #02a633, 0 0 60px #02a633; }
+  50% { box-shadow: 0 0 45px #02a633, 0 0 90px #02a633; }
 }
 
-.suit3d.speaking .reactor-core {
-  box-shadow: 0 0 80px #02a633, 0 0 160px #02a633;
-  filter: brightness(1.3);
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-6px); }
 }
 
-/* ---- Chat ---- */
-.chat {
-  margin-top: 10px;
-  text-align: left;
-  max-height: 300px;
-  overflow-y: auto;
-  padding: 0 20px;
-}
-
-.msg {
-  margin: 8px 0;
-}
-
-.msg.you .bubble {
-  border-left: 3px solid var(--green);
-  background: rgba(0,255,204,0.05);
-}
-
-.msg.jarvis .bubble {
-  border-left: 3px solid var(--violet);
-  background: rgba(92,4,186,0.05);
-}
-
-.bubble {
-  padding: 10px 14px;
-  border-radius: 8px;
-  color: #e4fffa;
-  box-shadow: 0 0 10px rgba(92,4,186,0.15);
-}
-
-.title {
-  color: var(--violet);
-  margin: 10px 0;
-  letter-spacing: 2px;
-}
-
-.hint {
-  margin-top: 12px;
-  color: var(--violet);
-  font-size: 0.9rem;
+.interim .bubble {
+  opacity: 0.7;
+  font-style: italic;
 }
