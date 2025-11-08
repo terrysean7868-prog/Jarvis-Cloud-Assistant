@@ -31,3 +31,4 @@ voice.ogg
 voice.wav
 .DS_Store
 *.log
+.env

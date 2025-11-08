@@ -105,6 +105,9 @@ async def sync_repo():
 async def health():
     return {"status": "ok"}
 
+@app.get("/envcheck")
+async def envcheck():
+    return {"openai": bool(os.getenv("OPENAI_API_KEY"))}
 
 # =========================================================
 # 🕒 Startup Event
