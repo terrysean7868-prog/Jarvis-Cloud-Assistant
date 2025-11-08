@@ -1,404 +1,212 @@
 import React, { useEffect, useRef, useState } from "react";
+import { WebVoiceProcessor } from "@picovoice/web-voice-processor";
+import { PorcupineWorker } from "@picovoice/porcupine-web";
 import "./App.css";
 
-export default function App(){
+export default function App() {
   const [status, setStatus] = useState("initializing");
-  const [conversation, setConversation] = useState([{from:"jarvis", text:"Good morning. I am JARVIS. Always at your service. Say 'Hey Jarvis' to begin."}]);
+  const [conversation, setConversation] = useState([
+    { from: "jarvis", text: "Good morning. I am JARVIS. Always at your service. Say 'Jarvis' to begin." },
+  ]);
   const [interimText, setInterimText] = useState("");
+  const [ringActive, setRingActive] = useState(false);
+
   const recognitionRef = useRef(null);
   const listeningRef = useRef(false);
   const wakeWordDetectedRef = useRef(false);
   const commandBufferRef = useRef("");
 
+  // ---------- Backend ----------
   const sendToBackend = async (text) => {
     setStatus("thinking");
     setInterimText("");
     wakeWordDetectedRef.current = false;
-    
-    // Determine API endpoint
-    // For local dev: use proxy (package.json) or direct localhost
-    // For Render/production: use REACT_APP_API_URL
-    let apiEndpoint;
-    if (process.env.REACT_APP_API_URL) {
-      // Production/Render: use explicit URL
-      apiEndpoint = `${process.env.REACT_APP_API_URL}/api/chat`;
-    } else {
-      // Local dev: try proxy first, fallback to direct
-      // React proxy will handle /api/* routes automatically
-      apiEndpoint = "/api/chat";
-    }
-    
-    console.log("Sending request to:", apiEndpoint);
-    console.log("Backend URL:", process.env.REACT_APP_API_URL || "http://localhost:8000 (proxy)");
-    
+    const apiEndpoint = process.env.REACT_APP_API_URL
+      ? `${process.env.REACT_APP_API_URL}/api/chat`
+      : "/api/chat";
+
     try {
       const res = await fetch(apiEndpoint, {
-        method: "POST", 
-        headers: {"Content-Type": "application/json"}, 
-        body: JSON.stringify({text, mode: "chat", user: "user"})
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, mode: "chat", user: "user" }),
       });
-      
-      if (!res.ok) {
-        throw new Error(`HTTP error! status: ${res.status}`);
-      }
-      
+      if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+
       const data = await res.json();
-      const reply = data.text || "I apologize, I didn't understand that.";
-      
-      // Clean reply text (remove JSON actions if present)
+      const reply = data?.text || "I didn’t quite catch that, sir.";
       const cleanReply = reply.split(/\{[\s\S]*"actions"[\s\S]*\}/)[0].trim() || reply;
-      
-      setConversation(c=>[...c, {from:"jarvis", text: cleanReply}]);
+
+      setConversation((c) => [...c, { from: "jarvis", text: cleanReply }]);
       speak(cleanReply);
-      
-      // Show actions if any were taken
-      if (data.actions && data.actions.length > 0) {
-        const actionSummary = `✅ Executed ${data.actions.length} action(s)`;
-        setConversation(c=>[...c, {from:"jarvis", text: actionSummary, type: "system"}]);
-      }
-      
-    } catch (e) {
-      console.error("Backend error:", e);
-      console.error("Error details:", e.message);
-      
-      // More helpful error message
-      let errorMsg = "I'm sorry, I'm having trouble connecting to the server. ";
-      if (e.message.includes("Failed to fetch") || e.message.includes("NetworkError")) {
-        errorMsg += "Please make sure the backend is running on http://localhost:8000";
-      } else {
-        errorMsg += `Error: ${e.message}`;
-      }
-      
-      setConversation(c=>[...c, {from:"jarvis", text: errorMsg}]);
-      speak(errorMsg);
-    } finally { 
+    } catch (err) {
+      console.error("Backend error:", err);
+      const msg = "I encountered a network issue, but I’m still here.";
+      setConversation((c) => [...c, { from: "jarvis", text: msg }]);
+      speak(msg);
+      setStatus("listening");
+      restartRecognition();
+    } finally {
       setStatus("listening");
     }
   };
 
+  const restartRecognition = (delay = 250) => {
+    try { recognitionRef.current?.stop(); } catch {}
+    setTimeout(() => {
+      try { recognitionRef.current?.start(); } catch {}
+    }, delay);
+  };
+
+  // ---------- Wakeword (Porcupine) ----------
+  useEffect(() => {
+    async function initWakeword() {
+      try {
+        setStatus("loading wakeword");
+        const modelResp = await fetch(process.env.PUBLIC_URL + "/wakeword/jarvis_wasm.ppn");
+        const modelBuffer = await modelResp.arrayBuffer();
+
+        const porcupineWorker = await PorcupineWorker.create(
+          [
+            { custom: modelBuffer, label: "jarvis", sensitivity: 0.6 },
+          ],
+          (keywordIndex) => {
+            if (keywordIndex >= 0) {
+              console.log("Wakeword detected: Jarvis");
+              playActivationSound();
+              wakeWordDetectedRef.current = true;
+              setRingActive(true);
+              setTimeout(() => setRingActive(false), 2000);
+              setStatus("activated");
+              setConversation((c) => [...c, { from: "jarvis", text: "Yes sir, I’m listening..." }]);
+              speak("Yes sir, I’m listening...");
+            }
+          }
+        );
+
+        await WebVoiceProcessor.subscribe(porcupineWorker);
+        await WebVoiceProcessor.start();
+        setStatus("listening");
+        console.log("Porcupine ready");
+      } catch (err) {
+        console.error("Wakeword init failed:", err);
+        setStatus("error");
+      }
+    }
+
+    initWakeword();
+    return () => { WebVoiceProcessor.stop().catch(() => {}); };
+  }, []);
+
+  // ---------- Speech Recognition ----------
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if(!SpeechRecognition){ 
+    if (!SpeechRecognition) {
+      setConversation((c) => [
+        ...c,
+        { from: "jarvis", text: "Your browser does not support Web Speech API." },
+      ]);
       setStatus("no-speech-api");
-      setConversation(c=>[...c, {from:"jarvis", text:"Error: Your browser does not support the Web Speech API. Please use Chrome or Edge."}]);
-      return; 
+      return;
     }
-    
+
     const rec = new SpeechRecognition();
     rec.lang = "en-US";
     rec.interimResults = true;
     rec.continuous = true;
-    rec.maxAlternatives = 3; // Increased for better accuracy
-    
-    rec.onstart = () => { 
-      listeningRef.current = true;
-      setStatus("listening");
-      console.log("🎤 Voice recognition started");
+
+    rec.onstart = () => { listeningRef.current = true; setStatus("listening"); };
+    rec.onerror = (e) => {
+      console.error("Speech error:", e);
+      if (["no-speech", "aborted"].includes(e.error)) return;
+      setStatus("error");
+      restartRecognition();
     };
-    
-    rec.onerror = (e) => { 
-      console.error("Speech recognition error:", e);
-      if(e.error === "no-speech") {
-        // Normal case, just continue
-        return;
-      } else if(e.error === "audio-capture") {
-        setStatus("no-microphone");
-        setConversation(c=>[...c, {from:"jarvis", text:"Error: No microphone detected. Please check your microphone permissions."}]);
-      } else if(e.error === "not-allowed") {
-        setStatus("permission-denied");
-        setConversation(c=>[...c, {from:"jarvis", text:"Error: Microphone permission denied. Please allow microphone access."}]);
-      } else {
-        setStatus("error");
-      }
-    };
-    
     rec.onresult = (e) => {
-      let fullTranscript = "";
-      let hasFinal = false;
-      
-      // Process all results
+      let finalText = "";
       for (let i = e.resultIndex; i < e.results.length; ++i) {
-        const result = e.results[i];
-        const transcript = result[0].transcript.trim();
-        
-        if (result.isFinal) {
-          hasFinal = true;
-          fullTranscript += " " + transcript;
-        } else {
-          // Show interim results for better UX
-          setInterimText(transcript);
-        }
+        const r = e.results[i];
+        const t = r[0].transcript.trim();
+        if (r.isFinal) finalText += " " + t;
+        else setInterimText(t);
       }
-      
-      if (hasFinal && fullTranscript) {
-        const text = fullTranscript.trim().toLowerCase();
+      if (finalText.trim()) {
+        const text = finalText.toLowerCase();
         commandBufferRef.current += " " + text;
-        
-        // Check for wake word variations
-        const wakeWords = ["hey jarvis", "hey jarvis", "jarvis", "activate jarvis"];
-        let wakeWordFound = null;
-        let wakeWordIndex = -1;
-        
-        for (const wakeWord of wakeWords) {
-          const index = commandBufferRef.current.toLowerCase().indexOf(wakeWord);
-          if (index !== -1) {
-            wakeWordFound = wakeWord;
-            wakeWordIndex = index;
-            break;
-          }
+        if (wakeWordDetectedRef.current) {
+          wakeWordDetectedRef.current = false;
+          setConversation((c) => [...c, { from: "you", text }]);
+          sendToBackend(text);
         }
-        
-        if (wakeWordFound) {
-          // Wake word detected!
-          wakeWordDetectedRef.current = true;
-          setStatus("activated");
-          
-          // Extract command after wake word
-          const afterWakeWord = commandBufferRef.current.substring(wakeWordIndex + wakeWordFound.length).trim();
-          
-          if (afterWakeWord) {
-            // Play activation sound (optional beep)
-            playActivationSound();
-            setConversation(c=>[...c, {from:"you", text: afterWakeWord}]);
-            sendToBackend(afterWakeWord);
-            commandBufferRef.current = "";
-            wakeWordDetectedRef.current = false;
-          } else {
-            // Wake word detected but no command yet
-            playActivationSound();
-            setStatus("ready");
-            setConversation(c=>[...c, {from:"jarvis", text:"Yes, sir? I'm listening..."}]);
-            speak("Yes, sir? I'm listening.");
-            commandBufferRef.current = "";
-          }
-        } else {
-          // No wake word, but if we're in activated state, treat as command
-          if (wakeWordDetectedRef.current && text.length > 2) {
-            sendToBackend(text);
-            commandBufferRef.current = "";
-            wakeWordDetectedRef.current = false;
-          }
-        }
-        
-        // Keep buffer manageable (last 50 words)
-        const words = commandBufferRef.current.split(" ");
-        if (words.length > 50) {
-          commandBufferRef.current = words.slice(-20).join(" ");
-        }
-        
         setInterimText("");
+        commandBufferRef.current = commandBufferRef.current.split(" ").slice(-20).join(" ");
       }
     };
-    
-    rec.onend = () => { 
-      listeningRef.current = false;
-      setStatus("idle");
-      setInterimText("");
-      
-      // Auto-restart for continuous listening
-      if (!wakeWordDetectedRef.current) {
-        setTimeout(() => {
-          try {
-            rec.start();
-            setStatus("listening");
-          } catch(e) {
-            console.warn("Failed to restart recognition:", e);
-          }
-        }, 300);
-      }
-    };
-    
+    rec.onend = () => { listeningRef.current = false; restartRecognition(); };
+
     recognitionRef.current = rec;
-    
-    // Request microphone permission and start
-    navigator.mediaDevices.getUserMedia({ audio: true })
-      .then(() => {
-        try { 
-          rec.start(); 
-          setStatus("listening");
-        } catch(e) { 
-          console.warn("Start failed:", e);
-          setStatus("error");
-        }
-      })
-      .catch((err) => {
-        console.error("Microphone permission denied:", err);
-        setStatus("permission-denied");
-      });
-    
-    return () => {
-      try {
-        rec.stop();
-      } catch(e) {
-        console.warn("Stop error:", e);
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    navigator.mediaDevices.getUserMedia({
+      audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true },
+    }).then(() => rec.start()).catch(() => setStatus("permission-denied"));
+
+    return () => { try { rec.stop(); } catch {} };
   }, []);
 
-  function playActivationSound() {
-    // Create a subtle beep sound
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    const oscillator = audioContext.createOscillator();
-    const gainNode = audioContext.createGain();
-    
-    oscillator.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-    
-    oscillator.frequency.value = 800;
-    oscillator.type = "sine";
-    
-    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.1);
-    
-    oscillator.start(audioContext.currentTime);
-    oscillator.stop(audioContext.currentTime + 0.1);
-  }
+  // ---------- Utilities ----------
+  const playActivationSound = () => {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = "sine"; osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
+    osc.start(); osc.stop(ctx.currentTime + 0.1);
+  };
 
-  function speak(text){
-    if(!window.speechSynthesis) {
-      console.warn("Speech synthesis not available");
-      return;
-    }
-    
-    // Cancel any ongoing speech
+  const speak = (text) => {
+    if (!window.speechSynthesis) return;
     window.speechSynthesis.cancel();
-    
-    // Clean text (remove markdown, code blocks, JSON, etc.)
-    let cleanText = text
-      .replace(/```[\s\S]*?```/g, "")  // Remove code blocks
-      .replace(/`[^`]+`/g, "")          // Remove inline code
-      .replace(/\{[\s\S]*"actions"[\s\S]*\}/g, "")  // Remove JSON actions
-      .replace(/\{[\s\S]*\}/g, "")      // Remove any remaining JSON
-      .replace(/\*\*(.*?)\*\*/g, "$1")  // Remove markdown bold
-      .replace(/\*(.*?)\*/g, "$1")      // Remove markdown italic
-      .replace(/#{1,6}\s/g, "")         // Remove markdown headers
-      .replace(/\[(.*?)\]\(.*?\)/g, "$1") // Remove markdown links
-      .replace(/\n+/g, ". ")            // Replace newlines with periods
-      .trim();
-    
-    if (!cleanText || cleanText.length < 2) {
-      console.log("No text to speak after cleaning");
-      return;
-    }
-    
-    // Ensure text ends with punctuation for natural speech
-    if (!/[.!?]$/.test(cleanText)) {
-      cleanText += ".";
-    }
-    
-    console.log("Speaking:", cleanText);
-    
-    const utterance = new SpeechSynthesisUtterance(cleanText);
-    utterance.rate = 0.95;  // Slightly slower for clarity
-    utterance.pitch = 1.0;
-    utterance.volume = 1.0;
-    utterance.lang = "en-US";
-    
-    // Try to find a good voice (prefer male, English voices)
-    const voices = window.speechSynthesis.getVoices();
-    let preferredVoice = voices.find(v => 
-      (v.name.toLowerCase().includes("google") && v.lang.startsWith("en")) ||
-      (v.name.toLowerCase().includes("microsoft david") && v.lang.startsWith("en")) ||
-      (v.name.toLowerCase().includes("microsoft mark") && v.lang.startsWith("en"))
-    );
-    
-    // Fallback to any English voice
-    if (!preferredVoice) {
-      preferredVoice = voices.find(v => v.lang.startsWith("en"));
-    }
-    
-    if (preferredVoice) {
-      utterance.voice = preferredVoice;
-      console.log("Using voice:", preferredVoice.name);
-    }
-    
-    // Event handlers
-    utterance.onstart = () => {
-      console.log("Speech started");
-      setStatus("speaking");
-    };
-    
-    utterance.onend = () => {
-      console.log("Speech ended");
-      setStatus("listening");
-    };
-    
-    utterance.onerror = (event) => {
-      console.error("Speech error:", event.error);
-      setStatus("listening");
-    };
-    
-    // Speak with a small delay to ensure previous speech is cancelled
-    setTimeout(() => {
-      try {
-        window.speechSynthesis.speak(utterance);
-      } catch (error) {
-        console.error("Error speaking:", error);
-        setStatus("listening");
-      }
-    }, 100);
-  }
-
-  // Load voices when available
-  useEffect(() => {
-    if (window.speechSynthesis) {
-      const loadVoices = () => {
-        window.speechSynthesis.getVoices();
-      };
-      loadVoices();
-      if (speechSynthesis.onvoiceschanged !== undefined) {
-        speechSynthesis.onvoiceschanged = loadVoices;
-      }
-    }
-  }, []);
+    const clean = text.replace(/```[\s\S]*?```/g, "").replace(/\n+/g, ". ").trim();
+    const u = new SpeechSynthesisUtterance(clean);
+    u.lang = "en-US"; u.rate = 0.95;
+    u.onstart = () => { setStatus("speaking"); recognitionRef.current?.stop(); };
+    u.onend = () => { setStatus("listening"); restartRecognition(); };
+    window.speechSynthesis.speak(u);
+  };
 
   const getStatusColor = () => {
-    switch(status) {
-      case "listening": return "#00ffc8"; // cyan green (JARVIS active)
-      case "activated": case "ready": return "#00d4ff"; // bright blue (activated)
-      case "thinking": return "#ff6b00"; // orange (processing)
-      case "speaking": return "#00d4ff"; // blue (speaking)
-      case "error": case "no-speech-api": case "permission-denied": return "#ff4444"; // red (error)
-      default: return "#6b7280"; // gray (idle)
+    switch (status) {
+      case "listening":
+      case "activated": return "#00ffc8";
+      case "thinking": return "#ff6b00";
+      case "speaking": return "#00d4ff";
+      case "error":
+      case "permission-denied": return "#ff4444";
+      default: return "#6b7280";
     }
   };
 
-  const isListeningState = status === "listening" || status === "activated" || status === "ready";
+  const isListeningState = ["listening", "activated"].includes(status);
 
+  // ---------- UI ----------
   return (
-    <div className={`container ${isListeningState ? 'listening' : ''}`}>
-      {/* Listening background circles */}
-      {isListeningState && (
-        <div className="listening-overlay">
-          <div className="listening-circle"></div>
-          <div className="listening-circle"></div>
-          <div className="listening-circle"></div>
-        </div>
-      )}
-      
+    <div className={`container ${isListeningState ? "listening" : ""}`}>
+      {ringActive && <div className="neon-ring"></div>}
       <div className="header">
         <h1>JARVIS</h1>
         <div className="status-indicator">
-          <div 
-            className="status-dot" 
-            style={{
-              backgroundColor: getStatusColor(),
-              color: getStatusColor()
-            }}
-          />
+          <div className="status-dot" style={{ backgroundColor: getStatusColor() }} />
           <span>{status.replace(/-/g, " ")}</span>
         </div>
       </div>
-      
+
       <div className="card">
         <div className="messages">
-          {conversation.map((m,i)=>(
+          {conversation.map((m, i) => (
             <div key={i} className={`message ${m.from}`}>
               <div className="message-label">{m.from === "you" ? "USER" : "JARVIS"}</div>
-              <div className={`message-bubble ${m.from}`}>
-                {m.text}
-              </div>
+              <div className={`message-bubble ${m.from}`}>{m.text}</div>
             </div>
           ))}
           {interimText && (
@@ -408,10 +216,9 @@ export default function App(){
             </div>
           )}
         </div>
-        
         <div className="instructions">
-          <strong>🎤 Voice Commands</strong>
-          <small>Say <strong>"Hey Jarvis"</strong> followed by your command</small>
+          <strong>🎤 Wake Word:</strong>
+          <small>Say <strong>"Jarvis"</strong> to wake me up — offline & always listening.</small>
         </div>
       </div>
     </div>
