@@ -26,7 +26,6 @@ venv.bak/
 *.db
 *.sqlite
 *.sqlite3
-jarvis_data.db
 voice.ogg
 voice.wav
 .DS_Store

@@ -1,17 +1,21 @@
 # app.py
 import os
 import asyncio
+import subprocess
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Depends, Header
+from dotenv import load_dotenv
 
 # === Core modules ===
 from llm_adapter import LLMAdapter
 from jarvis_brain import JarvisBrain
 from git_sync import GitSync
 from executor import ActionExecutor
+
 
 # =========================================================
 # 🚀 FastAPI Initialization
@@ -26,6 +30,8 @@ cors_origins = [
     "http://localhost:5173",  # Vite default port
     "https://jarvis-frontend.onrender.com",
 ]
+# Load environment variables
+load_dotenv()
 
 # Add environment variable-based origins (optional)
 if os.getenv("FRONTEND_URL"):
@@ -118,6 +124,72 @@ async def startup_event():
     if interval > 0:
         asyncio.create_task(git_sync.periodic_pull(interval=interval))
     print("✅ Jarvis server started")
+
+# 🧩 Get repository path and optional auth key from environment
+REPO_PATH = os.getenv("GIT_REPO_PATH", os.getcwd())
+SYNC_KEY = os.getenv("SYNC_KEY", "mysecretkey")
+
+def verify_key(x_api_key: str = Header(...)):
+    """Simple header-based auth for security."""
+    if x_api_key != SYNC_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
+
+def run_git_command(command: str):
+    """Safely run a Git command and return output or error."""
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPO_PATH,
+            shell=True,
+            text=True,
+            capture_output=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"Git error: {e.stderr.strip()}")
+
+@app.post("/sync_repo")
+def sync_repo(commit_message: str = "Auto-sync changes", authorized: bool = Depends(verify_key)):
+    """
+    Sync the local repository with GitHub:
+      1. Pull latest changes
+      2. Commit local changes (if any)
+      3. Push back to GitHub
+    """
+    try:
+        # 1️⃣ Pull from GitHub
+        pull_output = run_git_command("git pull origin main")
+
+        # 2️⃣ Add and commit local changes
+        run_git_command("git add .")
+        commit_process = subprocess.run(
+            f'git commit -m "{commit_message}"',
+            cwd=REPO_PATH,
+            shell=True,
+            text=True,
+            capture_output=True
+        )
+
+        if "nothing to commit" in commit_process.stdout.lower():
+            return {"status": "ok", "message": "Already up to date", "pull_output": pull_output}
+
+        # 3️⃣ Push updates
+        push_output = run_git_command("git push origin main")
+
+        return {
+            "status": "success",
+            "message": "Repository synced successfully",
+            "repo_path": REPO_PATH,
+            "pull_output": pull_output,
+            "commit_output": commit_process.stdout.strip(),
+            "push_output": push_output
+        }
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =========================================================
 # 🎨 Serve Frontend (React build)
