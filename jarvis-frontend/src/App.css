@@ -1,127 +1,174 @@
 :root {
-  --bg: #0f1724;
-  --muted: #6b7280;
-  --accent: #00ffc8;
-  --accent-bright: #00d4ff;
-  --danger: #ff6b6b;
-  --warn: #ff9f43;
-  --text: #e6eef8;
+  --bg: #000;
+  --green: #00ffcc;
+  --violet: #5c04ba;
+  --dark-metal: #111;
 }
 
 html, body, #root {
   height: 100%;
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: "Inter", sans-serif;
+  background: radial-gradient(circle at 50% 30%, #040404 0%, #000 100%);
+  color: white;
+  font-family: "Orbitron", sans-serif;
 }
 
-.container {
-  min-height: 100vh;
+.app-root {
+  height: 100vh;
   display: flex;
-  flex-direction: column;
-  padding: 20px;
-  position: relative;
-  overflow: hidden;
-}
-
-.header {
-  display: flex;
-  justify-content: space-between;
+  justify-content: center;
   align-items: center;
-}
-
-.status-indicator {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.status-dot {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
 }
 
 .card {
-  margin-top: 20px;
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 12px;
-  padding: 20px;
+  position: relative;
+  text-align: center;
+  width: 90%;
+  max-width: 800px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(92, 4, 186, 0.2);
+  border-radius: 20px;
+  padding: 30px;
+  box-shadow: 0 0 30px rgba(92, 4, 186, 0.3);
+  backdrop-filter: blur(6px);
 }
 
-.messages {
-  max-height: 65vh;
-  overflow-y: auto;
+/* ---- 3D suit ---- */
+.suit3d {
+  position: relative;
+  width: 280px;
+  height: 280px;
+  margin: 0 auto 30px;
+  filter: drop-shadow(0 0 30px rgba(92,4,186,0.3));
 }
 
-.message {
-  margin: 10px 0;
+.helmet {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 120px;
+  height: 90px;
+  transform: translateX(-50%);
+  background: radial-gradient(circle at 50% 20%, #2a1a2a, #090009 80%);
+  border-radius: 80% 80% 60% 60% / 80% 80% 30% 30%;
+  box-shadow: inset 0 0 20px rgba(92, 4, 186, 0.4),
+              0 0 25px rgba(92,4,186,0.3);
 }
 
-.message-bubble {
-  padding: 10px;
-  border-radius: 10px;
+.helmet::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 80px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  border-radius: 8px;
+  background: linear-gradient(90deg, #00ffcc, #02a633);
+  box-shadow: 0 0 15px #00ffcc;
 }
 
-.message-bubble.jarvis {
-  background: rgba(0, 212, 255, 0.1);
+/* shoulders / chest plating */
+.shoulders {
+  position: absolute;
+  top: 80px;
+  left: 50%;
+  width: 240px;
+  height: 120px;
+  transform: translateX(-50%);
+  background: radial-gradient(circle at 50% 40%, #160016, #070008 80%);
+  border-radius: 50% / 60%;
+  box-shadow: inset 0 0 40px rgba(92,4,186,0.6),
+              0 0 50px rgba(92,4,186,0.3);
 }
 
-.message-bubble.you {
-  background: rgba(255, 255, 255, 0.08);
+/* Arc reactor (center) */
+.reactor {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%) translateY(30%);
+  width: 110px;
+  height: 110px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.message-bubble.you.interim {
-  opacity: 0.7;
-  font-style: italic;
-}
-
-.instructions {
-  margin-top: 12px;
-  color: var(--muted);
-  font-size: 14px;
-}
-
-.neon-ring {
-  position: fixed;
-  bottom: 80px;
-  right: 80px;
-  width: 220px;
-  height: 220px;
+.reactor-core {
+  width: 50px;
+  height: 50px;
   border-radius: 50%;
-  border: 4px solid #00d4ff;
-  box-shadow: 0 0 25px rgba(0, 212, 255, 0.6),
-              0 0 55px rgba(0, 212, 255, 0.4);
-  animation: pulseRing 1.6s ease-out infinite;
-  pointer-events: none;
-  opacity: 0.85;
-  filter: drop-shadow(0 0 20px rgba(0, 255, 200, 0.6));
+  background: radial-gradient(circle, #00ffcc 0%, #008877 70%, #001111 100%);
+  box-shadow: 0 0 30px #00ffcc, 0 0 80px #00ffcc;
 }
 
-@keyframes pulseRing {
-  0% {
-    transform: scale(0.9);
-    opacity: 0.7;
-  }
-  50% {
-    transform: scale(1.05);
-    opacity: 1;
-  }
-  100% {
-    transform: scale(0.9);
-    opacity: 0.7;
-  }
+.reactor-ring {
+  position: absolute;
+  width: 90px;
+  height: 90px;
+  border: 3px solid rgba(0,255,204,0.4);
+  border-radius: 50%;
+  animation: spin 5s linear infinite;
 }
 
-@media (max-width: 768px) {
-  .neon-ring {
-    bottom: 40px;
-    right: 40px;
-    width: 140px;
-    height: 140px;
-    border-width: 3px;
-  }
+.reactor.pulsing .reactor-core {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse {
+  0%,100% { transform: scale(1); box-shadow: 0 0 40px #00ffcc, 0 0 100px #00ffcc; }
+  50% { transform: scale(1.2); box-shadow: 0 0 60px #00ffcc, 0 0 140px #00ffcc; }
+}
+
+.suit3d.speaking .reactor-core {
+  box-shadow: 0 0 80px #02a633, 0 0 160px #02a633;
+  filter: brightness(1.3);
+}
+
+/* ---- Chat ---- */
+.chat {
+  margin-top: 10px;
+  text-align: left;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 0 20px;
+}
+
+.msg {
+  margin: 8px 0;
+}
+
+.msg.you .bubble {
+  border-left: 3px solid var(--green);
+  background: rgba(0,255,204,0.05);
+}
+
+.msg.jarvis .bubble {
+  border-left: 3px solid var(--violet);
+  background: rgba(92,4,186,0.05);
+}
+
+.bubble {
+  padding: 10px 14px;
+  border-radius: 8px;
+  color: #e4fffa;
+  box-shadow: 0 0 10px rgba(92,4,186,0.15);
+}
+
+.title {
+  color: var(--violet);
+  margin: 10px 0;
+  letter-spacing: 2px;
+}
+
+.hint {
+  margin-top: 12px;
+  color: var(--violet);
+  font-size: 0.9rem;
 }
