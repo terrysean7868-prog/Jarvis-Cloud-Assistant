@@ -1,25 +1,27 @@
 import React, { useEffect, useRef, useState } from "react";
-import { PorcupineWorker } from "@picovoice/porcupine-web";
-import { WebVoiceProcessor } from "@picovoice/web-voice-processor";
 import "./App.css";
 
 export default function App() {
+  const [status, setStatus] = useState("initializing");
   const [conversation, setConversation] = useState([
-    { from: "jarvis", text: "System online. Say 'Jarvis' to begin." },
+    { from: "jarvis", text: "Good morning. I am JARVIS. Always at your service. Say 'Hey Jarvis' to begin." },
   ]);
   const [interimText, setInterimText] = useState("");
-  const [reactorPulse, setReactorPulse] = useState(false);
-  const [speaking, setSpeaking] = useState(false);
   const recognitionRef = useRef(null);
+  const audioStreamRef = useRef(null);
+  const workerRef = useRef(null);
+  const listeningRef = useRef(false);
   const wakeWordDetectedRef = useRef(false);
+  const commandBufferRef = useRef("");
+  const lastHotwordTrigger = useRef(0);
 
-  // ---------- Backend logic ----------
+  // --- Backend communication ---
   const sendToBackend = async (text) => {
+    setStatus("thinking");
     setInterimText("");
     wakeWordDetectedRef.current = false;
-
     const apiEndpoint =
-      process.env.REACT_APP_API_URL || "http://localhost:8000/api/chat";
+      process.env.REACT_APP_API_URL || "/api/chat";
 
     try {
       const res = await fetch(apiEndpoint, {
@@ -27,172 +29,219 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text, mode: "chat", user: "user" }),
       });
-
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      const reply = data?.text || "I didn’t quite catch that.";
-      setConversation((c) => [...c, { from: "jarvis", text: reply }]);
-      speak(reply);
+      const reply = data?.text || "I didn’t quite catch that, sir.";
+      const cleanReply = reply.split(/\{[\s\S]*"actions"[\s\S]*\}/)[0].trim() || reply;
+
+      setConversation((c) => [...c, { from: "jarvis", text: cleanReply }]);
+      speak(cleanReply);
     } catch (err) {
       console.error("Backend error:", err);
-      const msg = "Connection issue detected, staying online.";
+      const msg = "I encountered a connection problem, but I’m still here.";
       setConversation((c) => [...c, { from: "jarvis", text: msg }]);
       speak(msg);
+      setStatus("listening");
+      restartRecognition(250);
+    } finally {
+      setStatus("listening");
     }
   };
 
-  // ---------- Wakeword (Porcupine v3) ----------
-  useEffect(() => {
-    let porcupineWorker = null;
-    let mounted = true;
-
-    async function initWakeword() {
+  const restartRecognition = (delay = 150) => {
+    try {
+      recognitionRef.current?.stop();
+    } catch {}
+    setTimeout(() => {
       try {
-        const accessKey = process.env.REACT_APP_PICOVOICE_KEY;
-        if (!accessKey) throw new Error("Missing REACT_APP_PICOVOICE_KEY");
+        recognitionRef.current?.start();
+      } catch {}
+    }, delay);
+  };
 
-        porcupineWorker = await PorcupineWorker.create(
-          accessKey,
-          [{ builtin: "jarvis", sensitivity: 0.7 }],
-          {
-            processCallback: (keywordIndex) => {
-              if (!mounted) return;
-              if (keywordIndex >= 0) {
-                console.log("Wakeword detected: Jarvis");
-                playBeep();
-                wakeWordDetectedRef.current = true;
-                setReactorPulse(true);
-                setTimeout(() => setReactorPulse(false), 2000);
-                setConversation((c) => [
-                  ...c,
-                  { from: "jarvis", text: "Yes sir, I’m listening..." },
-                ]);
-                speak("Yes sir, I’m listening...");
-              }
-            },
-          }
-        );
-
-        await WebVoiceProcessor.subscribe(porcupineWorker);
-        await WebVoiceProcessor.start();
-        console.log("✅ Porcupine wakeword ready (v3.0.3)");
-      } catch (err) {
-        console.error("Wakeword error", err);
+  // --- Worker (voice activity detection) ---
+  const createHotwordWorker = () => {
+    const code = `
+      let lastVoice = 0;
+      function energyFromFloat32(data) {
+        let sum = 0;
+        for (let i = 0; i < data.length; i += 2) sum += data[i] * data[i];
+        return Math.sqrt(sum / (data.length / 2));
       }
+      onmessage = function(e) {
+        const { type, payload } = e.data;
+        if (type === 'analyze') {
+          const arr = new Float32Array(payload);
+          const energy = energyFromFloat32(arr);
+          const now = Date.now();
+          if (energy > 0.015) {
+            lastVoice = now;
+            postMessage({ event: 'voice', energy, time: now });
+          }
+        }
+      };
+    `;
+    return new Worker(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+  };
+
+  // --- Recognition + mic init ---
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setConversation((c) => [...c, { from: "jarvis", text: "SpeechRecognition not supported. Try Chrome." }]);
+      return;
     }
 
-    initWakeword();
-
-    return () => {
-      mounted = false;
-      try {
-        const wvp = WebVoiceProcessor.getInstance();
-        if (wvp && typeof wvp.stop === "function") wvp.stop();
-      } catch {}
-      try {
-        porcupineWorker?.release?.();
-      } catch {}
-    };
-  }, []);
-
-  // ---------- Speech recognition ----------
-  useEffect(() => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return;
-    const rec = new SR();
+    const rec = new SpeechRecognition();
     rec.lang = "en-US";
     rec.continuous = true;
     rec.interimResults = true;
+    recognitionRef.current = rec;
 
-    rec.onresult = (e) => {
-      let final = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i];
-        if (r.isFinal) final += r[0].transcript;
-        else setInterimText(r[0].transcript);
-      }
-      if (final.trim() && wakeWordDetectedRef.current) {
-        wakeWordDetectedRef.current = false;
-        setConversation((c) => [...c, { from: "you", text: final }]);
-        sendToBackend(final);
-      }
-      setInterimText("");
+    rec.onstart = () => setStatus("listening");
+    rec.onerror = (e) => {
+      console.warn("Speech error", e);
+      restartRecognition(250);
     };
 
-    rec.onend = () => {
-      try {
-        rec.start();
-      } catch {}
+    rec.onresult = (e) => {
+      let full = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) full += r[0].transcript;
+        else setInterimText(r[0].transcript);
+      }
+
+      const text = full.trim().toLowerCase();
+      if (!text) return;
+
+      // detect "jarvis" or "hey jarvis"
+      const wakeWords = ["hey jarvis", "jarvis", "ok jarvis"];
+      const detected = wakeWords.find((w) => text.includes(w));
+
+      if (detected) {
+        wakeWordDetectedRef.current = true;
+        playActivationSound();
+        setStatus("activated");
+        setConversation((c) => [...c, { from: "jarvis", text: "Yes sir, I’m listening..." }]);
+        speak("Yes sir, I’m listening...");
+        setInterimText("");
+        return;
+      }
+
+      if (wakeWordDetectedRef.current && text.length > 2) {
+        wakeWordDetectedRef.current = false;
+        setConversation((c) => [...c, { from: "you", text }]);
+        sendToBackend(text);
+        setInterimText("");
+      }
+    };
+
+    rec.onend = () => restartRecognition(100);
+
+    // mic + worker
+    const worker = createHotwordWorker();
+    workerRef.current = worker;
+    worker.onmessage = (ev) => {
+      const now = Date.now();
+      if (ev.data.event === "voice" && now - lastHotwordTrigger.current > 600) {
+        lastHotwordTrigger.current = now;
+        try {
+          recognitionRef.current?.start();
+        } catch {}
+      }
     };
 
     navigator.mediaDevices
-      .getUserMedia({ audio: true })
-      .then(() => rec.start())
-      .catch(() => console.warn("Microphone error"));
-    recognitionRef.current = rec;
+      .getUserMedia({ audio: { noiseSuppression: true, echoCancellation: true } })
+      .then((stream) => {
+        audioStreamRef.current = stream;
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const src = ctx.createMediaStreamSource(stream);
+        const proc = ctx.createScriptProcessor(2048, 1, 1);
+        proc.onaudioprocess = (e) => {
+          const input = e.inputBuffer.getChannelData(0);
+          worker.postMessage({ type: "analyze", payload: input.buffer }, [input.buffer.slice(0)]);
+        };
+        src.connect(proc);
+        proc.connect(ctx.destination);
+        rec.start();
+      })
+      .catch(() => setConversation((c) => [...c, { from: "jarvis", text: "Microphone permission denied." }]));
 
     return () => {
-      try {
-        rec.stop();
-      } catch {}
+      try { recognitionRef.current?.stop(); } catch {}
+      try { audioStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
+      try { workerRef.current?.terminate(); } catch {}
     };
-  }, [sendToBackend]);
+  }, []);
 
-  // ---------- Speech synthesis ----------
-  const speak = (text) => {
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 0.95;
-    u.lang = "en-US";
-    u.onstart = () => setSpeaking(true);
-    u.onend = () => setSpeaking(false);
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(u);
-  };
-
-  const playBeep = () => {
+  const playActivationSound = () => {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const o = ctx.createOscillator();
     const g = ctx.createGain();
-    o.connect(g);
-    g.connect(ctx.destination);
-    o.frequency.value = 900;
-    o.type = "sine";
-    g.gain.value = 0.2;
-    o.start();
-    o.stop(ctx.currentTime + 0.15);
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = 880; o.type = "sine"; g.gain.value = 0.25;
+    o.start(); o.stop(ctx.currentTime + 0.12);
   };
 
-  // ---------- UI ----------
+  const speak = (text) => {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-US";
+    u.rate = 0.95;
+    window.speechSynthesis.cancel();
+    u.onend = () => restartRecognition(120);
+    window.speechSynthesis.speak(u);
+  };
+
+  const getStatusColor = () => {
+    switch (status) {
+      case "activated":
+      case "speaking":
+        return "#00ffc8";
+      case "listening":
+        return "#00d4ff";
+      case "thinking":
+        return "#ff9f43";
+      default:
+        return "#6b7280";
+    }
+  };
+
   return (
-    <div className="app-root">
-      <div className="card">
-        <div className={`suit3d ${speaking ? "speaking" : ""}`}>
-          <div className={`reactor ${reactorPulse ? "pulsing" : ""}`}>
-            <div className="reactor-core"></div>
-            <div className="reactor-ring"></div>
-          </div>
-        </div>
-
+    <div className={`app-root ${status === "listening" ? "listening" : ""}`}>
+      <header className="app-header">
         <h1 className="title">JARVIS</h1>
+        <div className="status">
+          <span className="status-dot" style={{ background: getStatusColor() }} />
+          <span>{status}</span>
+        </div>
+      </header>
 
-        <div className="chat">
+      <div className="reactor-container">
+        <div className={`reactor-ring ${status}`} />
+        <div className="reactor-core" />
+      </div>
+
+      <main className="main-card">
+        <section className="messages">
           {conversation.map((m, i) => (
             <div key={i} className={`msg ${m.from}`}>
-              <div className="who">{m.from.toUpperCase()}</div>
-              <div className="bubble">{m.text}</div>
+              <div className="msg-label">{m.from === "you" ? "YOU" : "JARVIS"}</div>
+              <div className="msg-bubble">{m.text}</div>
             </div>
           ))}
           {interimText && (
             <div className="msg you interim">
-              <div className="bubble">{interimText}</div>
+              <div className="msg-label">USER</div>
+              <div className="msg-bubble">{interimText}</div>
             </div>
           )}
-        </div>
-
-        <div className="hint">
-          🎤 Say <b>"Jarvis"</b> to wake me — always listening.
-        </div>
-      </div>
+        </section>
+      </main>
+      <footer className="instructions">
+        🎤 Say <strong>"Hey Jarvis"</strong> — hotword & always listening.
+      </footer>
     </div>
   );
 }
