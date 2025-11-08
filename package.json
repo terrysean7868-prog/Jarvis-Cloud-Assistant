@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@picovoice/porcupine-web": "^3.0.3",
+    "@picovoice/web-voice-processor": "^4.0.9"
+  }
+}

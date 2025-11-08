@@ -4,8 +4,8 @@
   "private": true,
   "proxy": "http://localhost:8000",
   "dependencies": {
-    "@picovoice/porcupine-web": "^3.0.3",
-    "@picovoice/web-voice-processor": "^4.0.9",
+    "@picovoice/porcupine-web": "^2.2.2",
+    "@picovoice/web-voice-processor": "^1.2.2",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.0",
