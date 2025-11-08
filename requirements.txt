@@ -1,13 +1,26 @@
-python-telegram-bot==13.15
-APScheduler==3.6.3
-requests==2.31.0
-pymongo==4.4.0
-python-dotenv==1.0.0
-SpeechRecognition==3.8.1
-pydub==0.25.1
-ffmpeg-python==0.2.0
-gunicorn==20.1.0
-PyYAML==6.0
-telegram
-openai==0.28.0
+# Core dependencies (required)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+httpx>=0.25.0
+openai>=1.0.0
+google-generativeai>=0.3.0
+gitpython>=3.1.0
+aiofiles>=23.0.0
+python-multipart>=0.0.6
 
+# Optional dependencies (for additional features)
+# Uncomment if needed:
+# python-telegram-bot==13.15
+# APScheduler==3.6.3
+# pymongo==4.4.0
+# SpeechRecognition==3.8.1
+# pydub==0.25.1
+# ffmpeg-python==0.2.0
+# gunicorn==20.1.0
+# PyYAML>=6.0.1  # Use newer version that doesn't require Cython
+# telegram
+# sqlalchemy
+# tqdm
