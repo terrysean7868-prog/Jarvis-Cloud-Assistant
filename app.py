@@ -2,20 +2,18 @@
 import os
 import asyncio
 import subprocess
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Header, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, Depends, Header
 from dotenv import load_dotenv
 
 # === Core modules ===
 from llm_adapter import LLMAdapter
 from jarvis_brain import JarvisBrain
-from git_sync import GitSync
 from executor import ActionExecutor
-
+from git_sync import git_sync  # ✅ updated version from the new script
 
 # =========================================================
 # 🚀 FastAPI Initialization
@@ -30,19 +28,16 @@ cors_origins = [
     "http://localhost:5173",  # Vite default port
     "https://jarvis-frontend.onrender.com",
 ]
-# Load environment variables
+
 load_dotenv()
 
-# Add environment variable-based origins (optional)
 if os.getenv("FRONTEND_URL"):
     cors_origins.append(os.getenv("FRONTEND_URL"))
 
 if os.getenv("CORS_ORIGINS"):
-    cors_origins.extend([
-        origin.strip()
-        for origin in os.getenv("CORS_ORIGINS").split(",")
-        if origin.strip()
-    ])
+    cors_origins.extend(
+        [o.strip() for o in os.getenv("CORS_ORIGINS").split(",") if o.strip()]
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,8 +55,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 llm = LLMAdapter()
 brain = JarvisBrain(llm=llm)
-git_sync = GitSync(repo_url=GITHUB_REPO, token=GITHUB_TOKEN)
-executor = ActionExecutor(brain=brain, git_sync=git_sync)
+executor = ActionExecutor(brain=brain)
 
 # =========================================================
 # 💬 Data Models
@@ -69,7 +63,7 @@ executor = ActionExecutor(brain=brain, git_sync=git_sync)
 class MessageIn(BaseModel):
     user: str | None = "user"
     text: str
-    mode: str | None = "chat"  # "chat" or "command"
+    mode: str | None = "chat"
 
 # =========================================================
 # ⚙️ API Endpoints
@@ -77,8 +71,7 @@ class MessageIn(BaseModel):
 @app.post("/api/chat")
 async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     """
-    Primary chat endpoint. Returns LLM response and proposed actions.
-    If AUTO_APPLY=true and actions pass allowlist, actions will be executed in background.
+    Primary chat endpoint for message/command handling.
     """
     response = await brain.handle_message(msg.text, mode=msg.mode)
     actions = response.get("actions", [])
@@ -89,31 +82,75 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
 
 @app.post("/api/upload-module")
 async def upload_module(file: UploadFile = File(...)):
+    """
+    Uploads a new Python module and auto-commits it.
+    """
     content = await file.read()
     filename = file.filename
     rel_path = os.path.join("modules", filename)
+
     if not brain.is_path_allowed(rel_path):
         return {"status": "forbidden", "reason": "path not allowed"}
+
     os.makedirs("modules", exist_ok=True)
     with open(rel_path, "wb") as f:
         f.write(content)
-    git_sync.commit_and_push([rel_path], message=f"Add module {filename}")
-    return {"status": "ok", "path": rel_path}
+
+    # Auto commit using git_sync
+    try:
+        git_sync(repo_path=".",)
+        return {"status": "ok", "message": f"Module {filename} uploaded and committed."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @app.post("/api/sync")
 async def sync_repo():
-    result = git_sync.pull_and_update()
-    return {"status": "ok", "result": result}
+    """
+    Pull and sync latest repo changes.
+    """
+    try:
+        git_sync(repo_path=".")
+        return {"status": "ok", "message": "Repository synced successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
+
 @app.get("/envcheck")
 async def envcheck():
     return {"openai": bool(os.getenv("OPENAI_API_KEY"))}
+
+
+# =========================================================
+# 🔐 Secure Git Sync Endpoint
+# =========================================================
+SYNC_KEY = os.getenv("SYNC_KEY", "mysecretkey")
+REPO_PATH = os.getenv("GIT_REPO_PATH", os.getcwd())
+
+def verify_key(x_api_key: str = Header(...)):
+    """Simple header-based authentication"""
+    if x_api_key != SYNC_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
+
+
+@app.post("/api/git-sync")
+async def trigger_git_sync(authorized: bool = Depends(verify_key)):
+    """
+    Secure endpoint to push latest code to GitHub main branch.
+    Uses SSH_KEY or fallback auth from env variables.
+    """
+    try:
+        git_sync(repo_path=REPO_PATH)
+        return {"status": "success", "message": "✅ Code pushed to main branch."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 # =========================================================
 # 🕒 Startup Event
@@ -122,74 +159,9 @@ async def envcheck():
 async def startup_event():
     interval = int(os.getenv("GIT_PULL_INTERVAL_SEC", "0"))
     if interval > 0:
-        asyncio.create_task(git_sync.periodic_pull(interval=interval))
-    print("✅ Jarvis server started")
+        asyncio.create_task(asyncio.to_thread(git_sync, repo_path="."))
+    print("✅ Jarvis server started and git-sync initialized.")
 
-# 🧩 Get repository path and optional auth key from environment
-REPO_PATH = os.getenv("GIT_REPO_PATH", os.getcwd())
-SYNC_KEY = os.getenv("SYNC_KEY", "mysecretkey")
-
-def verify_key(x_api_key: str = Header(...)):
-    """Simple header-based auth for security."""
-    if x_api_key != SYNC_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
-
-def run_git_command(command: str):
-    """Safely run a Git command and return output or error."""
-    try:
-        result = subprocess.run(
-            command,
-            cwd=REPO_PATH,
-            shell=True,
-            text=True,
-            capture_output=True,
-            check=True
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"Git error: {e.stderr.strip()}")
-
-@app.post("/sync_repo")
-def sync_repo(commit_message: str = "Auto-sync changes", authorized: bool = Depends(verify_key)):
-    """
-    Sync the local repository with GitHub:
-      1. Pull latest changes
-      2. Commit local changes (if any)
-      3. Push back to GitHub
-    """
-    try:
-        # 1️⃣ Pull from GitHub
-        pull_output = run_git_command("git pull origin main")
-
-        # 2️⃣ Add and commit local changes
-        run_git_command("git add .")
-        commit_process = subprocess.run(
-            f'git commit -m "{commit_message}"',
-            cwd=REPO_PATH,
-            shell=True,
-            text=True,
-            capture_output=True
-        )
-
-        if "nothing to commit" in commit_process.stdout.lower():
-            return {"status": "ok", "message": "Already up to date", "pull_output": pull_output}
-
-        # 3️⃣ Push updates
-        push_output = run_git_command("git push origin main")
-
-        return {
-            "status": "success",
-            "message": "Repository synced successfully",
-            "repo_path": REPO_PATH,
-            "pull_output": pull_output,
-            "commit_output": commit_process.stdout.strip(),
-            "push_output": push_output
-        }
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 # =========================================================
 # 🎨 Serve Frontend (React build)
@@ -205,6 +177,6 @@ else:
     @app.get("/")
     async def root_fallback():
         return JSONResponse(
-            {"message": "Frontend not built yet. Please run `npm run build` inside jarvis-frontend/."},
-            status_code=404
+            {"message": "Frontend not built yet. Run `npm run build` inside jarvis-frontend/."},
+            status_code=404,
         )

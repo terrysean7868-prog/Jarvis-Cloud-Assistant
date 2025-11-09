@@ -1,114 +1,141 @@
-# git_sync.py
-import os, shutil, subprocess
-from git import Repo, GitCommandError, InvalidGitRepositoryError
+import os
+import subprocess
+import tempfile
+import logging
+from pathlib import Path
 
-class GitSync:
-    def __init__(self, repo_url: str = None, token: str = None):
-        self.repo_url = repo_url
-        self.token = token
-        self.local_path = os.getcwd()  # Work with main repository
-        self.repo = None
-        self._ensure_repo()
+logging.basicConfig(level=logging.INFO, format="[GIT SYNC] %(message)s")
 
-    def _auth_url(self):
-        if not self.token or not self.repo_url:
-            return self.repo_url
-        # Handle different URL formats
-        if "://" in self.repo_url and "@" not in self.repo_url:
-            return self.repo_url.replace("https://", f"https://{self.token}@")
-        return self.repo_url
 
-    def _ensure_repo(self):
-        """Initialize or connect to git repository in current directory."""
-        try:
-            # Try to open existing repo
-            self.repo = Repo(self.local_path)
-            # If repo_url is provided, ensure remote is set
-            if self.repo_url:
-                try:
-                    origin = self.repo.remote("origin")
-                    if origin.url != self._auth_url():
-                        # Update remote URL if token/auth changed
-                        origin.set_url(self._auth_url())
-                except ValueError:
-                    # No origin remote, add it
-                    self.repo.create_remote("origin", self._auth_url())
-        except (InvalidGitRepositoryError, Exception) as e:
-            # Not a git repo, initialize if repo_url provided
-            if self.repo_url:
-                try:
-                    # Clone if repo_url is different from current dir
-                    self.repo = Repo.init(self.local_path)
-                    if self.repo_url:
-                        try:
-                            self.repo.create_remote("origin", self._auth_url())
-                        except:
-                            pass
-                except Exception as init_error:
-                    print(f"Warning: Could not initialize git repo: {init_error}")
-                    self.repo = None
+def run_cmd(cmd, cwd=None, env=None, raise_on_fail=True):
+    """Run a shell command and handle output cleanly."""
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env or os.environ.copy(),
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            if raise_on_fail:
+                logging.error(f"❌ Command failed: {cmd}")
+                logging.error(result.stderr.strip())
+                raise RuntimeError(result.stderr.strip())
             else:
-                print(f"Warning: Not a git repository and no GITHUB_REPO provided: {e}")
-                self.repo = None
+                logging.warning(f"⚠️ Command returned {result.returncode}: {cmd}")
+        return result.stdout.strip()
+    except Exception as e:
+        if raise_on_fail:
+            raise
+        logging.warning(f"Command failed: {e}")
+        return ""
 
-    def commit_and_push(self, paths, message="Jarvis auto-update: applied changes"):
-        """Commit changes and push to GitHub."""
-        if not self.repo:
-            print("Warning: No git repository available. Changes not pushed.")
-            return {"status": "no_repo"}
-        
-        try:
-            # Add changed files
-            if paths:
-                for p in paths:
-                    abs_path = os.path.abspath(p)
-                    if os.path.exists(abs_path):
-                        try:
-                            self.repo.index.add([p])
-                        except Exception as e:
-                            print(f"Warning: Could not add {p}: {e}")
-            
-            # Check if there are changes to commit
-            if self.repo.is_dirty() or self.repo.untracked_files:
-                # Commit
-                self.repo.index.commit(message)
-                print(f"✅ Committed changes: {message}")
-                
-                # Push to origin
-                try:
-                    origin = self.repo.remote("origin")
-                    origin.push()
-                    print(f"✅ Pushed to GitHub")
-                    return {"status": "pushed", "message": message}
-                except Exception as push_error:
-                    print(f"Warning: Could not push to GitHub: {push_error}")
-                    return {"status": "committed_but_not_pushed", "error": str(push_error)}
-            else:
-                return {"status": "no_changes"}
-        except Exception as e:
-            print(f"Error during commit/push: {e}")
-            return {"status": "error", "error": str(e)}
 
-    def pull_and_update(self):
-        """Pull latest changes from GitHub."""
-        if not self.repo:
-            return {"status": "no_repo"}
-        
-        try:
-            origin = self.repo.remote("origin")
-            origin.pull()
-            print("✅ Pulled latest changes from GitHub")
-            return {"status": "pulled"}
-        except Exception as e:
-            print(f"Warning: Could not pull from GitHub: {e}")
-            return {"status": "error", "error": str(e)}
+def setup_ssh():
+    """Write SSH private key from env into temp file for git auth."""
+    ssh_key = os.getenv("SSH_KEY")
+    if not ssh_key:
+        logging.warning("No SSH_KEY found in environment.")
+        return None
 
-    async def periodic_pull(self, interval=300):
-        """Periodically pull updates from GitHub."""
-        import asyncio
-        while True:
-            try:
-                self.pull_and_update()
-            except Exception as e:
-                print(f"Error in periodic pull: {e}")
-            await asyncio.sleep(interval)
+    ssh_dir = Path(tempfile.gettempdir()) / "ssh_temp"
+    ssh_dir.mkdir(exist_ok=True)
+    key_path = ssh_dir / "id_rsa"
+    with open(key_path, "w") as f:
+        f.write(ssh_key.strip() + "\n")
+    os.chmod(key_path, 0o600)
+
+    wrapper_path = ssh_dir / "ssh_wrapper.sh"
+    wrapper_path.write_text(f"#!/bin/sh\nexec ssh -i {key_path} -o StrictHostKeyChecking=no \"$@\"\n")
+    os.chmod(wrapper_path, 0o700)
+
+    logging.info("🔐 SSH authentication configured.")
+    return str(wrapper_path)
+
+
+def git_sync(repo_path="."):
+    """Auto-commit and push all changes to the main branch."""
+    repo_path = Path(repo_path).resolve()
+    logging.info(f"📦 Syncing repo at {repo_path}")
+    env = os.environ.copy()
+
+    # Set up SSH first
+    ssh_wrapper = setup_ssh()
+    if ssh_wrapper:
+        env["GIT_SSH"] = ssh_wrapper
+
+    # Configure user
+    username = os.getenv("GITHUB_USERNAME", "Jarvis-AutoBot")
+    email = f"{username}@users.noreply.github.com"
+    run_cmd(f"git config user.name '{username}'", cwd=repo_path, env=env, raise_on_fail=False)
+    run_cmd(f"git config user.email '{email}'", cwd=repo_path, env=env, raise_on_fail=False)
+
+    # Ensure we’re on the main branch
+    try:
+        run_cmd("git checkout main", cwd=repo_path, env=env)
+    except Exception:
+        logging.warning("Branch 'main' not found, staying on current branch.")
+
+    # Stage all changes
+    run_cmd("git add -A", cwd=repo_path, env=env)
+
+    # Commit if needed
+    try:
+        run_cmd("git commit -m 'Auto-sync update from Jarvis'", cwd=repo_path, env=env)
+        logging.info("✅ Commit created.")
+    except Exception:
+        logging.info("🟢 No changes to commit.")
+
+    # Pull latest main before pushing
+    try:
+        run_cmd("git fetch origin main", cwd=repo_path, env=env)
+        run_cmd("git pull origin main --rebase", cwd=repo_path, env=env)
+    except Exception as e:
+        logging.warning(f"⚠️ Pull error: {e}. Trying normal merge.")
+        run_cmd("git pull origin main --no-rebase", cwd=repo_path, env=env, raise_on_fail=False)
+
+    # Try to push with SSH
+    try:
+        logging.info("🚀 Pushing to main via SSH...")
+        run_cmd("git push origin HEAD:main", cwd=repo_path, env=env)
+        logging.info("✅ Successfully pushed to main (SSH).")
+        return
+    except Exception as e:
+        logging.warning(f"SSH push failed: {e}")
+
+    # Fallback 1: GitHub token HTTPS
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        logging.info("🔁 Retrying push via HTTPS (GitHub token)...")
+        origin_url = run_cmd("git remote get-url origin", cwd=repo_path, env=env)
+        if "github.com" in origin_url:
+            https_url = origin_url.replace("git@github.com:", f"https://{token}@github.com/")
+            run_cmd(f"git remote set-url origin {https_url}", cwd=repo_path, env=env)
+        run_cmd("git push origin HEAD:main", cwd=repo_path, env=env)
+        logging.info("✅ Successfully pushed to main via HTTPS token.")
+        return
+
+    # Fallback 2: Username/password HTTPS
+    user = os.getenv("GITHUB_USERNAME")
+    password = os.getenv("GITHUB_PASSWORD")
+    if user and password:
+        logging.info("🔁 Retrying push via HTTPS (username/password)...")
+        origin_url = run_cmd("git remote get-url origin", cwd=repo_path, env=env)
+        if "github.com" in origin_url:
+            https_url = origin_url.replace("git@github.com:", f"https://{user}:{password}@github.com/")
+            run_cmd(f"git remote set-url origin {https_url}", cwd=repo_path, env=env)
+        run_cmd("git push origin HEAD:main", cwd=repo_path, env=env)
+        logging.info("✅ Successfully pushed to main via HTTPS (username/password).")
+        return
+
+    logging.error("❌ All push attempts failed (SSH, token, username/password).")
+    raise RuntimeError("Push failed")
+
+
+if __name__ == "__main__":
+    try:
+        git_sync()
+    except Exception as e:
+        logging.error(f"🚫 Git sync failed: {e}")
