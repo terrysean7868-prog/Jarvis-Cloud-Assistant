@@ -5,37 +5,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 class LLMAdapter:
     """
-    Universal LLM adapter — using Groq (free, fast, OpenAI-compatible)
-    Compatible with JarvisBrain's signature (system, max_tokens, etc.)
+    Jarvis Cloud - LLM Adapter for Groq (free)
+    Compatible with JarvisBrain expected args: system, max_tokens, temperature
     """
 
     def __init__(self):
         self.api_key = os.getenv("GROQ_API_KEY")
         if not self.api_key:
-            raise RuntimeError("Missing GROQ_API_KEY in environment variables")
+            raise RuntimeError("Missing GROQ_API_KEY in environment")
 
-        # Default Groq model (free)
+        # Default free Groq model
         self.model = os.getenv("GROQ_MODEL", "llama3-8b-8192")
 
     async def generate(
         self,
         prompt: str,
-        system: str = "You are Jarvis, a helpful and intelligent AI assistant.",
+        system: str = "You are Jarvis, an intelligent and loyal AI assistant.",
+        max_tokens: int = 2048,
         temperature: float = 0.6,
-        max_tokens: int = 1024,
     ):
         """
-        Generate a completion using Groq API.
-        Matches OpenAI ChatCompletion style.
+        Generate a response via Groq’s OpenAI-compatible API
         """
         try:
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             }
+
             payload = {
                 "model": self.model,
                 "messages": [
@@ -46,20 +45,20 @@ class LLMAdapter:
                 "max_tokens": max_tokens,
             }
 
-            response = requests.post(
+            resp = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=60,
             )
 
-            if response.status_code != 200:
-                print(f"[LLM] Groq API error {response.status_code}: {response.text}")
-                return "Apologies sir, the Groq model encountered an issue."
+            if resp.status_code != 200:
+                print(f"[LLM] Groq API Error {resp.status_code}: {resp.text}")
+                return f"Apologies sir, Groq API returned an error: {resp.status_code}"
 
-            data = response.json()
+            data = resp.json()
             return data["choices"][0]["message"]["content"].strip()
 
         except Exception as e:
-            print(f"[LLM] Groq Exception: {e}")
-            return "Apologies sir, my neural interface seems unstable at the moment."
+            print(f"[LLM] Exception: {e}")
+            return f"Apologies sir, I encountered an internal issue: {str(e)}"
