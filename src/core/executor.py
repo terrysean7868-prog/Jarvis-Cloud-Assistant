@@ -8,6 +8,11 @@ import platform
 from typing import List
 from src.core.jarvis_brain import JarvisBrain
 from src.utils.git_sync import git_sync  # ✅ now importing the function, not a class
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+import pyautogui
 
 # Internet access
 try:
@@ -41,6 +46,21 @@ class ActionExecutor:
             'amazon': 'https://www.amazon.com',
         }
 
+        # Extended URL mapping with more websites
+        self.url_map.update({
+            'bing': 'https://www.bing.com',
+            'yahoo': 'https://www.yahoo.com',
+            'duckduckgo': 'https://duckduckgo.com',
+            'spotify': 'https://www.spotify.com',
+            'apple': 'https://www.apple.com',
+            'microsoft': 'https://www.microsoft.com',
+            'tesla': 'https://www.tesla.com',
+            'cnn': 'https://www.cnn.com',
+            'bbc': 'https://www.bbc.com',
+            'nytimes': 'https://www.nytimes.com',
+        })
+        self.browser = None
+
     async def process_actions(self, actions: List[dict], user: str = "user"):
         """
         Executes actions proposed by JarvisBrain, such as writing, editing,
@@ -68,27 +88,8 @@ class ActionExecutor:
             
             # Handle URL opening actions
             if action_type == "open_url":
-                url = action.get("url", "")
-                url_name = action.get("url_name", "").lower()
-                
-                # Try to find URL from the map if not explicitly provided
-                if not url and url_name:
-                    url = self.url_map.get(url_name, f"https://www.{url_name}.com")
-                
-                if url:
-                    try:
-                        self._open_url(url)
-                        results.append({
-                            "status": "opened",
-                            "action_type": "open_url",
-                            "url": url
-                        })
-                    except Exception as e:
-                        results.append({
-                            "status": "error",
-                            "action_type": "open_url",
-                            "error": str(e)
-                        })
+                result = await self._handle_open_url(action)
+                results.append(result)
                 continue
             
             # Handle search actions
@@ -286,4 +287,66 @@ class ActionExecutor:
                 "action": "fetch_url",
                 "error": str(e)
             }
+    
+    def _initialize_browser(self):
+        """Initialize the Selenium WebDriver."""
+        if not self.browser:
+            chrome_options = Options()
+            chrome_options.add_argument("--headless")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--no-sandbox")
+            service = Service("chromedriver")  # Ensure chromedriver is in PATH
+            self.browser = webdriver.Chrome(service=service, options=chrome_options)
+
+    async def _handle_open_url(self, action: dict):
+        """
+        Handles the action to open a URL in the browser.
+        """
+        url_name = action.get("url_name", "").lower()
+        url = self.url_map.get(url_name, f"https://www.{url_name}.com")
+
+        try:
+            self._initialize_browser()
+            self.browser.get(url)
+            return {"status": "success", "message": f"Opened {url} in browser"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def _handle_screen_navigation(self, action: dict):
+        """
+        Handles screen navigation commands like moving the mouse, clicking, typing, etc.
+        """
+        command = action.get("command")
+        try:
+            if command == "move_mouse":
+                x, y = action.get("x", 0), action.get("y", 0)
+                pyautogui.moveTo(x, y, duration=0.5)
+                return {"status": "success", "message": f"Moved mouse to ({x}, {y})"}
+
+            elif command == "click":
+                button = action.get("button", "left")
+                pyautogui.click(button=button)
+                return {"status": "success", "message": f"Clicked {button} button"}
+
+            elif command == "type":
+                text = action.get("text", "")
+                pyautogui.typewrite(text)
+                return {"status": "success", "message": f"Typed '{text}'"}
+
+            elif command == "scroll":
+                amount = action.get("amount", 0)
+                pyautogui.scroll(amount)
+                return {"status": "success", "message": f"Scrolled {amount}"}
+
+            else:
+                return {"status": "error", "message": "Unknown screen navigation command"}
+
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def close_browser(self):
+        """Close the Selenium WebDriver."""
+        if self.browser:
+            self.browser.quit()
+            self.browser = None
 

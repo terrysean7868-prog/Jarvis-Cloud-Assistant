@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
 import "./reactor.css";
+import DottedRings from "./components/DottedRings";
 
 export default function App() {
   const [status, setStatus] = useState("initializing");
@@ -271,19 +272,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Animated Dotted Rings - Three concentric circles */}
-      <div className="reactor-container">
-        <div className="reactor-ring reactor-ring-1"></div>
-        <div className="reactor-ring reactor-ring-2"></div>
-        <div className="reactor-ring reactor-ring-3"></div>
-        <div 
-          className="reactor-core"
-          style={{ 
-            opacity: reactorEnergy,
-            transform: `scale(${0.8 + reactorEnergy * 0.4})`
-          }}
-        ></div>
-      </div>
+      <DottedRings />
 
       <div className="conversation">
         {conversation.map((m, i) => (

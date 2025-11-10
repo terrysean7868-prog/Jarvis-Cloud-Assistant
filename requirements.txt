@@ -79,3 +79,9 @@ APScheduler>=3.10.0         # Task scheduling - Background jobs
 # telegram
 # sqlalchemy
 # tqdm
+
+# Selenium for browser automation
+selenium>=4.0.0
+
+# Screen navigation
+pyautogui>=0.9.53

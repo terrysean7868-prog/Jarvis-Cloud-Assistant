@@ -1,0 +1,45 @@
+.dotted-rings {
+  position: absolute;
+  top: 10%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 200px;
+  height: 200px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.ring {
+  position: absolute;
+  border: 2px dashed #00bcd4;
+  border-radius: 50%;
+  animation: rotate 4s linear infinite;
+}
+
+.ring1 {
+  width: 100px;
+  height: 100px;
+  animation-delay: 0s;
+}
+
+.ring2 {
+  width: 150px;
+  height: 150px;
+  animation-delay: 0.5s;
+}
+
+.ring3 {
+  width: 200px;
+  height: 200px;
+  animation-delay: 1s;
+}
+
+@keyframes rotate {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
