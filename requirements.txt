@@ -39,8 +39,8 @@ SpeechRecognition==3.8.1
 pydub==0.25.1
 vosk==0.3.42
 # webrtcvad==2.0.10  # Requires MSVC Build Tools - comment out if build fails
-sounddevice>=0.4.6
-soundfile>=0.12.1
+# sounddevice>=0.4.6  # Optional: requires PortAudio native library. Comment out on hosted platforms
+# soundfile>=0.12.1  # Optional: used for audio file I/O. Comment out if PortAudio is unavailable
 pyttsx3>=2.90
 pocketsphinx>=0.1.15
 

@@ -4,8 +4,18 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 import asyncio
 from pathlib import Path
-import sounddevice as sd
-import soundfile as sf
+
+# sounddevice/soundfile require PortAudio native library which is not
+# available on many hosted platforms (eg. Render). Import lazily and
+# provide a safe fallback so the app can run without audio support.
+try:
+    import sounddevice as sd
+    import soundfile as sf
+    AUDIO_AVAILABLE = True
+except Exception:
+    sd = None
+    sf = None
+    AUDIO_AVAILABLE = False
 import queue
 import threading
 from utils.db import db
@@ -32,45 +42,75 @@ class CognitiveFunctions:
         
     def setup_audio_system(self):
         """Initialize audio input/output systems"""
+        # Initialize speech (TTS) if available. pyttsx3 is pure Python and
+        # usually works on hosted platforms, but still guard imports.
         try:
-            # Setup audio output (speech)
             import pyttsx3
             self.speech_output = pyttsx3.init()
             # Configure voice properties
             self.speech_output.setProperty('rate', 150)
             self.speech_output.setProperty('volume', 0.9)
-            
-            # Setup audio input (microphone)
-            self.audio_input = sd.InputStream(
-                channels=1,
-                samplerate=16000,
-                callback=self._audio_callback
-            )
-            self.audio_input.start()
-            
         except Exception as e:
+            self.speech_output = None
             db.save_system_event(
-                event_type='audio_setup_error',
-                description=str(e),
-                status='error'
+                event_type='speech_setup_error',
+                description=f'pyttsx3 init failed: {e}',
+                status='warning'
+            )
+
+        # Initialize audio input only when PortAudio (sounddevice) is available.
+        if AUDIO_AVAILABLE and sd is not None:
+            try:
+                self.audio_input = sd.InputStream(
+                    channels=1,
+                    samplerate=16000,
+                    callback=self._audio_callback
+                )
+                self.audio_input.start()
+            except Exception as e:
+                self.audio_input = None
+                db.save_system_event(
+                    event_type='audio_input_error',
+                    description=str(e),
+                    status='warning'
+                )
+        else:
+            # Log a non-fatal warning so deploy logs show why audio was disabled.
+            db.save_system_event(
+                event_type='audio_unavailable',
+                description='PortAudio/sounddevice not available; audio input disabled',
+                status='warning'
             )
     
     def _audio_callback(self, indata, frames, time, status):
         """Handle incoming audio data"""
         if status:
             print(f"Audio callback status: {status}")
-        self.audio_queue.put(indata.copy())
+        # Only enqueue if audio_queue exists and input data is present
+        try:
+            self.audio_queue.put(indata.copy())
+        except Exception:
+            pass
     
     async def speak(self, text: str):
         """Convert text to speech"""
         try:
+            if not self.speech_output:
+                # TTS not available in this environment; no-op
+                db.save_system_event(
+                    event_type='speech_skipped',
+                    description='TTS unavailable; speak() skipped',
+                    status='warning'
+                )
+                return
+
             def speak_async():
                 self.speech_output.say(text)
                 self.speech_output.runAndWait()
-            
+
             # Run in thread pool to avoid blocking
             await asyncio.get_event_loop().run_in_executor(None, speak_async)
-            
+
             # Log speech output
             db.save_system_event(
                 event_type='speech_output',
