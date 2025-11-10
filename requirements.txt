@@ -23,6 +23,13 @@ google-generativeai>=0.3.0
 # Version Control
 gitpython>=3.1.0
 
+# Background Job Scheduling
+APScheduler>=3.10.0
+
+# Web Scraping and Internet Access
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
 # Basic ML/Data Science (Required for Core Features)
 numpy>=1.21.0
 scikit-learn>=1.0.2  # Pattern recognition
@@ -56,8 +63,8 @@ gensim>=4.1.2        # Topic modeling
 # =============================================================================
 # Optional: Integrations
 # =============================================================================
-python-telegram-bot==13.15  # Telegram bot support
-APScheduler==3.6.3         # Task scheduling
+# python-telegram-bot==13.15  # Telegram bot support (incompatible with newer APScheduler)
+APScheduler>=3.10.0         # Task scheduling - Background jobs
 
 # =============================================================================
 # Development Dependencies (Optional)

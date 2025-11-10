@@ -16,17 +16,44 @@
 html, body {
   margin: 0;
   height: 100%;
+  width: 100%;
   background: radial-gradient(circle at center, #000 70%, #03030f 100%);
   font-family: "Orbitron", sans-serif;
   color: var(--text);
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/* ===== Responsive Design ===== */
+@media (max-width: 1024px) {
+  :root {
+    --ring-size-1: 160px;
+    --ring-size-2: 200px;
+    --ring-size-3: 240px;
+  }
 }
 
 @media (max-width: 768px) {
   :root {
-    --ring-size-1: 150px;
-    --ring-size-2: 180px;
-    --ring-size-3: 210px;
+    --ring-size-1: 120px;
+    --ring-size-2: 150px;
+    --ring-size-3: 180px;
+  }
+  
+  html, body {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 480px) {
+  :root {
+    --ring-size-1: 100px;
+    --ring-size-2: 130px;
+    --ring-size-3: 160px;
+  }
+  
+  html, body {
+    font-size: 12px;
   }
 }
 
@@ -35,22 +62,54 @@ html, body {
   flex-direction: column;
   align-items: center;
   justify-content: flex-start;
-  height: 100%;
-  padding: 20px;
+  height: 100vh;
+  padding: 15px;
+  gap: 15px;
+}
+
+@media (max-width: 768px) {
+  .app-root {
+    padding: 10px;
+    gap: 10px;
+  }
 }
 
 .app-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  width: 90%;
+  width: 100%;
   max-width: 900px;
+  padding: 10px 0;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+@media (max-width: 480px) {
+  .app-header {
+    justify-content: center;
+    text-align: center;
+  }
 }
 
 .title {
   font-size: 28px;
   color: var(--mint);
   text-shadow: 0 0 15px var(--mint);
+  flex: 1;
+}
+
+@media (max-width: 768px) {
+  .title {
+    font-size: 24px;
+  }
+}
+
+@media (max-width: 480px) {
+  .title {
+    font-size: 18px;
+    flex: 100%;
+  }
 }
 
 .status {
@@ -60,83 +119,217 @@ html, body {
   font-size: 14px;
   color: var(--muted);
 }
+
+@media (max-width: 480px) {
+  .status {
+    font-size: 12px;
+    flex: 100%;
+    justify-content: center;
+  }
+}
+
 .status-dot {
   width: 12px;
   height: 12px;
   border-radius: 50%;
   box-shadow: 0 0 10px currentColor;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@media (max-width: 480px) {
+  .status-dot {
+    width: 10px;
+    height: 10px;
+  }
 }
 
 .reactor-container {
   position: relative;
-  margin-top: 20px;
-  width: 160px;
-  height: 160px;
-  transition: all 0.2s ease-out;
+  margin-top: 10px;
+  width: var(--ring-size-1);
+  height: var(--ring-size-1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.3s ease-out;
 }
-.reactor-ring {
+
+/* ===== Dotted Ring 1 (Inner) ===== */
+.reactor-ring-1 {
   position: absolute;
-  width: 160px;
-  height: 160px;
+  width: var(--ring-size-1);
+  height: var(--ring-size-1);
   border-radius: 50%;
-  border: 4px solid var(--cyan);
-  box-shadow: 0 0 20px var(--cyan), inset 0 0 40px var(--cyan);
-  animation: spin 6s linear infinite;
+  border: 3px dotted var(--cyan);
+  box-shadow: 0 0 15px var(--cyan), inset 0 0 30px var(--cyan-glow);
+  animation: spin-cw 8s linear infinite;
+  opacity: 0.9;
 }
+
+/* ===== Dotted Ring 2 (Middle) ===== */
+.reactor-ring-2 {
+  position: absolute;
+  width: var(--ring-size-2);
+  height: var(--ring-size-2);
+  border-radius: 50%;
+  border: 2px dotted var(--mint);
+  box-shadow: 0 0 20px var(--mint), inset 0 0 40px var(--mint-glow);
+  animation: spin-ccw 10s linear infinite;
+  opacity: 0.7;
+}
+
+/* ===== Dotted Ring 3 (Outer) ===== */
+.reactor-ring-3 {
+  position: absolute;
+  width: var(--ring-size-3);
+  height: var(--ring-size-3);
+  border-radius: 50%;
+  border: 2px dotted var(--warn);
+  box-shadow: 0 0 25px var(--warn), inset 0 0 50px var(--warn-glow);
+  animation: spin-cw 12s linear infinite;
+  opacity: 0.6;
+}
+
 .reactor-core {
   position: absolute;
   width: 60px;
   height: 60px;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
   border-radius: 50%;
   background: radial-gradient(circle, var(--mint), #003a10);
   box-shadow: 0 0 25px var(--mint), 0 0 60px var(--mint);
+  transition: all 0.3s ease-out;
+  z-index: 10;
+}
+
+@media (max-width: 768px) {
+  .reactor-ring-1,
+  .reactor-ring-2,
+  .reactor-ring-3 {
+    border-width: 2px;
+  }
+  
+  .reactor-core {
+    width: 50px;
+    height: 50px;
+  }
+}
+
+@media (max-width: 480px) {
+  .reactor-core {
+    width: 40px;
+    height: 40px;
+  }
+  
+  .reactor-ring-1,
+  .reactor-ring-2,
+  .reactor-ring-3 {
+    border-width: 1.5px;
+  }
 }
 
 .main-card {
-  margin-top: 20px;
-  width: 90%;
+  margin-top: 15px;
+  width: 100%;
   max-width: 900px;
   background: rgba(255,255,255,0.02);
   border-radius: 16px;
   border: 1px solid rgba(255,255,255,0.05);
   padding: 20px;
   box-shadow: 0 4px 40px rgba(0,255,255,0.1);
-}
-
-.messages {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-height: 60vh;
+  max-height: 50vh;
   overflow-y: auto;
 }
 
-.msg {
+@media (max-width: 768px) {
+  .main-card {
+    padding: 15px;
+    max-height: 40vh;
+  }
+}
+
+@media (max-width: 480px) {
+  .main-card {
+    padding: 12px;
+    max-height: 35vh;
+    margin-top: 10px;
+  }
+}
+
+.conversation {
   display: flex;
   flex-direction: column;
+  gap: 10px;
+  max-height: 50vh;
+  overflow-y: auto;
+  padding-right: 8px;
 }
-.msg-bubble {
-  background: rgba(255,255,255,0.03);
-  border-radius: 12px;
+
+@media (max-width: 768px) {
+  .conversation {
+    gap: 8px;
+    max-height: 40vh;
+  }
+}
+
+@media (max-width: 480px) {
+  .conversation {
+    gap: 6px;
+    max-height: 35vh;
+  }
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
   padding: 10px 14px;
-  max-width: 80%;
+  border-radius: 8px;
+  max-width: 85%;
+  word-wrap: break-word;
 }
-.msg.jarvis .msg-bubble {
+
+.message.jarvis {
   border-left: 3px solid var(--cyan);
+  background: rgba(0, 212, 255, 0.05);
   color: #a3f5ff;
+  align-self: flex-start;
 }
-.msg.you .msg-bubble {
+
+.message.you {
   border-right: 3px solid var(--mint);
+  background: rgba(0, 255, 200, 0.05);
   color: #b2ffb2;
   align-self: flex-end;
+  max-width: 85%;
 }
-.msg-label {
-  font-size: 11px;
-  opacity: 0.6;
-  margin-bottom: 3px;
+
+.message.interim {
+  color: var(--muted);
+  font-style: italic;
+  opacity: 0.7;
+  align-self: flex-start;
+}
+
+.message.processing {
+  color: var(--warn);
+}
+
+@media (max-width: 768px) {
+  .message {
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+}
+
+@media (max-width: 480px) {
+  .message {
+    padding: 6px 10px;
+    font-size: 12px;
+    max-width: 90%;
+  }
+  
+  .message.you {
+    max-width: 90%;
+  }
 }
 
 .instructions {
@@ -144,6 +337,96 @@ html, body {
   font-size: 14px;
   color: var(--muted);
   text-align: center;
+  width: 100%;
+  max-width: 900px;
+  padding: 10px;
+}
+
+@media (max-width: 768px) {
+  .instructions {
+    font-size: 12px;
+    margin-top: 10px;
+  }
+}
+
+@media (max-width: 480px) {
+  .instructions {
+    font-size: 11px;
+    margin-top: 8px;
+    padding: 5px;
+  }
+}
+
+.mic-status {
+  font-weight: bold;
+  margin-bottom: 5px;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.hint {
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.hint strong {
+  color: var(--mint);
+}
+
+@media (max-width: 480px) {
+  .hint {
+    font-size: 10px;
+  }
+}
+
+.processing-dots {
+  display: inline-block;
+}
+
+.processing-dots::after {
+  content: '';
+  animation: dots 1.4s steps(4, end) infinite;
+}
+
+/* ===== ANIMATIONS ===== */
+@keyframes spin-cw {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes spin-ccw {
+  from { transform: rotate(360deg); }
+  to { transform: rotate(0deg); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes dots {
+  0%, 20% { content: ''; }
+  40% { content: '.'; }
+  60% { content: '..'; }
+  80%, 100% { content: '...'; }
+}
+
+/* ===== SCROLLBAR STYLING ===== */
+.conversation::-webkit-scrollbar {
+  width: 6px;
+}
+
+.conversation::-webkit-scrollbar-track {
+  background: rgba(255,255,255,0.05);
+  border-radius: 3px;
+}
+
+.conversation::-webkit-scrollbar-thumb {
+  background: rgba(0,255,200,0.3);
+  border-radius: 3px;
+}
+
+.conversation::-webkit-scrollbar-thumb:hover {
+  background: rgba(0,255,200,0.6);
 }
 
 @keyframes spin {

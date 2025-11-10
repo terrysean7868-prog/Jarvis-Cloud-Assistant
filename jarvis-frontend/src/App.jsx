@@ -271,7 +271,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* New Reactor Rings */}
+      {/* Animated Dotted Rings - Three concentric circles */}
       <div className="reactor-container">
         <div className="reactor-ring reactor-ring-1"></div>
         <div className="reactor-ring reactor-ring-2"></div>
@@ -280,7 +280,7 @@ export default function App() {
           className="reactor-core"
           style={{ 
             opacity: reactorEnergy,
-            transform: `translate(-50%, -50%) scale(${0.8 + reactorEnergy * 0.4})`
+            transform: `scale(${0.8 + reactorEnergy * 0.4})`
           }}
         ></div>
       </div>

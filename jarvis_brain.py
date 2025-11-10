@@ -14,6 +14,14 @@ import inspect
 import ast
 from cognitive_core import JarvisCognition, CognitiveMode
 
+# Import memory system
+try:
+    from memory import BotMemory
+    MEMORY_AVAILABLE = True
+except ImportError:
+    MEMORY_AVAILABLE = False
+    BotMemory = None
+
 # Allow Jarvis to modify its own code: modules, utils, config files, and core files
 DEFAULT_ALLOWED = "modules,utils,jarvis-frontend/src,app.py,jarvis_brain.py,llm_adapter.py,executor.py,git_sync.py,run_jarvis.py,config.py,requirements.txt,README.md"
 ALLOWED_PATHS = [p.strip() for p in os.getenv("ALLOWED_PATHS", DEFAULT_ALLOWED).split(",") if p.strip()]
@@ -82,11 +90,16 @@ class ContextManager:
         ])
 
 class JarvisBrain:
-    def __init__(self, llm: LLMAdapter):
+    def __init__(self, llm: LLMAdapter, user_id: str = "default"):
         self.llm = llm
+        self.user_id = user_id
         self.context = ContextManager()
         self.conn = sqlite3.connect('jarvis_memory.db', check_same_thread=False)
         self.cognition = JarvisCognition()  # Initialize cognitive architecture
+        
+        # Initialize memory system
+        self.memory = BotMemory(user_id) if MEMORY_AVAILABLE else None
+        
         self.setup_database()
         self.capabilities = self._load_capabilities()
         self.current_mode = CognitiveMode.INTERACT
@@ -122,11 +135,20 @@ class JarvisBrain:
             if file_path.stem.startswith('_'):
                 continue
             
-            analysis = CodeAnalyzer.analyze_python_file(str(file_path))
-            capabilities[file_path.stem] = {
-                'analysis': analysis,
-                'module': importlib.import_module(f'modules.{file_path.stem}')
-            }
+            try:
+                analysis = CodeAnalyzer.analyze_python_file(str(file_path))
+                capabilities[file_path.stem] = {
+                    'analysis': analysis,
+                    'module': importlib.import_module(f'modules.{file_path.stem}')
+                }
+            except Exception as e:
+                print(f"⚠️ Could not load module '{file_path.stem}': {e}")
+                # Continue loading other modules even if one fails
+                capabilities[file_path.stem] = {
+                    'analysis': {'functions': [], 'classes': [], 'imports': []},
+                    'module': None,
+                    'error': str(e)
+                }
         
         return capabilities
 
@@ -236,8 +258,13 @@ class JarvisBrain:
         # Add message to context
         self.context.add_to_history('user', text)
         
-        # Get relevant context
+        # Get relevant context (both from history and memory if available)
         context = self.context.get_relevant_context(text)
+        
+        # Add memory context if available
+        if self.memory:
+            memory_context = self.memory.get_contextual_memory()
+            context = f"{context}\n{memory_context}" if context and memory_context else context or memory_context
         
         try:
             # Check for mode change commands
@@ -335,24 +362,36 @@ class JarvisBrain:
                 for action in actions:
                     await self.execute_action(action)
             
+            response_text = response.get('text', str(response)) if isinstance(response, dict) else str(response)
+            intent = response.get('intent') if isinstance(response, dict) else None
+            
+            # Store conversation in memory if available
+            if self.memory:
+                self.memory.save_conversation(
+                    user_input=text,
+                    bot_response=response_text,
+                    intent=intent
+                )
+            
             # Store interaction in MongoDB
             db.save_chat(
                 user_input=text,
-                bot_response=response.get('text', str(response)),
+                bot_response=response_text,
                 session_id=session_id,
-                intent=response.get('intent'),
+                intent=intent,
                 context={
                     'mode': self.cognition.cognitive.current_mode.value,
-                    'actions': actions
+                    'actions': actions,
+                    'source': response.get('source', 'unknown') if isinstance(response, dict) else 'unknown'
                 }
             )
             
             # Add response to context
-            self.context.add_to_history('assistant', str(response))
+            self.context.add_to_history('assistant', response_text)
             
             # Vocalize response if speech is enabled
             if mode == 'voice':
-                await self.cognition.cognitive.speak(response.get('text', str(response)))
+                await self.cognition.cognitive.speak(response_text)
             
             return {
                 'text': response.get('text', str(response)),
