@@ -3,10 +3,17 @@ import re
 import logging
 import importlib
 import sys
+import json
 from openai import OpenAI
+from pathlib import Path
+from git import Repo
 
 # Get OpenAI API key from secret environment variable
 OPENAI_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_SECRET_KEY")
+
+# System paths
+ROOT_DIR = Path(__file__).parent.parent
+MODULES_DIR = Path(__file__).parent
 
 client = OpenAI(api_key=OPENAI_KEY)
 logger = logging.getLogger("jarvis.auto_update")
@@ -48,6 +55,73 @@ def reload_module(name: str):
         importlib.reload(sys.modules[modname])
     else:
         importlib.import_module(modname)
+
+def self_update(system_description: str) -> bool:
+    """
+    Updates the system based on natural language description.
+    Returns True if update was successful.
+    """
+    try:
+        # Generate improvement code using AI
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are an expert Python developer helping improve a Jarvis assistant."},
+                {"role": "user", "content": f"Improve this system by: {system_description}\nProvide only the code changes needed."}
+            ]
+        )
+        
+        code = extract_python_code(response.choices[0].message.content)
+        if not code:
+            return False
+
+        # Create backup
+        backup_dir = ROOT_DIR / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        
+        # Apply changes with git version control
+        repo = Repo(ROOT_DIR)
+        branch_name = f"auto-update-{int(time.time())}"
+        current = repo.active_branch
+        
+        new_branch = repo.create_head(branch_name)
+        new_branch.checkout()
+        
+        try:
+            # Apply changes
+            module_path = MODULES_DIR / "auto_update.py"
+            with open(module_path, 'w') as f:
+                f.write(code)
+            
+            # Test changes
+            try:
+                importlib.reload(sys.modules[__name__])
+            except Exception as e:
+                logger.error(f"Update validation failed: {e}")
+                current.checkout()
+                repo.delete_head(new_branch)
+                return False
+                
+            # Commit changes
+            repo.index.add([str(module_path)])
+            repo.index.commit(f"Auto-update: {system_description[:50]}")
+            
+            # Merge back to original branch
+            current.checkout()
+            repo.git.merge(branch_name)
+            
+            logger.info(f"Successfully applied system update: {system_description[:50]}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Update failed: {e}")
+            current.checkout()
+            repo.delete_head(new_branch)
+            return False
+            
+    except Exception as e:
+        logger.error(f"Self-update failed: {e}")
+        return False
 
 
 def update_help_list(module_name: str, description: str):

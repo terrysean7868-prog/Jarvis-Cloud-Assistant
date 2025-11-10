@@ -8,6 +8,7 @@ export default function App() {
   ]);
   const [interimText, setInterimText] = useState("");
   const [reactorEnergy, setReactorEnergy] = useState(0.1);
+  const [ringRotations, setRingRotations] = useState([0, 0, 0, 0]);
 
   const recognitionRef = useRef(null);
   const audioStreamRef = useRef(null);

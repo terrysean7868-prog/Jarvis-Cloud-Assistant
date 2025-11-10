@@ -31,6 +31,33 @@ def register(dp, services, scheduler):
                 mod = re.sub(r".*module", "", lower).strip()
                 auto_update.update_module_from_voice(update, mod)
                 return
+            elif re.search(r"sync.*git|push.*changes", lower):
+                from git_sync import git_sync, get_changes_summary
+                repo_path = os.path.dirname(os.path.dirname(__file__))
+                
+                changes = get_changes_summary(repo_path)
+                if not changes:
+                    update.message.reply_text("No changes to sync.")
+                    return
+                    
+                try:
+                    update.message.reply_text("Starting git sync...")
+                    git_sync(repo_path, f"Auto-sync: {changes[:50]}")
+                    update.message.reply_text("✅ Successfully synced changes with GitHub.")
+                except Exception as e:
+                    update.message.reply_text(f"❌ Git sync failed: {str(e)}")
+                return
+            elif re.search(r"show.*git.*status|check.*changes", lower):
+                from git_sync import get_changes_summary, get_diff_stats
+                repo_path = os.path.dirname(os.path.dirname(__file__))
+                
+                changes = get_changes_summary(repo_path)
+                if not changes:
+                    update.message.reply_text("No pending changes.")
+                else:
+                    stats = get_diff_stats(repo_path)
+                    update.message.reply_text(f"Pending changes:\n{changes}\n\nStats:\n{stats}")
+                return
             else:
                 update.message.reply_text("⚙️ Could not interpret your voice command.")
 

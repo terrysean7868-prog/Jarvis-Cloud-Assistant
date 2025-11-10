@@ -10,14 +10,15 @@ google-generativeai>=0.3.0
 gitpython>=3.1.0
 aiofiles>=23.0.0
 python-multipart>=0.0.6
-
-# Optional dependencies (for additional features)
-# Uncomment if needed:
-# python-telegram-bot==13.15
-# APScheduler==3.6.3
-# pymongo==4.4.0
-# SpeechRecognition==3.8.1
-# pydub==0.25.1
+pymongo>=4.4.0
+python-telegram-bot==13.15
+APScheduler==3.6.3
+SpeechRecognition==3.8.1
+pydub==0.25.1
+vosk==0.3.42
+webrtcvad==2.0.10
+numpy>=1.21.0
+pocketsphinx>=0.1.15
 # ffmpeg-python==0.2.0
 # gunicorn==20.1.0
 # PyYAML>=6.0.1  # Use newer version that doesn't require Cython
