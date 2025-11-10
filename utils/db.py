@@ -1,9 +1,12 @@
 from pymongo import MongoClient, ASCENDING, DESCENDING, IndexModel
 from datetime import datetime
 import os
+import sqlite3
+from pathlib import Path
 from dotenv import load_dotenv
 import json
 from bson import ObjectId
+from urllib.parse import quote_plus, urlparse
 
 load_dotenv()
 
@@ -28,19 +31,88 @@ class Database:
         if self._initialized:
             return
             
-        self.uri = os.getenv('MONGODB_URI') or os.getenv('MONGO_URI')
-        if not self.uri:
+        uri = os.getenv('MONGODB_URI') or os.getenv('MONGO_URI')
+        if not uri:
             raise ValueError("MongoDB URI not found in environment variables")
             
         try:
+            # Handle MongoDB URI with special characters
+            if 'mongodb+srv://' in uri:
+                # Split the URI into parts
+                prefix = 'mongodb+srv://'
+                rest = uri.replace(prefix, '')
+                
+                # Find the position of the last @ before the hostname
+                last_at = rest.rindex('@')
+                
+                # Split credentials and host info
+                credentials = rest[:last_at]
+                host_part = rest[last_at + 1:]
+                
+                # Find username and password
+                username_end = credentials.find(':')
+                username = credentials[:username_end]
+                password = credentials[username_end + 1:]
+                
+                # Reconstruct URI with escaped characters
+                self.uri = f"{prefix}{quote_plus(username)}:{quote_plus(password)}@{host_part}"
+                print("MongoDB URI successfully parsed and escaped")
+            else:
+                self.uri = uri
+                
+            # Initialize MongoDB connection
             self.client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
             self.client.admin.command('ping')
             self.db = self.client[os.getenv('MONGODB_DB_NAME', 'jarvis_db')]
             self._initialized = True
             self._setup_collections()
+            
+            print("Successfully connected to MongoDB")
+            
         except Exception as e:
+            print(f"MongoDB connection error: {str(e)}")
+            # Fallback to local storage if MongoDB connection fails
+            self._setup_local_fallback()
             raise ConnectionError(f'MongoDB connection failed: {e}')
             
+    def _setup_local_fallback(self):
+        """Setup local SQLite database as fallback"""
+        try:
+            db_path = Path("jarvis_local.db")
+            self.local_db = sqlite3.connect(str(db_path))
+            cursor = self.local_db.cursor()
+            
+            # Create tables for essential data
+            cursor.executescript("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT,
+                    message TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE TABLE IF NOT EXISTS system_events (
+                    id INTEGER PRIMARY KEY,
+                    event_type TEXT,
+                    description TEXT,
+                    status TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_chat_timestamp 
+                ON chat_history(timestamp DESC);
+                
+                CREATE INDEX IF NOT EXISTS idx_events_type 
+                ON system_events(event_type);
+            """)
+            
+            self.local_db.commit()
+            print("Local SQLite database initialized as fallback")
+            
+        except Exception as e:
+            print(f"Failed to setup local fallback: {e}")
+            raise
+    
     def _setup_collections(self):
         """Setup collections with proper indexes and schemas"""
         # Chat History Collection

@@ -178,8 +178,11 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=3):
             retry_count += 1
             
     return False
-            slug = github_repo.replace("https://github.com/", "")
-            repo_url = f"git@github.com:{slug}"
+
+def _get_repo_url(github_repo, github_token=None, github_user=None, github_pass=None):
+    if ssh_key:
+        slug = github_repo.replace("https://github.com/", "")
+        repo_url = f"git@github.com:{slug}"
     elif github_token:
         slug = github_repo.split("github.com/")[-1]
         repo_url = f"https://{github_token}@github.com/{slug}"

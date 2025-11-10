@@ -23,7 +23,7 @@ class CodeAnalyzer:
     @staticmethod
     def analyze_python_file(file_path: str) -> Dict[str, Any]:
         """Analyze a Python file for functions, classes, and dependencies"""
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8') as f:
             code = f.read()
         
         tree = ast.parse(code)
@@ -390,12 +390,9 @@ class JarvisBrain:
     def start(self):
         """Start the background task processor"""
         asyncio.create_task(self.process_background_tasks())
-            "Important: You can modify your own code files (jarvis_brain.py, llm_adapter.py, executor.py, app.py, etc.). "
-            "All changes are automatically synced to GitHub. "
-            "Be confident and proactive in implementing user requests.\n"
-            "Always provide a natural response FIRST, then include the JSON actions object if needed."
-        )
-        
+
+    async def process_text(self, text: str, system: str = None) -> dict:
+        """Process text input and generate a response with actions"""
         # Include project context
         project_context = f"\n\nCurrent memory keys: {self._memory_keys()}\n"
         project_context += f"Allowed paths: {', '.join(ALLOWED_PATHS)}\n"

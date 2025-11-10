@@ -1,34 +1,70 @@
-# Core dependencies (required)
+# =============================================================================
+# Core Dependencies (Required)
+# =============================================================================
+# Web Framework and API
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 httpx>=0.25.0
+aiohttp>=3.8.5
+python-multipart>=0.0.6
+
+# Database and Storage
+pymongo>=4.4.0
+aiofiles>=23.0.0
+
+# LLM and AI
 openai>=1.0.0
 google-generativeai>=0.3.0
+
+# Version Control
 gitpython>=3.1.0
-aiofiles>=23.0.0
-python-multipart>=0.0.6
-pymongo>=4.4.0
-python-telegram-bot==13.15
-APScheduler==3.6.3
+
+# Basic ML/Data Science (Required for Core Features)
+numpy>=1.21.0
+scikit-learn>=1.0.2  # Pattern recognition
+networkx>=2.6.3      # Knowledge graph
+scipy>=1.7.3         # Scientific computing
+
+# =============================================================================
+# Optional: Voice Recognition and Audio Processing
+# Requires: Microsoft Visual C++ Build Tools for some packages
+# =============================================================================
+# Comment out this section if you don't need voice features
+# or if you have build issues
 SpeechRecognition==3.8.1
 pydub==0.25.1
 vosk==0.3.42
-webrtcvad==2.0.10
-numpy>=1.21.0
+# webrtcvad==2.0.10  # Requires MSVC Build Tools - comment out if build fails
 sounddevice>=0.4.6
 soundfile>=0.12.1
 pyttsx3>=2.90
-scikit-learn>=1.0.2  # For pattern recognition and learning
-tensorflow>=2.13.0   # For advanced cognitive processing
-networkx>=2.6.3      # For knowledge graph management
-scipy>=1.7.3         # Required for scientific computing
-pandas>=1.3.3        # For data analysis
-nltk>=3.6.5          # For natural language processing
-gensim>=4.1.2        # For topic modeling and text analysis
 pocketsphinx>=0.1.15
+
+# =============================================================================
+# Optional: Advanced AI/ML Features
+# High memory/CPU usage - comment out if not needed
+# =============================================================================
+tensorflow>=2.13.0   # Advanced cognitive processing
+pandas>=1.3.3        # Data analysis
+nltk>=3.6.5          # Natural language processing
+gensim>=4.1.2        # Topic modeling
+
+# =============================================================================
+# Optional: Integrations
+# =============================================================================
+python-telegram-bot==13.15  # Telegram bot support
+APScheduler==3.6.3         # Task scheduling
+
+# =============================================================================
+# Development Dependencies (Optional)
+# =============================================================================
+# ffmpeg-python==0.2.0     # Audio processing
+# PyYAML>=6.0.1           # Configuration
+# sqlalchemy              # Database ORM
+# tqdm                    # Progress bars
 # ffmpeg-python==0.2.0
 # gunicorn==20.1.0
 # PyYAML>=6.0.1  # Use newer version that doesn't require Cython
