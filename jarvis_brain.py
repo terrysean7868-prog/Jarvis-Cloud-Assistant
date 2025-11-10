@@ -244,15 +244,56 @@ class JarvisBrain:
             if text.lower().startswith('switch to'):
                 requested_mode = text.lower().replace('switch to', '').strip()
                 try:
-                    await self.cognition.switch_mode(CognitiveMode(requested_mode))
-                    return {
-                        'text': f'Switched to {requested_mode} mode',
-                        'status': 'success',
-                        'mode_change': True
+                    cognitive_mode = CognitiveMode(requested_mode)
+                    await self.cognition.switch_mode(cognitive_mode)
+                    
+                    mode_descriptions = {
+                        CognitiveMode.LEARN: (
+                            "Learning mode activated. I'll now focus on pattern recognition, "
+                            "knowledge acquisition, and updating my understanding based on our interactions."
+                        ),
+                        CognitiveMode.DEVELOP: (
+                            "Development mode activated. I'll focus on system improvements, "
+                            "code analysis, and implementing new features."
+                        ),
+                        CognitiveMode.EXECUTE: (
+                            "Execution mode activated. I'll focus on task completion, "
+                            "command processing, and efficient operation."
+                        ),
+                        CognitiveMode.INTERACT: (
+                            "Interaction mode activated. I'll focus on natural conversation "
+                            "and assisting you with any questions or tasks."
+                        )
                     }
-                except ValueError:
+                    
+                    response_text = mode_descriptions.get(
+                        cognitive_mode,
+                        f"Switched to {requested_mode} mode. Ready for your instructions."
+                    )
+                    
+                    # Store mode change in context memory
+                    self.context_memory['last_mode_change'] = {
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'from_mode': str(self.current_mode) if hasattr(self, 'current_mode') else 'unknown',
+                        'to_mode': str(cognitive_mode)
+                    }
+                    
+                    self.current_mode = cognitive_mode
+                    
                     return {
-                        'text': f'Invalid mode: {requested_mode}',
+                        'text': response_text,
+                        'status': 'success',
+                        'mode_change': True,
+                        'mode': cognitive_mode.value
+                    }
+                    
+                except ValueError:
+                    available_modes = [mode.value for mode in CognitiveMode]
+                    return {
+                        'text': (
+                            f"Invalid mode: '{requested_mode}'. Available modes are: "
+                            f"{', '.join(available_modes)}"
+                        ),
                         'status': 'error'
                     }
             

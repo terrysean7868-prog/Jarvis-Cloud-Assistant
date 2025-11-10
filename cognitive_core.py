@@ -121,15 +121,94 @@ class JarvisCognition:
         self.attention_focus = None
     
     async def switch_mode(self, mode: CognitiveMode):
-        """Switch cognitive operating mode"""
+        """Switch cognitive operating mode and initialize mode-specific components"""
         self.cognitive.current_mode = mode
+        
+        # Initialize mode-specific components
+        if mode == CognitiveMode.LEARN:
+            # Setup learning components
+            await self._initialize_learning_mode()
+        elif mode == CognitiveMode.DEVELOP:
+            # Setup development components
+            await self._initialize_development_mode()
+        elif mode == CognitiveMode.EXECUTE:
+            # Setup execution components
+            await self._initialize_execution_mode()
+            
         await self.cognitive.speak(f"Switching to {mode.value} mode")
         
         # Log mode change
         db.save_system_event(
             event_type='mode_change',
             description=f'Switched to {mode.value} mode',
-            status='success'
+            status='success',
+            details={'previous_mode': self.cognitive.current_mode.value}
+        )
+        
+    async def _initialize_learning_mode(self):
+        """Initialize learning mode components"""
+        # Setup knowledge graph
+        self.knowledge_graph = {}
+        
+        # Initialize pattern recognition
+        self.pattern_detector = {
+            'short_term': [],
+            'long_term': []
+        }
+        
+        # Setup learning rate and parameters
+        self.learning_params = {
+            'rate': 0.1,
+            'batch_size': 32,
+            'epochs': 10
+        }
+        
+        # Log learning mode initialization
+        db.save_system_event(
+            event_type='mode_init',
+            description='Learning mode initialized',
+            status='success',
+            details=self.learning_params
+        )
+        
+    async def _initialize_development_mode(self):
+        """Initialize development mode components"""
+        # Setup code analysis tools
+        self.code_analyzer = CodeAnalyzer()
+        
+        # Initialize development parameters
+        self.dev_params = {
+            'auto_apply': True,
+            'test_mode': False,
+            'backup_enabled': True
+        }
+        
+        # Log development mode initialization
+        db.save_system_event(
+            event_type='mode_init',
+            description='Development mode initialized',
+            status='success',
+            details=self.dev_params
+        )
+        
+    async def _initialize_execution_mode(self):
+        """Initialize execution mode components"""
+        # Setup task queue
+        self.task_queue = asyncio.Queue()
+        
+        # Initialize execution parameters
+        self.exec_params = {
+            'parallel_tasks': 4,
+            'timeout': 30,
+            'retry_count': 3
+        }
+        
+        # Log execution mode initialization
+        db.save_system_event(
+            event_type='mode_init',
+            description='Execution mode initialized',
+            status='success',
+            details=self.exec_params
         )
     
     async def develop_system(self, target_area: str):
