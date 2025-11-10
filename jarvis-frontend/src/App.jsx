@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
+import "./reactor.css";
 
 export default function App() {
   const [status, setStatus] = useState("initializing");
@@ -8,7 +9,7 @@ export default function App() {
   ]);
   const [interimText, setInterimText] = useState("");
   const [reactorEnergy, setReactorEnergy] = useState(0.1);
-  const [ringRotations, setRingRotations] = useState([0, 0, 0, 0]);
+  const [isProcessing, setIsProcessing] = useState(false);
 
   const recognitionRef = useRef(null);
   const audioStreamRef = useRef(null);
@@ -270,36 +271,45 @@ export default function App() {
         </div>
       </header>
 
-      <div
-        className="reactor-container"
-        style={{
-          transform: `scale(${1 + reactorEnergy * 0.2})`,
-          filter: `drop-shadow(0 0 ${30 + reactorEnergy * 60}px #00ffc8)`,
-        }}
-      >
-        <div className={`reactor-ring ${status}`} />
-        <div className="reactor-core" />
+      {/* New Reactor Rings */}
+      <div className="reactor-container">
+        <div className="reactor-ring reactor-ring-1"></div>
+        <div className="reactor-ring reactor-ring-2"></div>
+        <div className="reactor-ring reactor-ring-3"></div>
+        <div 
+          className="reactor-core"
+          style={{ 
+            opacity: reactorEnergy,
+            transform: `translate(-50%, -50%) scale(${0.8 + reactorEnergy * 0.4})`
+          }}
+        ></div>
       </div>
 
-      <main className="main-card">
-        <section className="messages">
-          {conversation.map((m, i) => (
-            <div key={i} className={`msg ${m.from}`}>
-              <div className="msg-label">{m.from === "you" ? "YOU" : "JARVIS"}</div>
-              <div className="msg-bubble">{m.text}</div>
-            </div>
-          ))}
-          {interimText && (
-            <div className="msg you interim">
-              <div className="msg-label">USER</div>
-              <div className="msg-bubble">{interimText}</div>
-            </div>
-          )}
-        </section>
-      </main>
+      <div className="conversation">
+        {conversation.map((m, i) => (
+          <div key={i} className={`message ${m.from}`}>
+            {m.text}
+          </div>
+        ))}
+        {interimText && (
+          <div className="message interim">
+            {interimText}
+          </div>
+        )}
+        {isProcessing && (
+          <div className="message jarvis processing">
+            <span className="processing-dots">Processing</span>
+          </div>
+        )}
+      </div>
 
       <footer className="instructions">
-        🎤 Say <strong>"Hey Jarvis"</strong> — always listening, always learning.
+        <div className="mic-status" style={{ color: getStatusColor() }}>
+          🎤 {status === "listening" ? "Listening..." : status}
+        </div>
+        <div className="hint">
+          Say <strong>"Hey Jarvis"</strong> to begin
+        </div>
       </footer>
     </div>
   );

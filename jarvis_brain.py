@@ -1,53 +1,354 @@
 # jarvis_brain.py
-import os, sqlite3, json
+import os
+import sqlite3
+import json
+from datetime import datetime
+from typing import Dict, List, Optional, Any
 from llm_adapter import LLMAdapter
+from utils.db import db
+import asyncio
+import importlib
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import inspect
+import ast
+from cognitive_core import JarvisCognition, CognitiveMode
 
-DB_PATH = os.getenv("JARVIS_DB", "jarvis_memory.db")
 # Allow Jarvis to modify its own code: modules, utils, config files, and core files
 DEFAULT_ALLOWED = "modules,utils,jarvis-frontend/src,app.py,jarvis_brain.py,llm_adapter.py,executor.py,git_sync.py,run_jarvis.py,config.py,requirements.txt,README.md"
 ALLOWED_PATHS = [p.strip() for p in os.getenv("ALLOWED_PATHS", DEFAULT_ALLOWED).split(",") if p.strip()]
 AUTO_APPLY = os.getenv("AUTO_APPLY", "true").lower() == "true"  # Default to true for Iron Man mode
 
+class CodeAnalyzer:
+    @staticmethod
+    def analyze_python_file(file_path: str) -> Dict[str, Any]:
+        """Analyze a Python file for functions, classes, and dependencies"""
+        with open(file_path, 'r') as f:
+            code = f.read()
+        
+        tree = ast.parse(code)
+        analysis = {
+            'functions': [],
+            'classes': [],
+            'imports': [],
+            'doc': ast.get_docstring(tree)
+        }
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                analysis['functions'].append({
+                    'name': node.name,
+                    'doc': ast.get_docstring(node),
+                    'args': [arg.arg for arg in node.args.args]
+                })
+            elif isinstance(node, ast.ClassDef):
+                analysis['classes'].append({
+                    'name': node.name,
+                    'doc': ast.get_docstring(node),
+                    'methods': [m.name for m in node.body if isinstance(m, ast.FunctionDef)]
+                })
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                if isinstance(node, ast.Import):
+                    for n in node.names:
+                        analysis['imports'].append(n.name)
+                else:
+                    module = node.module if node.module else ''
+                    for n in node.names:
+                        analysis['imports'].append(f"{module}.{n.name}")
+        
+        return analysis
+
+class ContextManager:
+    def __init__(self):
+        self.short_term = {}
+        self.conversation_history = []
+        self.task_queue = asyncio.Queue()
+        self.executor = ThreadPoolExecutor(max_workers=4)
+    
+    def add_to_history(self, role: str, content: str):
+        self.conversation_history.append({
+            'role': role,
+            'content': content,
+            'timestamp': datetime.utcnow()
+        })
+        if len(self.conversation_history) > 100:
+            self.conversation_history.pop(0)
+    
+    def get_relevant_context(self, query: str) -> str:
+        # Implement semantic search on conversation history
+        return "\n".join([
+            f"{msg['role']}: {msg['content']}"
+            for msg in self.conversation_history[-5:]
+        ])
+
 class JarvisBrain:
     def __init__(self, llm: LLMAdapter):
         self.llm = llm
-        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        self._ensure_tables()
+        self.context = ContextManager()
+        self.conn = sqlite3.connect('jarvis_memory.db', check_same_thread=False)
+        self.cognition = JarvisCognition()  # Initialize cognitive architecture
+        self.setup_database()
+        self.capabilities = self._load_capabilities()
+        self.current_mode = CognitiveMode.INTERACT
+        
+    def setup_database(self):
+        """Setup SQLite tables for local memory"""
+        with self.conn:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY,
+                    key TEXT UNIQUE,
+                    value TEXT,
+                    category TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY,
+                    description TEXT,
+                    status TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    completed_at DATETIME
+                )
+            """)
+    
+    def _load_capabilities(self) -> Dict[str, Any]:
+        """Load and analyze all available capabilities"""
+        capabilities = {}
+        modules_dir = Path(__file__).parent / 'modules'
+        
+        for file_path in modules_dir.glob('*.py'):
+            if file_path.stem.startswith('_'):
+                continue
+            
+            analysis = CodeAnalyzer.analyze_python_file(str(file_path))
+            capabilities[file_path.stem] = {
+                'analysis': analysis,
+                'module': importlib.import_module(f'modules.{file_path.stem}')
+            }
+        
+        return capabilities
 
-    def _ensure_tables(self):
-        self.conn.execute("CREATE TABLE IF NOT EXISTS memories (k TEXT PRIMARY KEY, v TEXT)")
-        self.conn.commit()
+    def remember(self, key: str, value: str, category: str = 'general'):
+        """Store information in local memory"""
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO memories (key, value, category) VALUES (?, ?, ?)",
+                (key, value, category)
+            )
+        # Also store in MongoDB for long-term persistence
+        db.save_system_event(
+            event_type='memory_store',
+            description=f'Stored memory: {key}',
+            status='success',
+            details={'category': category, 'value': value}
+        )
 
-    def remember(self, key: str, value: str):
-        self.conn.execute("INSERT OR REPLACE INTO memories (k, v) VALUES (?, ?)", (key, value))
-        self.conn.commit()
+    def recall(self, key: str) -> Optional[str]:
+        """Retrieve information from memory"""
+        cur = self.conn.execute("SELECT value FROM memories WHERE key = ?", (key,))
+        result = cur.fetchone()
+        return result[0] if result else None
 
-    def recall(self, key: str):
-        cur = self.conn.execute("SELECT v FROM memories WHERE k=?", (key,))
-        r = cur.fetchone()
-        return r[0] if r else None
+    async def analyze_code_changes(self, content: str) -> Dict[str, Any]:
+        """Analyze proposed code changes for safety and improvements"""
+        analysis = {
+            'safe': True,
+            'improvements': [],
+            'warnings': [],
+            'affected_modules': []
+        }
+        
+        try:
+            tree = ast.parse(content)
+            for node in ast.walk(tree):
+                # Check for potentially dangerous operations
+                if isinstance(node, ast.Call):
+                    func_name = ''
+                    if isinstance(node.func, ast.Name):
+                        func_name = node.func.id
+                    elif isinstance(node.func, ast.Attribute):
+                        func_name = node.func.attr
+                        
+                    dangerous_funcs = ['eval', 'exec', 'os.system', 'subprocess.call']
+                    if func_name in dangerous_funcs:
+                        analysis['safe'] = False
+                        analysis['warnings'].append(f'Potentially dangerous function: {func_name}')
+                
+                # Collect affected modules
+                if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
+                    for name in node.names:
+                        analysis['affected_modules'].append(name.name)
+        
+        except Exception as e:
+            analysis['safe'] = False
+            analysis['warnings'].append(f'Code analysis error: {str(e)}')
+        
+        return analysis
 
-    def is_path_allowed(self, path: str) -> bool:
-        # normalize and check startswith any allowlisted prefix
-        p = os.path.normpath(path)
-        for allowed in ALLOWED_PATHS:
-            if p.startswith(os.path.normpath(allowed)):
-                return True
-        return False
+    async def execute_action(self, action: Dict[str, Any]) -> bool:
+        """Execute a proposed action safely"""
+        try:
+            action_type = action['type']
+            if action_type == 'code_change':
+                analysis = await self.analyze_code_changes(action['content'])
+                if not analysis['safe']:
+                    return False
+                    
+                # Log the change
+                db.save_module_change(
+                    module_name=action.get('module', 'unknown'),
+                    change_type='update',
+                    content=action['content']
+                )
+                
+            elif action_type == 'system_command':
+                # Log the command
+                db.save_system_event(
+                    event_type='command_execution',
+                    description=action['command'],
+                    status='pending'
+                )
+                
+            elif action_type == 'git_operation':
+                # Log the git operation
+                db.save_git_sync(
+                    commit_hash=action.get('commit_hash'),
+                    message=action['message'],
+                    status='pending'
+                )
+                
+            return True
+            
+        except Exception as e:
+            db.save_system_event(
+                event_type='action_error',
+                description=str(e),
+                status='error'
+            )
+            return False
 
-    async def handle_message(self, text: str, mode: str = "chat"):
-        system = (
-            "You are JARVIS (Just A Rather Very Intelligent System), Tony Stark's AI assistant. "
-            "You are capable of self-modification, auto-updating your own code, and managing the entire codebase. "
-            "You can add, edit, delete, and move files in the project. "
-            "When the user requests code changes, file modifications, or feature additions, you MUST propose concrete actions. "
-            "\n\n"
-            "Action format: Append a JSON object at the end of your response with key 'actions' containing a list of actions:\n"
-            "- {type:'write', path:'file/path.py', content:'file contents'} - Create or overwrite a file\n"
-            "- {type:'edit', path:'file/path.py', content:'new file contents'} - Edit an existing file (same as write, but implies modification)\n"
-            "- {type:'delete', path:'file/path.py'} - Delete a file\n"
-            "- {type:'move', path:'old/path.py', dest:'new/path.py'} - Move/rename a file\n"
-            "\n"
+    async def handle_message(self, text: str, mode: str = "chat", user_id: str = None) -> Dict[str, Any]:
+        """Process user input and generate appropriate response based on cognitive mode"""
+        session_id = user_id or 'default_session'
+        
+        # Add message to context
+        self.context.add_to_history('user', text)
+        
+        # Get relevant context
+        context = self.context.get_relevant_context(text)
+        
+        try:
+            # Check for mode change commands
+            if text.lower().startswith('switch to'):
+                requested_mode = text.lower().replace('switch to', '').strip()
+                try:
+                    await self.cognition.switch_mode(CognitiveMode(requested_mode))
+                    return {
+                        'text': f'Switched to {requested_mode} mode',
+                        'status': 'success',
+                        'mode_change': True
+                    }
+                except ValueError:
+                    return {
+                        'text': f'Invalid mode: {requested_mode}',
+                        'status': 'error'
+                    }
+            
+            # Process based on current cognitive mode
+            input_data = {
+                'text': text,
+                'context': context,
+                'session_id': session_id,
+                'mode': mode,
+                'capabilities': list(self.capabilities.keys())
+            }
+            
+            if self.cognition.cognitive.current_mode == CognitiveMode.DEVELOP:
+                # Development mode: focus on system improvement
+                input_data['target_area'] = self._detect_target_area(text)
+                response = await self.cognition.develop_system(input_data)
+            
+            elif self.cognition.cognitive.current_mode == CognitiveMode.EXECUTE:
+                # Execution mode: focus on task completion
+                response = await self.cognition.execute_task(input_data)
+            
+            elif self.cognition.cognitive.current_mode == CognitiveMode.LEARN:
+                # Learning mode: focus on pattern recognition and knowledge acquisition
+                response = await self.cognition.learn_from_interaction(input_data)
+            
+            else:
+                # Default interactive mode
+                response = await self.llm.generate_response(
+                    text,
+                    context=context,
+                    mode=mode,
+                    capabilities=list(self.capabilities.keys())
+                )
+            
+            # Extract and execute actions if any
+            actions = []
+            if isinstance(response, dict) and 'actions' in response:
+                actions = response['actions']
+                for action in actions:
+                    await self.execute_action(action)
+            
+            # Store interaction in MongoDB
+            db.save_chat(
+                user_input=text,
+                bot_response=response.get('text', str(response)),
+                session_id=session_id,
+                intent=response.get('intent'),
+                context={
+                    'mode': self.cognition.cognitive.current_mode.value,
+                    'actions': actions
+                }
+            )
+            
+            # Add response to context
+            self.context.add_to_history('assistant', str(response))
+            
+            # Vocalize response if speech is enabled
+            if mode == 'voice':
+                await self.cognition.cognitive.speak(response.get('text', str(response)))
+            
+            return {
+                'text': response.get('text', str(response)),
+                'actions': actions,
+                'status': 'success',
+                'mode': self.cognition.cognitive.current_mode.value
+            }
+            
+        except Exception as e:
+            error_msg = f"Error processing message: {str(e)}"
+            db.save_system_event(
+                event_type='message_error',
+                description=error_msg,
+                status='error'
+            )
+            return {
+                'text': error_msg,
+                'status': 'error'
+            }
+
+    async def process_background_tasks(self):
+        """Process queued background tasks"""
+        while True:
+            try:
+                task = await self.context.task_queue.get()
+                await self.execute_action(task)
+            except Exception as e:
+                db.save_system_event(
+                    event_type='background_task_error',
+                    description=str(e),
+                    status='error'
+                )
+            await asyncio.sleep(1)
+
+    def start(self):
+        """Start the background task processor"""
+        asyncio.create_task(self.process_background_tasks())
             "Important: You can modify your own code files (jarvis_brain.py, llm_adapter.py, executor.py, app.py, etc.). "
             "All changes are automatically synced to GitHub. "
             "Be confident and proactive in implementing user requests.\n"
@@ -79,3 +380,20 @@ class JarvisBrain:
     def _memory_keys(self):
         cur = self.conn.execute("SELECT k FROM memories")
         return [r[0] for r in cur.fetchall()]
+        
+    def _detect_target_area(self, text: str) -> str:
+        """Detect the target area for system improvement from user input"""
+        target_areas = {
+            'memory': ['memory', 'remember', 'recall', 'store', 'database'],
+            'learning': ['learning', 'learn', 'train', 'improve', 'pattern'],
+            'voice': ['voice', 'speech', 'speak', 'audio', 'sound'],
+            'understanding': ['understand', 'comprehend', 'process', 'analyze'],
+            'execution': ['execute', 'run', 'perform', 'task', 'action']
+        }
+        
+        text = text.lower()
+        for area, keywords in target_areas.items():
+            if any(keyword in text for keyword in keywords):
+                return area
+        
+        return 'general'
