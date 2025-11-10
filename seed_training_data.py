@@ -5,8 +5,8 @@ Seeds JARVIS bot with intent examples and conversational patterns.
 
 import asyncio
 from datetime import datetime
-from utils.db import db
-from training_data import (
+from src.utils.db import db
+from data.training_data import (
     TRAINING_INTENTS,
     CONVERSATIONAL_PATTERNS,
     CONTEXTUAL_RESPONSES,

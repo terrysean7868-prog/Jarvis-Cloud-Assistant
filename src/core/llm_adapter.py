@@ -8,19 +8,19 @@ import random
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
-from utils.db import db
+from src.utils.db import db
 
 load_dotenv()
 
 try:
-    from training_data import TRAINING_INTENTS, PERSONALITY_TRAITS
+    from data.training_data import TRAINING_INTENTS, PERSONALITY_TRAITS
 except ImportError:
     TRAINING_INTENTS = {}
     PERSONALITY_TRAITS = {"humor": 0.4, "formality": 0.7}
 
 # Internet access for real-time data
 try:
-    from internet import get_internet, close_internet
+    from src.internet.internet import get_internet, close_internet
     INTERNET_AVAILABLE = True
 except ImportError:
     INTERNET_AVAILABLE = False

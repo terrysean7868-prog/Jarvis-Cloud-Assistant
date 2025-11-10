@@ -4,19 +4,19 @@ import sqlite3
 import json
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-from llm_adapter import LLMAdapter
-from utils.db import db
+from src.core.llm_adapter import LLMAdapter
+from src.utils.db import db
 import asyncio
 import importlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import inspect
 import ast
-from cognitive_core import JarvisCognition, CognitiveMode
+from src.core.cognitive_core import JarvisCognition, CognitiveMode
 
 # Import memory system
 try:
-    from memory import BotMemory
+    from src.memory.memory import BotMemory
     MEMORY_AVAILABLE = True
 except ImportError:
     MEMORY_AVAILABLE = False

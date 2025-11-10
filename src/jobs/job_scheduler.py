@@ -13,8 +13,8 @@ from datetime import datetime, timedelta
 from typing import Callable, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from utils.db import db
-from git_sync import git_sync
+from src.utils.db import db
+from src.utils.git_sync import git_sync
 
 
 class JobScheduler:

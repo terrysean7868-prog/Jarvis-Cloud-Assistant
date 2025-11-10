@@ -6,7 +6,7 @@ from MongoDB for persistent learning and personalization.
 
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
-from utils.db import db
+from src.utils.db import db
 import json
 from bson import ObjectId
 

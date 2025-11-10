@@ -6,7 +6,7 @@ High-level API for web searches, data fetching, and real-time information
 import asyncio
 import logging
 from typing import Optional, List, Dict, Any
-from web_scraper import WebScraper, get_scraper, close_scraper
+from src.internet.web_scraper import WebScraper, get_scraper, close_scraper
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)

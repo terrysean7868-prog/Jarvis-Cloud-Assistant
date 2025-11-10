@@ -18,8 +18,8 @@ except Exception:
     AUDIO_AVAILABLE = False
 import queue
 import threading
-from utils.db import db
-from config import Config
+from src.utils.db import db
+from src.config.config import Config
 
 class CognitiveMode(Enum):
     DEVELOP = "develop"    # Self-improvement and system development mode

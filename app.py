@@ -10,10 +10,10 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 # === Core modules ===
-from llm_adapter import LLMAdapter
-from jarvis_brain import JarvisBrain
-from executor import ActionExecutor
-from git_sync import git_sync  # ✅ updated version from the new script
+from src.core.llm_adapter import LLMAdapter
+from src.core.jarvis_brain import JarvisBrain
+from src.core.executor import ActionExecutor
+from src.utils.git_sync import git_sync  # ✅ updated version from the new script
 
 # === Training data ===
 try:
@@ -24,7 +24,7 @@ except ImportError:
 
 # === Background Job Scheduler ===
 try:
-    from job_scheduler import initialize_scheduler, shutdown_scheduler
+    from src.jobs.job_scheduler import initialize_scheduler, shutdown_scheduler
     SCHEDULER_AVAILABLE = True
 except ImportError:
     SCHEDULER_AVAILABLE = False

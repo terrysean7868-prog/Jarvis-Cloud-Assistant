@@ -6,12 +6,12 @@ import webbrowser
 import subprocess
 import platform
 from typing import List
-from jarvis_brain import JarvisBrain
-from git_sync import git_sync  # ✅ now importing the function, not a class
+from src.core.jarvis_brain import JarvisBrain
+from src.utils.git_sync import git_sync  # ✅ now importing the function, not a class
 
 # Internet access
 try:
-    from internet import get_internet, close_internet
+    from src.internet.internet import get_internet, close_internet
     INTERNET_AVAILABLE = True
 except ImportError:
     INTERNET_AVAILABLE = False
