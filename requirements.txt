@@ -12,6 +12,10 @@ aiohttp>=3.8.5
 python-multipart>=0.0.6
 paramiko
 
+# Authentication & Security
+python-jose[cryptography]>=3.3.0
+cryptography>=41.0.0
+
 # Database and Storage
 pymongo>=4.4.0
 aiofiles>=23.0.0
