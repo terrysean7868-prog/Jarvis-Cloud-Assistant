@@ -12,8 +12,15 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-import pyautogui
 from googletrans import Translator
+
+# Optional: pyautogui for screen navigation (only on desktop with display)
+try:
+    import pyautogui
+    PYAUTOGUI_AVAILABLE = True
+except (ImportError, KeyError):
+    # KeyError: 'DISPLAY' environment variable missing (headless/server environment)
+    PYAUTOGUI_AVAILABLE = False
 
 # Internet access
 try:
@@ -21,7 +28,6 @@ try:
     INTERNET_AVAILABLE = True
 except ImportError:
     INTERNET_AVAILABLE = False
-
 
 class ActionExecutor:
     def __init__(self, brain: JarvisBrain):
@@ -329,7 +335,14 @@ class ActionExecutor:
     async def _handle_screen_navigation(self, action: dict):
         """
         Handles screen navigation commands like moving the mouse, clicking, typing, etc.
+        Only available on desktop environments with a display server.
         """
+        if not PYAUTOGUI_AVAILABLE:
+            return {
+                "status": "error",
+                "message": "Screen navigation unavailable: running on headless/server environment without display"
+            }
+
         command = action.get("command")
         try:
             if command == "move_mouse":
