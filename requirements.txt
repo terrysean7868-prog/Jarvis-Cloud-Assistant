@@ -89,3 +89,4 @@ selenium>=4.0.0
 
 # Screen navigation
 pyautogui>=0.9.53
+translator
