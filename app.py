@@ -8,6 +8,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from fastapi import status
 
 # === Core modules ===
 from src.core.llm_adapter import LLMAdapter
@@ -102,8 +106,59 @@ class MessageIn(BaseModel):
 # =========================================================
 # ⚙️ API Endpoints
 # =========================================================
+SECRET_KEY = os.getenv("JWT_SECRET", "your-secret-key")
+ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+fake_users_db = {
+    "admin": {
+        "username": "admin",
+        "password": "password123"
+    }
+}
+
+def authenticate_user(username: str, password: str):
+    user = fake_users_db.get(username)
+    if not user or user["password"] != password:
+        return False
+    return user
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = fake_users_db.get(username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+@app.post("/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": user["username"]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
 @app.post("/api/chat")
-async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
+async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     """
     Primary chat endpoint for message/command handling.
     """
@@ -115,7 +170,7 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
 
 
 @app.post("/api/upload-module")
-async def upload_module(file: UploadFile = File(...)):
+async def upload_module(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     """
     Uploads a new Python module and auto-commits it.
     """
@@ -139,7 +194,7 @@ async def upload_module(file: UploadFile = File(...)):
 
 
 @app.post("/api/sync")
-async def sync_repo():
+async def sync_repo(user: dict = Depends(get_current_user)):
     """
     Pull and sync latest repo changes.
     """
@@ -151,7 +206,7 @@ async def sync_repo():
 
 
 @app.post("/api/search")
-async def web_search(message: MessageIn):
+async def web_search(message: MessageIn, user: dict = Depends(get_current_user)):
     """
     Perform web search with internet access
     
@@ -186,7 +241,7 @@ async def web_search(message: MessageIn):
 
 
 @app.post("/api/research")
-async def research_topic(message: MessageIn):
+async def research_topic(message: MessageIn, user: dict = Depends(get_current_user)):
     """
     Perform deep research on a topic with multiple sources
     
@@ -220,7 +275,7 @@ async def research_topic(message: MessageIn):
 
 
 @app.post("/api/answer")
-async def answer_question(message: MessageIn):
+async def answer_question(message: MessageIn, user: dict = Depends(get_current_user)):
     """
     Get answer to a question from web search
     
@@ -256,7 +311,7 @@ async def answer_question(message: MessageIn):
 
 
 @app.post("/api/news")
-async def get_news(message: MessageIn):
+async def get_news(message: MessageIn, user: dict = Depends(get_current_user)):
     """
     Get latest news on a topic
     

@@ -13,6 +13,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 import pyautogui
+from googletrans import Translator
 
 # Internet access
 try:
@@ -60,13 +61,26 @@ class ActionExecutor:
             'nytimes': 'https://www.nytimes.com',
         })
         self.browser = None
+        self.translator = Translator()
+        self.default_language = "en"  # Default language is English
+        self.authenticated_users = {"admin": "password123"}  # Example credentials
 
-    async def process_actions(self, actions: List[dict], user: str = "user"):
+    def authenticate_user(self, username: str, password: str) -> bool:
+        """
+        Authenticates a user based on username and password.
+        """
+        return self.authenticated_users.get(username) == password
+
+    async def process_actions(self, actions: List[dict], user: str = "user", password: str = "", language: str = "en"):
         """
         Executes actions proposed by JarvisBrain, such as writing, editing,
         deleting, moving files, opening URLs, or searching the web.
         After applying file changes, it triggers an automatic Git push to the main branch.
         """
+        # Authenticate user
+        if not self.authenticate_user(user, password):
+            return [{"status": "error", "message": "Authentication failed"}]
+
         results = []
         changed_files = []
 
@@ -343,6 +357,18 @@ class ActionExecutor:
 
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    async def _translate_response(self, response: str, target_language: str) -> str:
+        """
+        Translates the response to the target language.
+        """
+        try:
+            if target_language != self.default_language:
+                translated = self.translator.translate(response, dest=target_language)
+                return translated.text
+            return response
+        except Exception as e:
+            return f"Error in translation: {str(e)}"
 
     def close_browser(self):
         """Close the Selenium WebDriver."""

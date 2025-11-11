@@ -259,9 +259,10 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  max-height: 50vh;
+  max-height: 25vh;
   overflow-y: auto;
   padding-right: 8px;
+  margin-top: 20% !important;
 }
 
 @media (max-width: 768px) {
@@ -333,13 +334,13 @@ html, body {
 }
 
 .instructions {
-  margin-top: 12px;
+  margin-top: 0px;
   font-size: 14px;
   color: var(--muted);
   text-align: center;
   width: 100%;
-  max-width: 900px;
-  padding: 10px;
+  max-width: 300px;
+  padding: 0px;
 }
 
 @media (max-width: 768px) {
@@ -359,7 +360,7 @@ html, body {
 
 .mic-status {
   font-weight: bold;
-  margin-bottom: 5px;
+  margin-bottom: 15px;
   animation: pulse 1.5s ease-in-out infinite;
 }
 

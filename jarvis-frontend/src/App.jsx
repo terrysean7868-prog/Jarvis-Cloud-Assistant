@@ -272,7 +272,7 @@ export default function App() {
         </div>
       </header>
 
-      <DottedRings />
+  <DottedRings audioLevel={reactorEnergy} status={status} />
 
       <div className="conversation">
         {conversation.map((m, i) => (
