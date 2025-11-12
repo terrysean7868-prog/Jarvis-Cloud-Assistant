@@ -20,7 +20,9 @@ cryptography>=41.0.0
 pymongo>=4.4.0
 aiofiles>=23.0.0
 
+# =============================================================================
 # LLM and AI
+# =============================================================================
 openai>=1.0.0
 google-generativeai>=0.3.0
 
@@ -34,59 +36,52 @@ APScheduler>=3.10.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 
-# Basic ML/Data Science (Required for Core Features)
+# =============================================================================
+# Basic ML / Data Science (for reasoning, pattern recognition)
+# =============================================================================
 numpy>=1.21.0
-scikit-learn>=1.0.2  # Pattern recognition
-networkx>=2.6.3      # Knowledge graph
-scipy>=1.7.3         # Scientific computing
+scikit-learn>=1.0.2
+networkx>=2.6.3
+scipy>=1.7.3
 
 # =============================================================================
-# Optional: Voice Recognition and Audio Processing
-# Requires: Microsoft Visual C++ Build Tools for some packages
+# Voice Recognition and Audio Processing
 # =============================================================================
-# Comment out this section if you don't need voice features
-# or if you have build issues
 SpeechRecognition==3.8.1
 pydub==0.25.1
 vosk==0.3.42
-# webrtcvad==2.0.10  # Requires MSVC Build Tools - comment out if build fails
-# sounddevice>=0.4.6  # Optional: requires PortAudio native library. Comment out on hosted platforms
-# soundfile>=0.12.1  # Optional: used for audio file I/O. Comment out if PortAudio is unavailable
 pyttsx3>=2.90
 pocketsphinx>=0.1.15
+# Optional:
+# webrtcvad==2.0.10
+# sounddevice>=0.4.6
+# soundfile>=0.12.1
 
 # =============================================================================
-# Optional: Advanced AI/ML Features
-# High memory/CPU usage - comment out if not needed
+# Advanced AI / ML Features (optional, heavy)
 # =============================================================================
-tensorflow>=2.13.0   # Advanced cognitive processing
-pandas>=1.3.3        # Data analysis
-nltk>=3.6.5          # Natural language processing
-gensim>=4.1.2        # Topic modeling
+tensorflow>=2.13.0
+pandas>=1.3.3
+nltk>=3.6.5
+gensim>=4.1.2
 
 # =============================================================================
-# Optional: Integrations
+# Integrations
 # =============================================================================
-# python-telegram-bot==13.15  # Telegram bot support (incompatible with newer APScheduler)
-APScheduler>=3.10.0         # Task scheduling - Background jobs
+# python-telegram-bot==13.15  # optional Telegram bot support
+selenium>=4.0.0              # Browser automation
+pyautogui>=0.9.53            # Screen navigation automation
 
 # =============================================================================
-# Development Dependencies (Optional)
+# Translation and Language Tools
 # =============================================================================
-# ffmpeg-python==0.2.0     # Audio processing
-# PyYAML>=6.0.1           # Configuration
-# sqlalchemy              # Database ORM
-# tqdm                    # Progress bars
+googletrans==4.0.0-rc1       # For language translation (Executor)
+
+# =============================================================================
+# Development / Optional Tools
+# =============================================================================
 # ffmpeg-python==0.2.0
 # gunicorn==20.1.0
-# PyYAML>=6.0.1  # Use newer version that doesn't require Cython
-# telegram
+# PyYAML>=6.0.1
 # sqlalchemy
 # tqdm
-
-# Selenium for browser automation
-selenium>=4.0.0
-
-# Screen navigation
-pyautogui>=0.9.53
-translator
