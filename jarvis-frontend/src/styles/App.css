@@ -1,0 +1,107 @@
+/* src/styles/App.css */
+body {
+  margin: 0;
+  background: #0a0f1c;
+  font-family: "Poppins", sans-serif;
+  color: white;
+}
+
+.app {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+}
+
+.chat-container {
+  width: 90%;
+  max-width: 600px;
+  background: #12172a;
+  border-radius: 16px;
+  padding: 20px;
+  box-shadow: 0 0 15px rgba(0, 150, 255, 0.4);
+  display: flex;
+  flex-direction: column;
+  height: 80vh;
+}
+
+.chat-header {
+  text-align: center;
+  margin-bottom: 10px;
+}
+
+.chat-box {
+  flex-grow: 1;
+  overflow-y: auto;
+  margin-bottom: 10px;
+  padding-right: 10px;
+}
+
+.chat-message {
+  margin: 8px 0;
+}
+
+.chat-message.user .bubble {
+  background: #0078ff;
+  align-self: flex-end;
+}
+
+.chat-message.jarvis .bubble {
+  background: #262f47;
+}
+
+.bubble {
+  padding: 10px 14px;
+  border-radius: 12px;
+  display: inline-block;
+  max-width: 80%;
+  line-height: 1.4;
+}
+
+.chat-input {
+  display: flex;
+  gap: 8px;
+}
+
+.chat-input input {
+  flex-grow: 1;
+  padding: 10px;
+  border-radius: 8px;
+  border: none;
+  outline: none;
+}
+
+.chat-input button {
+  background: #0078ff;
+  border: none;
+  color: white;
+  padding: 10px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.mic-btn {
+  background: #20263f;
+  color: white;
+  border: none;
+  border-radius: 50%;
+  padding: 10px;
+  font-size: 18px;
+  cursor: pointer;
+}
+
+.mic-btn.listening {
+  background: #ff3b3b;
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+
+.loading {
+  text-align: center;
+  color: #888;
+}

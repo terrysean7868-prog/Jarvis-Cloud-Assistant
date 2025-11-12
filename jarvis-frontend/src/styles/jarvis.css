@@ -1,0 +1,129 @@
+/* === RESPONSIVE JARVIS HUD === */
+
+.jarvis-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  transform-style: preserve-3d;
+  perspective: 1200px;
+  overflow: hidden;
+  min-height: 100vh;
+  width: 100vw;
+  background: radial-gradient(circle at center, #001018 0%, #000000 100%);
+  transition: transform 0.3s ease-out;
+}
+
+/* === Arc Reactor Core scaling === */
+.arc-core {
+  width: min(20vw, 200px);
+  height: min(20vw, 200px);
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--core-glow) 0%, #001515 80%);
+  box-shadow: 0 0 35px var(--core-shadow), inset 0 0 20px var(--core-glow);
+  transition: all 0.6s ease;
+}
+
+/* === HUD Text Adjustments === */
+.hud-text {
+  position: absolute;
+  bottom: 8vh;
+  width: 100%;
+  text-align: center;
+  font-size: clamp(0.9rem, 2vw, 1.3rem);
+  color: #00ffff;
+  text-shadow: 0 0 8px rgba(0, 255, 255, 0.8);
+}
+
+/* === HUD Logs + Overlays === */
+.hud-logs {
+  position: absolute;
+  right: 2vw;
+  top: 5vh;
+  width: clamp(200px, 20vw, 300px);
+  font-size: clamp(0.8rem, 1.5vw, 1rem);
+}
+
+.hud-overlay-left,
+.hud-overlay-right {
+  position: absolute;
+  bottom: 5vh;
+  width: clamp(150px, 15vw, 200px);
+  font-size: clamp(0.75rem, 1.3vw, 1rem);
+  opacity: 0.85;
+}
+
+/* === Responsive Scaling === */
+@media (max-width: 1024px) {
+  .arc-core {
+    width: min(30vw, 160px);
+    height: min(30vw, 160px);
+  }
+  .hud-logs {
+    right: 3vw;
+    top: 4vh;
+  }
+  .hud-overlay-left {
+    left: 3vw;
+    bottom: 6vh;
+  }
+}
+
+@media (max-width: 768px) {
+  .arc-core {
+    width: 35vw;
+    height: 35vw;
+  }
+  .hud-logs {
+    right: 4vw;
+    top: 3vh;
+    width: 40vw;
+  }
+  .hud-overlay-left,
+  .hud-overlay-right {
+    display: none;
+  }
+  .hud-text {
+    font-size: clamp(0.8rem, 2.5vw, 1rem);
+    bottom: 12vh;
+  }
+}
+
+@media (max-width: 480px) {
+  .arc-core {
+    width: 45vw;
+    height: 45vw;
+  }
+  .hud-text {
+    font-size: 0.9rem;
+    bottom: 10vh;
+  }
+  .hud-logs {
+    position: static;
+    width: 90%;
+    margin: 2vh auto;
+    text-align: center;
+  }
+}
+
+/* === Particle Canvas Responsiveness === */
+#holoParticles {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 0;
+  pointer-events: none;
+  width: 100%;
+  height: 100%;
+}
+
+/* === Touch optimization for mobile === */
+@media (hover: none) and (pointer: coarse) {
+  .voice-orb {
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .arc-core {
+    box-shadow: 0 0 25px var(--core-shadow);
+  }
+}

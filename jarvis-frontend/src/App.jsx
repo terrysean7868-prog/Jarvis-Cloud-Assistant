@@ -1,317 +1,274 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
-import "./App.css";
-import "./reactor.css";
-import DottedRings from "./components/DottedRings";
+// src/App.jsx
+import React, { useState, useEffect, useRef } from "react";
+import ArcReactor from "./components/ArcReactor";
+import HUDLogs from "./components/HUDLogs";
+import { listenOnce, speak } from "./utils/speech";
+import { sendMessage } from "./utils/api";
+import "./styles/jarvis.css";
 
 export default function App() {
-  const [status, setStatus] = useState("initializing");
-  const [conversation, setConversation] = useState([
-    { from: "jarvis", text: "Good morning. I am JARVIS. Always at your service. Say 'Hey Jarvis' to begin." },
-  ]);
-  const [interimText, setInterimText] = useState("");
-  const [reactorEnergy, setReactorEnergy] = useState(0.1);
-  const [isProcessing, setIsProcessing] = useState(false);
+  // === STATES ===
+  const [listening, setListening] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+  const [wakePulse, setWakePulse] = useState(false);
+  const [logs, setLogs] = useState([]);
+  const [emotion, setEmotion] = useState("calm");
+  const [volume, setVolume] = useState(0);
+  const [transformState, setTransformState] = useState("normal");
+  const wakeRecognizer = useRef(null);
 
-  const recognitionRef = useRef(null);
-  const audioStreamRef = useRef(null);
-  const workerRef = useRef(null);
-  const wakeWordDetectedRef = useRef(false);
-  const lastHotwordTrigger = useRef(0);
+  // === LOGGING ===
+  const addLog = (type, message) => {
+    setLogs((prev) => [
+      { type, message, time: new Date().toLocaleTimeString() },
+      ...prev.slice(0, 8),
+    ]);
+  };
 
-  // -----------------------------
-  // 🎧 Utility Functions
-  // -----------------------------
-
-  const restartRecognition = useCallback((delay = 150) => {
-    try {
-      recognitionRef.current?.stop();
-    } catch {}
-    setTimeout(() => {
-      try {
-        recognitionRef.current?.start();
-      } catch {}
-    }, delay);
-  }, []);
-
-  const playActivationSound = useCallback(() => {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.connect(g);
-    g.connect(ctx.destination);
-    o.frequency.value = 880;
-    o.type = "sine";
-    g.gain.value = 0.25;
-    o.start();
-    o.stop(ctx.currentTime + 0.12);
-  }, []);
-
-  const speak = useCallback(
-    (text) => {
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = "en-US";
-      u.rate = 0.95;
-      window.speechSynthesis.cancel();
-      u.onend = () => restartRecognition(120);
-      window.speechSynthesis.speak(u);
-    },
-    [restartRecognition]
-  );
-
-  // -----------------------------
-  // 🧠 Send Message to Backend
-  // -----------------------------
-  const sendToBackend = useCallback(
-    async (text) => {
-      setIsProcessing(true);
-      setStatus("thinking");
-      setInterimText("");
-      wakeWordDetectedRef.current = false;
-
-      const apiEndpoint = process.env.REACT_APP_API_URL || "/api/chat";
-
-      try {
-        const res = await fetch(apiEndpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, mode: "chat", user: "user" }),
-        });
-
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const reply = data?.text || "I didn’t quite catch that, sir.";
-
-        setConversation((c) => [...c, { from: "jarvis", text: reply }]);
-        speak(reply);
-      } catch (err) {
-        console.error("Backend error:", err);
-        const msg = "I encountered a connection problem, but I’m still here.";
-        setConversation((c) => [...c, { from: "jarvis", text: msg }]);
-        speak(msg);
-      } finally {
-        setIsProcessing(false);
-        setStatus("listening");
-        restartRecognition(250);
-      }
-    },
-    [restartRecognition, speak]
-  );
-
-  // -----------------------------
-  // 🧩 Hotword Worker
-  // -----------------------------
-  const createHotwordWorker = useCallback(() => {
-    const code = `
-      let lastVoice = 0;
-      function energyFromFloat32(data) {
-        let sum = 0;
-        for (let i = 0; i < data.length; i += 2) sum += data[i] * data[i];
-        return Math.sqrt(sum / (data.length / 2));
-      }
-      onmessage = function(e) {
-        const { type, payload } = e.data;
-        if (type === 'analyze') {
-          const arr = new Float32Array(payload);
-          const energy = energyFromFloat32(arr);
-          const now = Date.now();
-          if (energy > 0.015) {
-            lastVoice = now;
-            postMessage({ event: 'voice', energy, time: now });
-          }
-          postMessage({ event: 'energy', energy });
-        }
-      };
-    `;
-    return new Worker(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
-  }, []);
-
-  // -----------------------------
-  // 🎙️ Speech Recognition Setup
-  // -----------------------------
+  // === MICROPHONE ANALYZER (AMPLITUDE) ===
   useEffect(() => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setConversation((c) => [
-        ...c,
-        { from: "jarvis", text: "SpeechRecognition not supported. Try Chrome or Edge." },
-      ]);
+    let audioCtx, analyser, dataArray, micStream;
+    const initMic = async () => {
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const source = audioCtx.createMediaStreamSource(micStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        const update = () => {
+          analyser.getByteFrequencyData(dataArray);
+          const avg = dataArray.reduce((a, b) => a + b) / dataArray.length / 255;
+          setVolume(avg);
+          requestAnimationFrame(update);
+        };
+        update();
+      } catch (err) {
+        console.warn("Mic analyzer unavailable", err);
+      }
+    };
+    initMic();
+    return () => micStream?.getTracks().forEach((t) => t.stop());
+  }, []);
+
+  // === CONTINUOUS WAKE WORD LISTENER ===
+  useEffect(() => {
+  const SpeechRecognition =
+    window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    console.warn("SpeechRecognition not supported.");
+    return;
+  }
+
+  const recognizer = new SpeechRecognition();
+  recognizer.continuous = true;
+  recognizer.interimResults = false;
+  recognizer.lang = "en-US";
+
+  let isListening = false;
+  let restartTimer = null;
+
+  const safeStart = () => {
+    if (!isListening) {
+      try {
+        recognizer.start();
+        isListening = true;
+        console.debug("Wake listener started ✅");
+      } catch (err) {
+        if (err.name === "InvalidStateError") {
+          // Already started — skip this one silently
+        } else {
+          console.warn("SpeechRecognition start error:", err);
+        }
+      }
+    }
+  };
+
+  const safeStop = () => {
+    try {
+      recognizer.stop();
+      isListening = false;
+    } catch (err) {
+      console.warn("Safe stop failed:", err);
+    }
+  };
+
+  recognizer.onstart = () => (isListening = true);
+
+  recognizer.onend = () => {
+    isListening = false;
+    // Restart safely after a short delay
+    clearTimeout(restartTimer);
+    restartTimer = setTimeout(safeStart, 1000);
+  };
+
+  recognizer.onerror = (e) => {
+    if (e.error === "no-speech" || e.error === "aborted") {
+      // harmless, just restart later
+      clearTimeout(restartTimer);
+      restartTimer = setTimeout(safeStart, 1500);
+    } else {
+      console.warn("Wake listener error:", e.error);
+      clearTimeout(restartTimer);
+      restartTimer = setTimeout(safeStart, 2000);
+    }
+  };
+
+  recognizer.onresult = (event) => {
+    const transcript = event.results[event.resultIndex][0].transcript
+      .trim()
+      .toLowerCase();
+    if (transcript.includes("hey jarvis") || transcript.includes("ok jarvis")) {
+      addLog("wake", "Wake word detected 🔊");
+      setWakePulse(true);
+      setTimeout(() => setWakePulse(false), 1000);
+      handleVoiceCommand();
+    }
+  };
+
+  // Start listener safely
+  safeStart();
+  wakeRecognizer.current = recognizer;
+  addLog("system", "Wake-word listener activated.");
+
+  return () => {
+    clearTimeout(restartTimer);
+    safeStop();
+  };
+}, []);
+
+
+  // === HANDLE VOICE COMMAND ===
+  const handleVoiceCommand = async () => {
+    if (listening) return;
+    setListening(true);
+    addLog("system", "Listening for command…");
+
+    const transcript = await listenOnce();
+    setListening(false);
+
+    if (!transcript) {
+      addLog("error", "No speech detected.");
       return;
     }
 
-    const rec = new SpeechRecognition();
-    rec.lang = "en-US";
-    rec.continuous = true;
-    rec.interimResults = true;
-    recognitionRef.current = rec;
+    addLog("input", transcript);
+    setEmotion("analyzing");
 
-    rec.onstart = () => setStatus("listening");
-    rec.onerror = (e) => {
-      if (e.error === "aborted") return;
-      console.warn("Speech error", e);
-      restartRecognition(250);
-    };
+    // Transformation commands (local control)
+    if (/twist|vortex/i.test(transcript)) {
+      setTransformState("twist");
+      addLog("action", "Twisting reactor geometry.");
+      speak("Twisting core geometry, sir.");
+      return;
+    }
+    if (/expand/i.test(transcript)) {
+      setTransformState("expand");
+      addLog("action", "Expanding reactor core.");
+      speak("Expanding energy field.");
+      return;
+    }
+    if (/contract|shrink/i.test(transcript)) {
+      setTransformState("contract");
+      addLog("action", "Contracting reactor.");
+      speak("Contracting core field.");
+      return;
+    }
+    if (/normal|reset/i.test(transcript)) {
+      setTransformState("normal");
+      addLog("action", "Returning reactor to stable form.");
+      speak("Returning to default structure.");
+      return;
+    }
 
-    rec.onresult = (e) => {
-      let full = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i];
-        if (r.isFinal) full += r[0].transcript;
-        else setInterimText(r[0].transcript);
-      }
+    try {
+      const res = await sendMessage(transcript);
+      addLog("response", res.text);
 
-      const text = full.trim().toLowerCase();
-      if (!text) return;
+      // Emotion-driven state change
+      if (res.text.match(/error|critical|alert/i)) setEmotion("critical");
+      else if (res.text.match(/action|launch|open/i)) setEmotion("action");
+      else setEmotion("calm");
 
-      const wakeWords = ["hey jarvis", "jarvis", "ok jarvis"];
-      const detected = wakeWords.find((w) => text.includes(w));
-
-      if (detected) {
-        wakeWordDetectedRef.current = true;
-        playActivationSound();
-        setStatus("activated");
-        setConversation((c) => [...c, { from: "jarvis", text: "Yes sir, I’m listening..." }]);
-        speak("Yes sir, I’m listening...");
-        setInterimText("");
-        return;
-      }
-
-      if (wakeWordDetectedRef.current && text.length > 2) {
-        wakeWordDetectedRef.current = false;
-        setConversation((c) => [...c, { from: "you", text }]);
-        sendToBackend(text);
-        setInterimText("");
-      }
-    };
-
-    rec.onend = () => restartRecognition(100);
-
-    const worker = createHotwordWorker();
-    workerRef.current = worker;
-
-    worker.onmessage = (ev) => {
-      const { event, energy } = ev.data;
-      if (event === "energy") setReactorEnergy(Math.min(energy * 8, 1));
-      if (event === "voice") {
-        const now = Date.now();
-        if (now - lastHotwordTrigger.current > 600) {
-          lastHotwordTrigger.current = now;
-          try {
-            recognitionRef.current?.start();
-          } catch {}
-        }
-      }
-    };
-
-    navigator.mediaDevices
-      .getUserMedia({ audio: { noiseSuppression: true, echoCancellation: true } })
-      .then(async (stream) => {
-        audioStreamRef.current = stream;
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const src = ctx.createMediaStreamSource(stream);
-
-        try {
-          const workletCode = `
-            class VADProcessor extends AudioWorkletProcessor {
-              process(inputs) {
-                const input = inputs[0][0];
-                if (input) {
-                  const buf = new Float32Array(input);
-                  this.port.postMessage(buf.buffer, [buf.buffer]);
-                }
-                return true;
-              }
-            }
-            registerProcessor('vad-processor', VADProcessor);
-          `;
-          const blob = new Blob([workletCode], { type: "application/javascript" });
-          const url = URL.createObjectURL(blob);
-          await ctx.audioWorklet.addModule(url);
-
-          const node = new AudioWorkletNode(ctx, "vad-processor");
-          node.port.onmessage = (e) => {
-            worker.postMessage({ type: "analyze", payload: e.data }, [e.data]);
-          };
-          src.connect(node);
-          node.connect(ctx.destination);
-        } catch {
-          const proc = ctx.createScriptProcessor(2048, 1, 1);
-          proc.onaudioprocess = (e) => {
-            const input = e.inputBuffer.getChannelData(0);
-            worker.postMessage({ type: "analyze", payload: input.buffer }, [input.buffer.slice(0)]);
-          };
-          src.connect(proc);
-          proc.connect(ctx.destination);
-        }
-
-        rec.start();
-      })
-      .catch(() => {
-        setConversation((c) => [...c, { from: "jarvis", text: "Microphone permission denied." }]);
+      setSpeaking(true);
+      speak(res.text, () => {
+        setSpeaking(false);
+        setEmotion("calm");
       });
 
-    return () => {
-      recognitionRef.current?.stop?.();
-      audioStreamRef.current?.getTracks?.().forEach((t) => t.stop());
-      workerRef.current?.terminate?.();
-    };
-  }, [createHotwordWorker, restartRecognition, sendToBackend, playActivationSound, speak]);
-
-  // -----------------------------
-  // 💡 UI Helper
-  // -----------------------------
-  const getStatusColor = useCallback(() => {
-    switch (status) {
-      case "activated":
-      case "speaking":
-        return "#00ffc8";
-      case "listening":
-        return "#00d4ff";
-      case "thinking":
-        return "#ff9f43";
-      default:
-        return "#6b7280";
+      if (res.actions?.length) {
+        for (const a of res.actions) {
+          addLog("action", `${a.type} → ${a.value || ""}`);
+          if (a.type === "open_url") window.open(a.value, "_blank");
+        }
+      }
+    } catch (err) {
+      addLog("error", err.message);
+      speak("Connection issue, sir.");
+      setEmotion("critical");
+      setTimeout(() => setEmotion("calm"), 2000);
     }
-  }, [status]);
+  };
 
-  // -----------------------------
-  // 🎨 Render
-  // -----------------------------
+  // === BACKGROUND PARTICLES ===
+  useEffect(() => {
+    const canvas = document.getElementById("holoParticles");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+
+    const resize = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    };
+    resize();
+    window.addEventListener("resize", resize);
+
+    const density =
+      window.innerWidth < 600 ? 40 : window.innerWidth < 1024 ? 70 : 100;
+    const particles = Array.from({ length: density }, () => ({
+      x: Math.random() * canvas.width,
+      y: Math.random() * canvas.height,
+      z: Math.random() * 2 + 0.5,
+    }));
+
+    const draw = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      for (let p of particles) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.z, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(0,255,255,0.25)";
+        ctx.fill();
+        p.y += p.z * 0.3;
+        if (p.y > canvas.height) p.y = 0;
+      }
+      requestAnimationFrame(draw);
+    };
+    draw();
+
+    return () => window.removeEventListener("resize", resize);
+  }, []);
+
+  // === RENDER ===
   return (
-    <div className={`app-root ${status === "listening" ? "listening" : ""}`}>
-      <header className="app-header">
-        <h1 className="title">JARVIS</h1>
-        <div className="status">
-          <span className="status-dot" style={{ background: getStatusColor() }} />
-          <span>{status}</span>
-        </div>
-      </header>
-
-      <DottedRings audioLevel={reactorEnergy} status={status} />
-
-      <div className="conversation">
-        {conversation.map((m, i) => (
-          <div key={i} className={`message ${m.from}`}>
-            {m.text}
-          </div>
-        ))}
-        {interimText && <div className="message interim">{interimText}</div>}
-        {isProcessing && (
-          <div className="message jarvis processing">
-            <span className="processing-dots">
-              Processing<span className="dot">.</span><span className="dot">.</span><span className="dot">.</span>
-            </span>
-          </div>
-        )}
+    <div className="jarvis-container">
+      <canvas id="holoParticles"></canvas>
+      <ArcReactor
+        active={listening || speaking}
+        wakePulse={wakePulse}
+        emotion={emotion}
+        volume={volume}
+        transformState={transformState}
+      />
+      <HUDLogs logs={logs} />
+      <div className="hud-text">
+        {listening
+          ? "Listening..."
+          : speaking
+          ? "Responding..."
+          : "Say 'Hey Jarvis' to begin"}
       </div>
-
-      <footer className="instructions">
-        <div className="mic-status" style={{ color: getStatusColor() }}>
-          🎤 {status === "listening" ? "Listening..." : status}
-        </div>
-        <div className="hint">
-          Say <strong>"Hey Jarvis"</strong> to begin
-        </div>
-      </footer>
     </div>
   );
 }

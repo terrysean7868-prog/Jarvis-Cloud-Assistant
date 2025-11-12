@@ -1,0 +1,87 @@
+.hud-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  z-index: 2;
+  font-family: "Orbitron", sans-serif;
+  color: #00ffff;
+}
+
+/* Panels */
+.hud-panel {
+  width: 200px;
+  padding: 20px;
+  backdrop-filter: blur(5px);
+  background: rgba(0, 40, 60, 0.15);
+  border: 1px solid rgba(0, 255, 255, 0.2);
+  box-shadow: 0 0 20px rgba(0, 255, 255, 0.2);
+}
+
+.hud-panel.left {
+  margin-left: 40px;
+  text-align: left;
+}
+.hud-panel.right {
+  margin-right: 40px;
+  text-align: right;
+}
+
+/* Bars */
+.hud-label {
+  font-size: 0.8rem;
+  opacity: 0.8;
+  margin-top: 8px;
+}
+.hud-bar {
+  height: 6px;
+  background: rgba(0, 255, 255, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.hud-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #00ffff, #0066ff);
+  transition: width 0.3s;
+}
+.hud-bar-fill.net {
+  background: linear-gradient(90deg, #00ffcc, #00aaff);
+}
+.hud-metric {
+  font-size: 0.9rem;
+  margin-top: 4px;
+}
+
+/* Right ring animation */
+.ring-group {
+  position: relative;
+  width: 150px;
+  height: 150px;
+  margin-left: auto;
+}
+.ring {
+  position: absolute;
+  border: 2px solid rgba(0, 255, 255, 0.4);
+  border-radius: 50%;
+  animation: rotate 6s linear infinite;
+}
+.ring1 { width: 100px; height: 100px; top: 25px; left: 25px; }
+.ring2 { width: 120px; height: 120px; top: 15px; left: 15px; animation-duration: 8s; }
+.ring3 { width: 140px; height: 140px; top: 5px; left: 5px; animation-duration: 10s; }
+
+@keyframes rotate {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Mic Analyzer */
+.mic-analyzer {
+  position: absolute;
+  top: 40%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1;
+  filter: drop-shadow(0 0 15px cyan);
+}

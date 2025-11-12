@@ -1,0 +1,109 @@
+.arc-reactor {
+  --core-glow: #00ffff;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: min(32vmin, 260px);
+  height: min(32vmin, 260px);
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  perspective: 1000px;
+  transition: all 0.5s ease;
+  transform-style: preserve-3d;
+}
+
+.core {
+  position: absolute;
+  width: 35%;
+  height: 35%;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--core-glow) 0%, #001010 85%);
+  box-shadow: 0 0 30px var(--core-glow), inset 0 0 20px var(--core-glow);
+  transition: all 0.3s ease;
+}
+
+.ring {
+  position: absolute;
+  border-radius: 50%;
+  border: 2px solid var(--core-glow);
+  opacity: 0.8;
+  transform-style: preserve-3d;
+  animation: rotateForward 14s linear infinite;
+  backface-visibility: hidden;
+}
+
+.ring1 {
+  width: 80%;
+  height: 80%;
+  animation: rotateForward 12s linear infinite;
+}
+.ring2 {
+  width: 110%;
+  height: 110%;
+  opacity: 0.6;
+  animation: rotateReverse 16s linear infinite;
+}
+.ring3 {
+  width: 140%;
+  height: 140%;
+  opacity: 0.4;
+  animation: rotateForward 20s linear infinite;
+}
+.ring4 {
+  width: 170%;
+  height: 170%;
+  opacity: 0.25;
+  animation: rotateReverse 24s linear infinite;
+}
+
+@keyframes rotateForward {
+  from {
+    transform: rotateZ(0deg) rotateY(0deg);
+  }
+  to {
+    transform: rotateZ(360deg) rotateY(360deg);
+  }
+}
+@keyframes rotateReverse {
+  from {
+    transform: rotateZ(360deg) rotateY(0deg);
+  }
+  to {
+    transform: rotateZ(0deg) rotateY(-360deg);
+  }
+}
+
+/* Wake pulse shockwave */
+.arc-reactor.wake .core {
+  animation: pulse 1s ease-out;
+}
+@keyframes pulse {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.5);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Emotion colors */
+[data-emotion="calm"] { --core-glow: #00ffff; }
+[data-emotion="analyzing"] { --core-glow: #ffe066; }
+[data-emotion="critical"] { --core-glow: #ff4d4d; }
+[data-emotion="action"] { --core-glow: #00ff99; }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .arc-reactor {
+    width: 45vmin;
+    height: 45vmin;
+  }
+}
