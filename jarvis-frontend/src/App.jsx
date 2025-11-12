@@ -18,53 +18,88 @@ export default function App() {
   const wakeWordDetectedRef = useRef(false);
   const lastHotwordTrigger = useRef(0);
 
-  // --- Backend communication ---
-  const sendToBackend = useCallback(async (text) => {
-    setIsProcessing(true);
-    setStatus("thinking");
-    setInterimText("");
-    wakeWordDetectedRef.current = false;
-
-    const apiEndpoint = process.env.REACT_APP_API_URL || "/api/chat";
-
-    try {
-      const res = await fetch(apiEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, mode: "chat", user: "user" }),
-      });
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const reply = data?.text || "I didn’t quite catch that, sir.";
-
-      setConversation((c) => [...c, { from: "jarvis", text: reply }]);
-      speak(reply);
-    } catch (err) {
-      console.error("Backend error:", err);
-      const msg = "I encountered a connection problem, but I’m still here.";
-      setConversation((c) => [...c, { from: "jarvis", text: msg }]);
-      speak(msg);
-    } finally {
-      setIsProcessing(false);
-      setStatus("listening");
-      restartRecognition(250);
-    }
-  }, [restartRecognition, speak]); // ✅ added dependencies
-
+  // -----------------------------
+  // 🎧 Utility Functions
+  // -----------------------------
 
   const restartRecognition = useCallback((delay = 150) => {
     try {
       recognitionRef.current?.stop();
-    } catch { }
+    } catch {}
     setTimeout(() => {
       try {
         recognitionRef.current?.start();
-      } catch { }
+      } catch {}
     }, delay);
   }, []);
 
-  // --- Hotword detection worker ---
+  const playActivationSound = useCallback(() => {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.connect(g);
+    g.connect(ctx.destination);
+    o.frequency.value = 880;
+    o.type = "sine";
+    g.gain.value = 0.25;
+    o.start();
+    o.stop(ctx.currentTime + 0.12);
+  }, []);
+
+  const speak = useCallback(
+    (text) => {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "en-US";
+      u.rate = 0.95;
+      window.speechSynthesis.cancel();
+      u.onend = () => restartRecognition(120);
+      window.speechSynthesis.speak(u);
+    },
+    [restartRecognition]
+  );
+
+  // -----------------------------
+  // 🧠 Send Message to Backend
+  // -----------------------------
+  const sendToBackend = useCallback(
+    async (text) => {
+      setIsProcessing(true);
+      setStatus("thinking");
+      setInterimText("");
+      wakeWordDetectedRef.current = false;
+
+      const apiEndpoint = process.env.REACT_APP_API_URL || "/api/chat";
+
+      try {
+        const res = await fetch(apiEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, mode: "chat", user: "user" }),
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const reply = data?.text || "I didn’t quite catch that, sir.";
+
+        setConversation((c) => [...c, { from: "jarvis", text: reply }]);
+        speak(reply);
+      } catch (err) {
+        console.error("Backend error:", err);
+        const msg = "I encountered a connection problem, but I’m still here.";
+        setConversation((c) => [...c, { from: "jarvis", text: msg }]);
+        speak(msg);
+      } finally {
+        setIsProcessing(false);
+        setStatus("listening");
+        restartRecognition(250);
+      }
+    },
+    [restartRecognition, speak]
+  );
+
+  // -----------------------------
+  // 🧩 Hotword Worker
+  // -----------------------------
   const createHotwordWorker = useCallback(() => {
     const code = `
       let lastVoice = 0;
@@ -90,7 +125,9 @@ export default function App() {
     return new Worker(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
   }, []);
 
-  // --- Speech Recognition setup ---
+  // -----------------------------
+  // 🎙️ Speech Recognition Setup
+  // -----------------------------
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
@@ -160,7 +197,7 @@ export default function App() {
           lastHotwordTrigger.current = now;
           try {
             recognitionRef.current?.start();
-          } catch { }
+          } catch {}
         }
       }
     };
@@ -174,18 +211,18 @@ export default function App() {
 
         try {
           const workletCode = `
-          class VADProcessor extends AudioWorkletProcessor {
-            process(inputs) {
-              const input = inputs[0][0];
-              if (input) {
-                const buf = new Float32Array(input);
-                this.port.postMessage(buf.buffer, [buf.buffer]);
+            class VADProcessor extends AudioWorkletProcessor {
+              process(inputs) {
+                const input = inputs[0][0];
+                if (input) {
+                  const buf = new Float32Array(input);
+                  this.port.postMessage(buf.buffer, [buf.buffer]);
+                }
+                return true;
               }
-              return true;
             }
-          }
-          registerProcessor('vad-processor', VADProcessor);
-        `;
+            registerProcessor('vad-processor', VADProcessor);
+          `;
           const blob = new Blob([workletCode], { type: "application/javascript" });
           const url = URL.createObjectURL(blob);
           await ctx.audioWorklet.addModule(url);
@@ -196,8 +233,7 @@ export default function App() {
           };
           src.connect(node);
           node.connect(ctx.destination);
-        } catch (err) {
-          console.warn("AudioWorklet unavailable, fallback to ScriptProcessor:", err);
+        } catch {
           const proc = ctx.createScriptProcessor(2048, 1, 1);
           proc.onaudioprocess = (e) => {
             const input = e.inputBuffer.getChannelData(0);
@@ -218,40 +254,11 @@ export default function App() {
       audioStreamRef.current?.getTracks?.().forEach((t) => t.stop());
       workerRef.current?.terminate?.();
     };
-  }, [
-    createHotwordWorker,
-    restartRecognition,
-    sendToBackend,
-    playActivationSound,
-    speak, // ✅ added these two
-  ]);
+  }, [createHotwordWorker, restartRecognition, sendToBackend, playActivationSound, speak]);
 
-
-  const playActivationSound = useCallback(() => {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.connect(g);
-    g.connect(ctx.destination);
-    o.frequency.value = 880;
-    o.type = "sine";
-    g.gain.value = 0.25;
-    o.start();
-    o.stop(ctx.currentTime + 0.12);
-  }, []);
-
-  const speak = useCallback(
-    (text) => {
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = "en-US";
-      u.rate = 0.95;
-      window.speechSynthesis.cancel();
-      u.onend = () => restartRecognition(120);
-      window.speechSynthesis.speak(u);
-    },
-    [restartRecognition]
-  );
-
+  // -----------------------------
+  // 💡 UI Helper
+  // -----------------------------
   const getStatusColor = useCallback(() => {
     switch (status) {
       case "activated":
@@ -266,6 +273,9 @@ export default function App() {
     }
   }, [status]);
 
+  // -----------------------------
+  // 🎨 Render
+  // -----------------------------
   return (
     <div className={`app-root ${status === "listening" ? "listening" : ""}`}>
       <header className="app-header">
@@ -284,14 +294,12 @@ export default function App() {
             {m.text}
           </div>
         ))}
-        {interimText && (
-          <div className="message interim">
-            {interimText}
-          </div>
-        )}
+        {interimText && <div className="message interim">{interimText}</div>}
         {isProcessing && (
           <div className="message jarvis processing">
-            <span className="processing-dots">Processing<span className="dot">.</span><span className="dot">.</span><span className="dot">.</span></span>
+            <span className="processing-dots">
+              Processing<span className="dot">.</span><span className="dot">.</span><span className="dot">.</span>
+            </span>
           </div>
         )}
       </div>
