@@ -44,7 +44,7 @@ const DottedRings = ({ audioLevel = 0, status = "listening" }) => {
     <div className="dotted-rings" data-status={status}>
       <div
         className="ring-wrap ring1-wrap"
-        style={{ ["--scale"]: scale1 }}
+        style={{ "--scale": scale1 }}
       >
         <div
           className="ring-inner ring1"
@@ -54,7 +54,7 @@ const DottedRings = ({ audioLevel = 0, status = "listening" }) => {
 
       <div
         className="ring-wrap ring2-wrap"
-        style={{ ["--scale"]: scale2 }}
+        style={{ "--scale": scale2 }}
       >
         <div
           className="ring-inner ring2"
@@ -64,7 +64,7 @@ const DottedRings = ({ audioLevel = 0, status = "listening" }) => {
 
       <div
         className="ring-wrap ring3-wrap"
-        style={{ ["--scale"]: scale3 }}
+        style={{ "--scale": scale3 }}
       >
         <div
           className="ring-inner ring3"
