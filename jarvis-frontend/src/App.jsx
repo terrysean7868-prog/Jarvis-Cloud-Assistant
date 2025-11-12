@@ -50,16 +50,17 @@ export default function App() {
       setStatus("listening");
       restartRecognition(250);
     }
-  }, []);
+  }, [restartRecognition, speak]); // ✅ added dependencies
+
 
   const restartRecognition = useCallback((delay = 150) => {
     try {
       recognitionRef.current?.stop();
-    } catch {}
+    } catch { }
     setTimeout(() => {
       try {
         recognitionRef.current?.start();
-      } catch {}
+      } catch { }
     }, delay);
   }, []);
 
@@ -159,7 +160,7 @@ export default function App() {
           lastHotwordTrigger.current = now;
           try {
             recognitionRef.current?.start();
-          } catch {}
+          } catch { }
         }
       }
     };
@@ -173,18 +174,18 @@ export default function App() {
 
         try {
           const workletCode = `
-            class VADProcessor extends AudioWorkletProcessor {
-              process(inputs) {
-                const input = inputs[0][0];
-                if (input) {
-                  const buf = new Float32Array(input);
-                  this.port.postMessage(buf.buffer, [buf.buffer]);
-                }
-                return true;
+          class VADProcessor extends AudioWorkletProcessor {
+            process(inputs) {
+              const input = inputs[0][0];
+              if (input) {
+                const buf = new Float32Array(input);
+                this.port.postMessage(buf.buffer, [buf.buffer]);
               }
+              return true;
             }
-            registerProcessor('vad-processor', VADProcessor);
-          `;
+          }
+          registerProcessor('vad-processor', VADProcessor);
+        `;
           const blob = new Blob([workletCode], { type: "application/javascript" });
           const url = URL.createObjectURL(blob);
           await ctx.audioWorklet.addModule(url);
@@ -217,7 +218,14 @@ export default function App() {
       audioStreamRef.current?.getTracks?.().forEach((t) => t.stop());
       workerRef.current?.terminate?.();
     };
-  }, [createHotwordWorker, restartRecognition, sendToBackend]);
+  }, [
+    createHotwordWorker,
+    restartRecognition,
+    sendToBackend,
+    playActivationSound,
+    speak, // ✅ added these two
+  ]);
+
 
   const playActivationSound = useCallback(() => {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
