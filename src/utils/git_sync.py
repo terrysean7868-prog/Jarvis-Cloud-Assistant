@@ -1,5 +1,5 @@
 # ==============================================================
-# git_sync.py — Secure GitHub Auto Sync via SSH for Render
+# git_sync.py — Self-Healing GitHub Auto Sync via SSH (Render-ready)
 # ==============================================================
 
 import os
@@ -10,6 +10,7 @@ import stat
 import re
 from datetime import datetime
 from pathlib import Path
+
 
 # ==============================================================
 # 🧠 Utility Command Runner
@@ -25,14 +26,15 @@ def run(cmd: str, cwd: str = ".", check=True, env=None):
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())
     return result.stdout.strip()
 
+
 # ==============================================================
-# 🔐 SSH Trust Setup (fixes 'Host key verification failed')
+# 🔐 SSH Trust Setup (startup)
 # ==============================================================
 
 def setup_ssh_trust():
     """
-    Preconfigure SSH to trust github.com and load SSH key into the agent.
-    Prevents 'Host key verification failed' errors on Render.
+    Fetch GitHub's SSH host key dynamically and trust it.
+    Prevents 'Host key verification failed' or 'REMOTE HOST IDENTIFICATION HAS CHANGED'.
     """
     ssh_key = os.getenv("SSH_KEY")
     if not ssh_key:
@@ -43,24 +45,36 @@ def setup_ssh_trust():
     os.makedirs(ssh_dir, exist_ok=True)
     key_path = os.path.join(ssh_dir, "id_rsa")
 
-    # Write private key securely
+    # Save private key securely
     with open(key_path, "w") as f:
         f.write(ssh_key)
     os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
 
-    # Trust GitHub SSH host
-    known_hosts_path = os.path.join(ssh_dir, "known_hosts")
-    github_key = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMZxZy6c+oS0tzOaFQ5s0M3m8z6z8Ef3yLa2OxuO2Hx\n"
-    with open(known_hosts_path, "w") as kh:
-        kh.write(github_key)
+    # Dynamically fetch GitHub host key
+    try:
+        result = subprocess.run(
+            ["ssh-keyscan", "github.com"],
+            capture_output=True, text=True, check=True
+        )
+        github_host_key = result.stdout.strip()
+        if github_host_key:
+            known_hosts_path = os.path.join(ssh_dir, "known_hosts")
+            with open(known_hosts_path, "w") as kh:
+                kh.write(github_host_key + "\n")
+            print("[SSH INIT] ✅ GitHub host key fetched dynamically.")
+        else:
+            print("[SSH INIT] ⚠️ ssh-keyscan returned no output.")
+    except Exception as e:
+        print(f"[SSH INIT] ⚠️ ssh-keyscan failed: {e}")
 
     # Start ssh-agent and add key
     try:
         subprocess.run("eval $(ssh-agent -s)", shell=True, check=False)
         subprocess.run(f"ssh-add {key_path}", shell=True, check=False)
-        print("[SSH INIT] 🔑 SSH key added and github.com trusted.")
+        print("[SSH INIT] 🔑 SSH key added and GitHub trusted.")
     except Exception as e:
-        print(f"[SSH INIT] ⚠️ SSH setup failed: {e}")
+        print(f"[SSH INIT] ⚠️ SSH agent setup failed: {e}")
+
 
 # ==============================================================
 # 🧩 Ensure Git Remote Exists
@@ -82,19 +96,44 @@ def ensure_remote(repo_path: str, repo_url: str):
         print(f"[GIT SYNC] ⚠️ Could not verify remote: {e}")
         run(f"git remote add origin {repo_url}", cwd=repo_path)
 
+
 # ==============================================================
-# 🚀 Git Sync Function (SSH-only, Render-safe)
+# 🧩 Dynamic Re-Fetch of GitHub Host Key (mid-sync fallback)
+# ==============================================================
+
+def refresh_github_host_key():
+    """Re-fetch GitHub host key and update known_hosts if mismatch occurs."""
+    ssh_dir = os.path.expanduser("~/.ssh")
+    os.makedirs(ssh_dir, exist_ok=True)
+    known_hosts_path = os.path.join(ssh_dir, "known_hosts")
+
+    try:
+        print("[GIT SYNC] 🔁 Refreshing GitHub host key...")
+        result = subprocess.run(
+            ["ssh-keyscan", "github.com"],
+            capture_output=True, text=True, check=True
+        )
+        new_key = result.stdout.strip()
+        with open(known_hosts_path, "w") as kh:
+            kh.write(new_key + "\n")
+        print("[GIT SYNC] ✅ Host key refreshed successfully.")
+    except Exception as e:
+        print(f"[GIT SYNC] ⚠️ Could not refresh host key: {e}")
+
+
+# ==============================================================
+# 🚀 Git Sync Function (SSH-only, auto-healing)
 # ==============================================================
 
 def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=3):
     """
     Securely syncs the repository with the GitHub main branch using SSH authentication.
-    Fully compatible with Render deployment environments.
+    Automatically re-trusts GitHub host keys if verification errors occur.
     """
     repo_path = os.path.abspath(repo_path)
     print(f"[GIT SYNC] 🚀 Starting sync in: {repo_path}")
 
-    # --- Environment ---
+    # --- Environment setup ---
     ssh_key = os.getenv("SSH_KEY")
     github_repo = os.getenv("GITHUB_REPO")
     github_user = os.getenv("GITHUB_USERNAME")
@@ -103,11 +142,10 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=3):
 
     if not ssh_key:
         raise RuntimeError("[GIT SYNC] ❌ SSH_KEY not set in environment.")
-
     if not github_repo or not github_user:
         raise RuntimeError("[GIT SYNC] ❌ Missing GITHUB_REPO or GITHUB_USERNAME.")
 
-    # --- Ensure Git identity ---
+    # --- Git identity ---
     run(f'git config --global user.name "{git_name}"', cwd=repo_path)
     run(f'git config --global user.email "{git_email}"', cwd=repo_path)
     print(f"[GIT SYNC] ✅ Git identity set to {git_name} <{git_email}>")
@@ -118,7 +156,7 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=3):
     ensure_remote(repo_path, repo_url)
     print(f"[GIT SYNC] 🧩 Using SSH authentication ({repo_url})")
 
-    # --- Create temporary SSH environment ---
+    # --- Temporary SSH environment ---
     tmp_dir = tempfile.mkdtemp()
     key_file = os.path.join(tmp_dir, "id_rsa")
     with open(key_file, "w") as f:
@@ -126,20 +164,22 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=3):
     os.chmod(key_file, 0o600)
 
     known_hosts = os.path.join(tmp_dir, "known_hosts")
-    with open(known_hosts, "w") as kh:
-        kh.write("github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMZxZy6c+oS0tzOaFQ5s0M3m8z6z8Ef3yLa2OxuO2Hx\n")
+    # Always fetch current GitHub host key dynamically
+    try:
+        subprocess.run(f"ssh-keyscan github.com > {known_hosts}", shell=True, check=True)
+    except Exception:
+        refresh_github_host_key()
 
     ssh_env = os.environ.copy()
-    ssh_env["GIT_SSH_COMMAND"] = f"ssh -i {key_file} -o UserKnownHostsFile={known_hosts} -o StrictHostKeyChecking=yes"
+    ssh_env["GIT_SSH_COMMAND"] = (
+        f"ssh -i {key_file} -o UserKnownHostsFile={known_hosts} -o StrictHostKeyChecking=yes"
+    )
 
-    # --- Perform sync ---
     success = False
     try:
         for attempt in range(1, max_retries + 1):
             print(f"[GIT SYNC] 🔄 Attempt {attempt}/{max_retries}...")
-
             try:
-                # Stage and commit
                 run("git add -A", cwd=repo_path, env=ssh_env)
                 status = run("git status --porcelain", cwd=repo_path, env=ssh_env)
                 if status.strip():
@@ -148,7 +188,6 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=3):
                 else:
                     print("[GIT SYNC] 💤 No changes to commit.")
 
-                # Pull and push
                 run("git pull origin main --rebase --autostash", cwd=repo_path, env=ssh_env)
                 run("git push origin HEAD:main", cwd=repo_path, env=ssh_env)
                 print("[GIT SYNC] ✅ Push to main successful.")
@@ -156,7 +195,15 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=3):
                 break
 
             except Exception as e:
-                print(f"[GIT SYNC] ⚠️ Error during sync attempt {attempt}: {e}")
+                error_msg = str(e)
+                print(f"[GIT SYNC] ⚠️ Error during sync attempt {attempt}: {error_msg}")
+
+                # If host key verification failed, refresh keys and retry
+                if ("Host key verification failed" in error_msg or
+                        "REMOTE HOST IDENTIFICATION HAS CHANGED" in error_msg):
+                    refresh_github_host_key()
+                    continue
+
                 if attempt < max_retries:
                     import time; time.sleep(3)
                 else:
