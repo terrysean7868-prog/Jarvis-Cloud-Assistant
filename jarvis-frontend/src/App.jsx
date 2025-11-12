@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import "./App.css";
 import "./reactor.css";
 import DottedRings from "./components/DottedRings";
@@ -19,7 +19,8 @@ export default function App() {
   const lastHotwordTrigger = useRef(0);
 
   // --- Backend communication ---
-  const sendToBackend = async (text) => {
+  const sendToBackend = useCallback(async (text) => {
+    setIsProcessing(true);
     setStatus("thinking");
     setInterimText("");
     wakeWordDetectedRef.current = false;
@@ -44,14 +45,14 @@ export default function App() {
       const msg = "I encountered a connection problem, but I’m still here.";
       setConversation((c) => [...c, { from: "jarvis", text: msg }]);
       speak(msg);
+    } finally {
+      setIsProcessing(false);
       setStatus("listening");
       restartRecognition(250);
-    } finally {
-      setStatus("listening");
     }
-  };
+  }, []);
 
-  const restartRecognition = (delay = 150) => {
+  const restartRecognition = useCallback((delay = 150) => {
     try {
       recognitionRef.current?.stop();
     } catch {}
@@ -60,10 +61,10 @@ export default function App() {
         recognitionRef.current?.start();
       } catch {}
     }, delay);
-  };
+  }, []);
 
-  // --- Worker (voice activity detection) ---
-  const createHotwordWorker = () => {
+  // --- Hotword detection worker ---
+  const createHotwordWorker = useCallback(() => {
     const code = `
       let lastVoice = 0;
       function energyFromFloat32(data) {
@@ -86,10 +87,9 @@ export default function App() {
       };
     `;
     return new Worker(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
-  };
+  }, []);
 
-  // --- Recognition + mic init ---
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // --- Speech Recognition setup ---
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
@@ -108,7 +108,7 @@ export default function App() {
 
     rec.onstart = () => setStatus("listening");
     rec.onerror = (e) => {
-      if (e.error === "aborted") return; // Ignore restarts
+      if (e.error === "aborted") return;
       console.warn("Speech error", e);
       restartRecognition(250);
     };
@@ -171,7 +171,6 @@ export default function App() {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
         const src = ctx.createMediaStreamSource(stream);
 
-        // Use AudioWorklet if supported
         try {
           const workletCode = `
             class VADProcessor extends AudioWorkletProcessor {
@@ -214,19 +213,13 @@ export default function App() {
       });
 
     return () => {
-      try {
-        recognitionRef.current?.stop();
-      } catch {}
-      try {
-        audioStreamRef.current?.getTracks().forEach((t) => t.stop());
-      } catch {}
-      try {
-        workerRef.current?.terminate();
-      } catch {}
+      recognitionRef.current?.stop?.();
+      audioStreamRef.current?.getTracks?.().forEach((t) => t.stop());
+      workerRef.current?.terminate?.();
     };
-  }, []);
+  }, [createHotwordWorker, restartRecognition, sendToBackend]);
 
-  const playActivationSound = () => {
+  const playActivationSound = useCallback(() => {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const o = ctx.createOscillator();
     const g = ctx.createGain();
@@ -237,18 +230,21 @@ export default function App() {
     g.gain.value = 0.25;
     o.start();
     o.stop(ctx.currentTime + 0.12);
-  };
+  }, []);
 
-  const speak = (text) => {
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = "en-US";
-    u.rate = 0.95;
-    window.speechSynthesis.cancel();
-    u.onend = () => restartRecognition(120);
-    window.speechSynthesis.speak(u);
-  };
+  const speak = useCallback(
+    (text) => {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "en-US";
+      u.rate = 0.95;
+      window.speechSynthesis.cancel();
+      u.onend = () => restartRecognition(120);
+      window.speechSynthesis.speak(u);
+    },
+    [restartRecognition]
+  );
 
-  const getStatusColor = () => {
+  const getStatusColor = useCallback(() => {
     switch (status) {
       case "activated":
       case "speaking":
@@ -260,7 +256,7 @@ export default function App() {
       default:
         return "#6b7280";
     }
-  };
+  }, [status]);
 
   return (
     <div className={`app-root ${status === "listening" ? "listening" : ""}`}>
@@ -272,7 +268,7 @@ export default function App() {
         </div>
       </header>
 
-  <DottedRings audioLevel={reactorEnergy} status={status} />
+      <DottedRings audioLevel={reactorEnergy} status={status} />
 
       <div className="conversation">
         {conversation.map((m, i) => (
@@ -287,7 +283,7 @@ export default function App() {
         )}
         {isProcessing && (
           <div className="message jarvis processing">
-            <span className="processing-dots">Processing</span>
+            <span className="processing-dots">Processing<span className="dot">.</span><span className="dot">.</span><span className="dot">.</span></span>
           </div>
         )}
       </div>
