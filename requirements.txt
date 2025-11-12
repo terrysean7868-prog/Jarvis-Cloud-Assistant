@@ -75,7 +75,7 @@ pyautogui>=0.9.53            # Screen navigation automation
 # =============================================================================
 # Translation and Language Tools
 # =============================================================================
-googletrans==4.0.0-rc1       # For language translation (Executor)
+googletrans==4.0.2       # For language translation (Executor)
 
 # =============================================================================
 # Development / Optional Tools
