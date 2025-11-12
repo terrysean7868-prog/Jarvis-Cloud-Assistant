@@ -1,4 +1,19 @@
 /* === RESPONSIVE JARVIS HUD === */
+/* Jarvis dark base */
+html, body, #root, .jarvis-root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: radial-gradient(circle at center, #020607 0%, #000 100%);
+  color: #00eaff;
+  overflow: hidden;
+}
+
+/* Keep canvas below UI layers */
+#filamentCanvas {
+  background: transparent !important;
+}
 
 .jarvis-container {
   display: flex;
@@ -126,4 +141,22 @@
   .arc-core {
     box-shadow: 0 0 25px var(--core-shadow);
   }
+}
+.jarvis-root {
+  background: radial-gradient(circle at center, #03090c 0%, #000 100%);
+  overflow: hidden;
+  color: #00eaff;
+}
+
+canvas {
+  background: transparent !important;
+}
+
+/* Optional subtle vignette for more depth */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(circle at center, transparent 40%, rgba(0, 0, 0, 0.6) 100%);
+  pointer-events: none;
 }
