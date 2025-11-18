@@ -21,12 +21,36 @@ from selenium.webdriver.chrome.options import Options
 from googletrans import Translator
 
 # Optional: pyautogui for screen navigation (only on desktop with display)
-try:
-    import pyautogui
-    PYAUTOGUI_AVAILABLE = True
-except (ImportError, KeyError):
-    # KeyError: 'DISPLAY' environment variable missing (headless/server environment)
+# Check for headless environment before importing
+PYAUTOGUI_AVAILABLE = False
+pyautogui = None
+
+# Detect headless environment - pyautogui requires DISPLAY on Linux
+_is_headless_env = False
+if platform.system() != "Windows":
+    if "DISPLAY" not in os.environ:
+        _is_headless_env = True
+    # Check for server environment indicators
+    # Render sets PORT, RENDER_SERVICE_ID, or path contains /opt/render
+    if (os.getenv("RENDER") or os.getenv("DYNO") or os.getenv("DOCKER") or 
+        os.getenv("PORT") or "/opt/render" in os.getcwd()):
+        _is_headless_env = True
+
+if not _is_headless_env:
+    try:
+        # Set DISPLAY if needed to prevent KeyError in mouseinfo
+        if platform.system() != "Windows" and "DISPLAY" not in os.environ:
+            os.environ["DISPLAY"] = ":0"
+        import pyautogui
+        PYAUTOGUI_AVAILABLE = True
+    except (ImportError, KeyError, Exception):
+        # KeyError: 'DISPLAY' environment variable missing (headless/server environment)
+        PYAUTOGUI_AVAILABLE = False
+        pyautogui = None
+else:
+    # Headless environment - skip import entirely
     PYAUTOGUI_AVAILABLE = False
+    pyautogui = None
 
 # Internet access
 try:
@@ -504,11 +528,14 @@ class ActionExecutor:
                         return {"status": "success", "message": f"Clicked at ({x}, {y})"}
                 else:
                     # Click at current position
-                    if PYAUTOGUI_AVAILABLE:
-                        pyautogui.click(button=button)
-                        return {"status": "success", "message": f"Clicked {button} button"}
+                    if PYAUTOGUI_AVAILABLE and pyautogui:
+                        try:
+                            pyautogui.click(button=button)
+                            return {"status": "success", "message": f"Clicked {button} button"}
+                        except:
+                            return {"status": "error", "message": "Click failed - no display available"}
                 
-                return {"status": "error", "message": "Click failed"}
+                return {"status": "error", "message": "Click failed - screen access not available in headless environment"}
 
             elif command == "type" or command == "type_text":
                 text = action.get("text", "")

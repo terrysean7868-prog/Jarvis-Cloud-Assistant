@@ -24,14 +24,46 @@ except ImportError:
     TESSERACT_AVAILABLE = False
 
 # Screen navigation
-try:
-    import pyautogui
-    PYAUTOGUI_AVAILABLE = True
-    # Safety settings
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.1
-except ImportError:
+PYAUTOGUI_AVAILABLE = False
+pyautogui = None
+
+# Detect headless environment (Render, Docker, etc.)
+# pyautogui requires DISPLAY environment variable on Linux
+# On headless servers, skip import entirely to avoid KeyError
+_is_headless = False
+if platform.system() != "Windows":
+    # Check if DISPLAY is set (required for X11)
+    if "DISPLAY" not in os.environ:
+        _is_headless = True
+    # Also check for common server environment indicators
+    # Render sets PORT, RENDER_SERVICE_ID, or path contains /opt/render
+    if (os.getenv("RENDER") or os.getenv("DYNO") or os.getenv("DOCKER") or 
+        os.getenv("PORT") or "/opt/render" in os.getcwd() or 
+        "/opt/render" in str(__file__)):
+        _is_headless = True
+
+if not _is_headless:
+    try:
+        # Set DISPLAY if not set (prevents KeyError in mouseinfo module)
+        if platform.system() != "Windows" and "DISPLAY" not in os.environ:
+            os.environ["DISPLAY"] = ":0"
+        
+        import pyautogui
+        PYAUTOGUI_AVAILABLE = True
+        # Safety settings
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.1
+    except (ImportError, KeyError, Exception) as e:
+        # If import fails, mark as unavailable
+        PYAUTOGUI_AVAILABLE = False
+        pyautogui = None
+        # Only log in non-headless environments
+        if platform.system() == "Windows" or os.getenv("DISPLAY"):
+            print(f"pyautogui not available: {e}")
+else:
+    # Headless environment - skip import entirely
     PYAUTOGUI_AVAILABLE = False
+    pyautogui = None
 
 # Computer vision for element detection
 try:
@@ -51,8 +83,11 @@ class ScreenAccess:
         
     def get_screen_size(self) -> Tuple[int, int]:
         """Get screen dimensions"""
-        if PYAUTOGUI_AVAILABLE:
-            return pyautogui.size()
+        if PYAUTOGUI_AVAILABLE and pyautogui:
+            try:
+                return pyautogui.size()
+            except:
+                return (1920, 1080)  # Default
         return (1920, 1080)  # Default
     
     def capture_screen(self, region: Optional[Tuple[int, int, int, int]] = None) -> Optional[Image.Image]:
@@ -61,6 +96,11 @@ class ScreenAccess:
         region: (x, y, width, height) or None for full screen
         """
         if not PIL_AVAILABLE:
+            return None
+        
+        # Check if we're in a headless environment
+        if not os.getenv("DISPLAY") and platform.system() != "Windows":
+            print("Screen capture not available in headless environment")
             return None
         
         try:
@@ -128,7 +168,7 @@ class ScreenAccess:
     
     def click_at_position(self, x: int, y: int, button: str = "left") -> bool:
         """Click at specific screen position"""
-        if not PYAUTOGUI_AVAILABLE:
+        if not PYAUTOGUI_AVAILABLE or not pyautogui:
             return False
         
         try:
@@ -140,7 +180,7 @@ class ScreenAccess:
     
     def type_text(self, text: str, interval: float = 0.05) -> bool:
         """Type text at current cursor position"""
-        if not PYAUTOGUI_AVAILABLE:
+        if not PYAUTOGUI_AVAILABLE or not pyautogui:
             return False
         
         try:
@@ -152,7 +192,7 @@ class ScreenAccess:
     
     def press_key(self, key: str, presses: int = 1, interval: float = 0.1) -> bool:
         """Press keyboard key"""
-        if not PYAUTOGUI_AVAILABLE:
+        if not PYAUTOGUI_AVAILABLE or not pyautogui:
             return False
         
         try:
@@ -164,7 +204,7 @@ class ScreenAccess:
     
     def scroll(self, x: int = 0, y: int = 0, clicks: int = 3) -> bool:
         """Scroll screen"""
-        if not PYAUTOGUI_AVAILABLE:
+        if not PYAUTOGUI_AVAILABLE or not pyautogui:
             return False
         
         try:
@@ -179,7 +219,7 @@ class ScreenAccess:
     
     def get_mouse_position(self) -> Tuple[int, int]:
         """Get current mouse position"""
-        if not PYAUTOGUI_AVAILABLE:
+        if not PYAUTOGUI_AVAILABLE or not pyautogui:
             return (0, 0)
         
         try:
@@ -189,7 +229,7 @@ class ScreenAccess:
     
     def move_mouse(self, x: int, y: int, duration: float = 0.5) -> bool:
         """Move mouse to position"""
-        if not PYAUTOGUI_AVAILABLE:
+        if not PYAUTOGUI_AVAILABLE or not pyautogui:
             return False
         
         try:

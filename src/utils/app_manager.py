@@ -11,6 +11,11 @@ from typing import Dict, List, Optional, Tuple
 import psutil
 
 # Windows-specific imports
+WIN32_AVAILABLE = False
+win32gui = None
+win32con = None
+win32process = None
+
 if platform.system() == "Windows":
     try:
         import win32gui
@@ -19,6 +24,9 @@ if platform.system() == "Windows":
         WIN32_AVAILABLE = True
     except ImportError:
         WIN32_AVAILABLE = False
+        win32gui = None
+        win32con = None
+        win32process = None
 else:
     WIN32_AVAILABLE = False
 
@@ -181,7 +189,7 @@ class AppManager:
     
     def switch_to_app(self, app_name: str) -> Dict:
         """Switch to an application window"""
-        if not WIN32_AVAILABLE and platform.system() == "Windows":
+        if platform.system() == "Windows" and not WIN32_AVAILABLE:
             return {
                 "status": "error",
                 "message": "Windows API not available"
@@ -190,16 +198,16 @@ class AppManager:
         try:
             app_name_lower = app_name.lower().strip()
             
-            def enum_handler(hwnd, ctx):
-                if win32gui.IsWindowVisible(hwnd):
-                    window_title = win32gui.GetWindowText(hwnd)
-                    if app_name_lower in window_title.lower():
-                        win32gui.SetForegroundWindow(hwnd)
-                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                        return False
-                return True
-            
-            if platform.system() == "Windows" and WIN32_AVAILABLE:
+            if platform.system() == "Windows" and WIN32_AVAILABLE and win32gui and win32con:
+                def enum_handler(hwnd, ctx):
+                    if win32gui.IsWindowVisible(hwnd):
+                        window_title = win32gui.GetWindowText(hwnd)
+                        if app_name_lower in window_title.lower():
+                            win32gui.SetForegroundWindow(hwnd)
+                            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                            return False
+                    return True
+                
                 win32gui.EnumWindows(enum_handler, None)
                 self.active_window = app_name_lower
                 return {
@@ -207,7 +215,7 @@ class AppManager:
                     "message": f"Switched to {app_name}"
                 }
             else:
-                # For other platforms, try to bring app to front
+                # For other platforms or headless, try to bring app to front
                 return self.open_app(app_name)
         except Exception as e:
             return {
@@ -231,7 +239,7 @@ class AppManager:
     
     def get_active_window(self) -> Optional[Dict]:
         """Get currently active window"""
-        if platform.system() == "Windows" and WIN32_AVAILABLE:
+        if platform.system() == "Windows" and WIN32_AVAILABLE and win32gui:
             try:
                 hwnd = win32gui.GetForegroundWindow()
                 window_title = win32gui.GetWindowText(hwnd)
