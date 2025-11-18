@@ -6,6 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from typing import List
 
 from src.core.llm_adapter import LLMAdapter
 from src.core.jarvis_brain import JarvisBrain
