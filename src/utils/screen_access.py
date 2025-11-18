@@ -6,15 +6,28 @@ Provides screen capture, OCR, and intelligent navigation
 import os
 import platform
 import base64
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, TYPE_CHECKING
 from io import BytesIO
 
 # Screen capture
+PIL_AVAILABLE = False
+Image = None
+ImageGrab = None
+
 try:
     from PIL import Image, ImageGrab
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+    Image = None
+    ImageGrab = None
+
+# For type hints only
+if TYPE_CHECKING:
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        PILImage = None
 
 # OCR for reading screen text
 try:
@@ -90,12 +103,13 @@ class ScreenAccess:
                 return (1920, 1080)  # Default
         return (1920, 1080)  # Default
     
-    def capture_screen(self, region: Optional[Tuple[int, int, int, int]] = None) -> Optional[Image.Image]:
+    def capture_screen(self, region: Optional[Tuple[int, int, int, int]] = None):
         """
         Capture screen or region
         region: (x, y, width, height) or None for full screen
+        Returns: PIL Image object or None
         """
-        if not PIL_AVAILABLE:
+        if not PIL_AVAILABLE or not ImageGrab:
             return None
         
         # Check if we're in a headless environment
