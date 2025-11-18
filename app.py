@@ -139,6 +139,12 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         background_tasks.add_task(executor.process_actions, actions, msg.user)
     return response
 
+# Alias for backward compatibility
+@app.post("/api/message")
+async def message_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
+    """Alias for /api/chat endpoint for backward compatibility"""
+    return await chat_endpoint(msg, background_tasks)
+
 # =========================================================
 # 🛠️ Git Sync API
 # =========================================================

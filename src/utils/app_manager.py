@@ -8,7 +8,14 @@ import platform
 import subprocess
 import time
 from typing import Dict, List, Optional, Tuple
-import psutil
+
+# Process utilities - optional dependency
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
 
 # Windows-specific imports
 WIN32_AVAILABLE = False
@@ -154,6 +161,12 @@ class AppManager:
     
     def close_app(self, app_name: str) -> Dict:
         """Close an application"""
+        if not PSUTIL_AVAILABLE or not psutil:
+            return {
+                "status": "error",
+                "message": "Process management not available (psutil not installed)"
+            }
+        
         try:
             app_name_lower = app_name.lower().strip()
             
@@ -174,7 +187,7 @@ class AppManager:
                             "status": "success",
                             "message": f"Closed {app_name}"
                         }
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                except Exception:
                     continue
             
             return {
@@ -225,6 +238,9 @@ class AppManager:
     
     def list_running_apps(self) -> List[Dict]:
         """List all running applications"""
+        if not PSUTIL_AVAILABLE or not psutil:
+            return []
+        
         apps = []
         for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
             try:
