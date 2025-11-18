@@ -8,6 +8,12 @@ import platform
 from typing import List
 from src.core.jarvis_brain import JarvisBrain
 from src.utils.git_sync import git_sync  # ✅ now importing the function, not a class
+from src.utils.self_update import self_update_file, self_add_feature, parse_voice_command
+from src.utils.screen_access import screen_access
+from src.utils.email_generator import email_generator
+from src.utils.app_manager import app_manager
+from src.utils.task_manager import task_manager
+from src.utils.error_handler import error_handler
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -32,6 +38,7 @@ except ImportError:
 class ActionExecutor:
     def __init__(self, brain: JarvisBrain):
         self.brain = brain
+        self.stop_requested = False
         # Mapping of common website names to URLs
         self.url_map = {
             'youtube': 'https://www.youtube.com',
@@ -83,8 +90,14 @@ class ActionExecutor:
         deleting, moving files, opening URLs, or searching the web.
         After applying file changes, it triggers an automatic Git push to the main branch.
         """
-        # Authenticate user
-        if not self.authenticate_user(user, password):
+        # Check for stop request
+        if self.stop_requested or task_manager.stop_requested:
+            self.stop_requested = False
+            task_manager.stop_requested = False
+            return [{"status": "stopped", "message": "Operation stopped by user"}]
+
+        # Authenticate user (if password provided)
+        if password and not self.authenticate_user(user, password):
             return [{"status": "error", "message": "Authentication failed"}]
 
         results = []
@@ -130,6 +143,109 @@ class ActionExecutor:
                             "action_type": "search",
                             "error": str(e)
                         })
+                continue
+
+            # Handle self-update actions
+            if action_type == "self_update":
+                description = action.get("description", "")
+                file_path = action.get("file_path", "")
+                if description and file_path:
+                    result = self_update_file(description, file_path)
+                    results.append(result)
+                    if result.get("status") == "success":
+                        changed_files.append(result.get("path", ""))
+                continue
+
+            # Handle self-add actions
+            if action_type == "self_add":
+                description = action.get("description", "")
+                feature_type = action.get("feature_type", "module")
+                result = self_add_feature(description, feature_type)
+                results.append(result)
+                if result.get("status") == "success":
+                    changed_files.append(result.get("path", ""))
+                continue
+
+            # Handle screen capture actions
+            if action_type == "capture_screen":
+                screenshot_info = screen_access.take_screenshot_info()
+                results.append({
+                    "status": "success",
+                    "action_type": "capture_screen",
+                    "screenshot": screenshot_info
+                })
+                continue
+
+            # Handle screen navigation actions
+            if action_type == "screen_navigation":
+                result = await self._handle_screen_navigation(action)
+                results.append(result)
+                continue
+
+            # Handle email generation actions
+            if action_type == "generate_email":
+                recipient = action.get("recipient", "")
+                subject = action.get("subject")
+                body_prompt = action.get("body_prompt", action.get("description", ""))
+                tone = action.get("tone", "professional")
+                result = email_generator.generate_email(recipient, subject, body_prompt, tone)
+                results.append(result)
+                continue
+
+            # Handle application management actions
+            if action_type == "open_app":
+                app_name = action.get("app_name", "")
+                args = action.get("args", [])
+                result = app_manager.open_app(app_name, args)
+                results.append(result)
+                continue
+
+            if action_type == "close_app":
+                app_name = action.get("app_name", "")
+                result = app_manager.close_app(app_name)
+                results.append(result)
+                continue
+
+            if action_type == "switch_app":
+                app_name = action.get("app_name", "")
+                result = app_manager.switch_to_app(app_name)
+                results.append(result)
+                continue
+
+            if action_type == "execute_command":
+                command = action.get("command", "")
+                wait = action.get("wait", True)
+                result = app_manager.execute_command(command, wait)
+                results.append(result)
+                continue
+
+            # Handle task management
+            if action_type == "create_task":
+                description = action.get("description", "")
+                steps = action.get("steps", [])
+                priority = action.get("priority", 5)
+                task_id = task_manager.create_task(description, steps, priority)
+                results.append({
+                    "status": "success",
+                    "task_id": task_id,
+                    "message": f"Task created: {description}"
+                })
+                continue
+
+            if action_type == "stop_task" or action_type == "stop":
+                result = task_manager.stop_current_task()
+                results.append(result)
+                continue
+
+            # Handle error checking and fixing
+            if action_type == "check_errors" or action_type == "fix_errors":
+                result = error_handler.monitor_and_fix()
+                results.append(result)
+                continue
+
+            if action_type == "check_render_logs":
+                result = error_handler.check_render_logs()
+                results.append(result)
                 continue
 
             # File operations (existing code)
@@ -335,38 +451,97 @@ class ActionExecutor:
     async def _handle_screen_navigation(self, action: dict):
         """
         Handles screen navigation commands like moving the mouse, clicking, typing, etc.
-        Only available on desktop environments with a display server.
+        Enhanced with screen access capabilities.
         """
-        if not PYAUTOGUI_AVAILABLE:
-            return {
-                "status": "error",
-                "message": "Screen navigation unavailable: running on headless/server environment without display"
-            }
-
-        command = action.get("command")
+        command = action.get("command", "")
+        
         try:
-            if command == "move_mouse":
+            if command == "capture_screen" or command == "screenshot":
+                screenshot_info = screen_access.take_screenshot_info()
+                return {
+                    "status": "success",
+                    "message": "Screen captured",
+                    "screenshot": screenshot_info
+                }
+
+            elif command == "read_screen" or command == "ocr":
+                region = action.get("region")
+                text = screen_access.read_screen_text(region)
+                return {
+                    "status": "success",
+                    "message": "Screen text extracted",
+                    "text": text
+                }
+
+            elif command == "find_text":
+                search_text = action.get("text", "")
+                position = screen_access.find_text_on_screen(search_text)
+                if position:
+                    return {
+                        "status": "success",
+                        "message": f"Found text at {position}",
+                        "position": position
+                    }
+                return {
+                    "status": "error",
+                    "message": "Text not found on screen"
+                }
+
+            elif command == "move_mouse":
                 x, y = action.get("x", 0), action.get("y", 0)
-                pyautogui.moveTo(x, y, duration=0.5)
-                return {"status": "success", "message": f"Moved mouse to ({x}, {y})"}
+                duration = action.get("duration", 0.5)
+                if screen_access.move_mouse(x, y, duration):
+                    return {"status": "success", "message": f"Moved mouse to ({x}, {y})"}
+                return {"status": "error", "message": "Failed to move mouse"}
 
             elif command == "click":
+                x = action.get("x")
+                y = action.get("y")
                 button = action.get("button", "left")
-                pyautogui.click(button=button)
-                return {"status": "success", "message": f"Clicked {button} button"}
+                
+                if x is not None and y is not None:
+                    if screen_access.click_at_position(x, y, button):
+                        return {"status": "success", "message": f"Clicked at ({x}, {y})"}
+                else:
+                    # Click at current position
+                    if PYAUTOGUI_AVAILABLE:
+                        pyautogui.click(button=button)
+                        return {"status": "success", "message": f"Clicked {button} button"}
+                
+                return {"status": "error", "message": "Click failed"}
 
-            elif command == "type":
+            elif command == "type" or command == "type_text":
                 text = action.get("text", "")
-                pyautogui.typewrite(text)
-                return {"status": "success", "message": f"Typed '{text}'"}
+                interval = action.get("interval", 0.05)
+                if screen_access.type_text(text, interval):
+                    return {"status": "success", "message": f"Typed '{text}'"}
+                return {"status": "error", "message": "Failed to type text"}
+
+            elif command == "press_key":
+                key = action.get("key", "")
+                presses = action.get("presses", 1)
+                if screen_access.press_key(key, presses):
+                    return {"status": "success", "message": f"Pressed key '{key}'"}
+                return {"status": "error", "message": "Failed to press key"}
 
             elif command == "scroll":
-                amount = action.get("amount", 0)
-                pyautogui.scroll(amount)
-                return {"status": "success", "message": f"Scrolled {amount}"}
+                x = action.get("x", 0)
+                y = action.get("y", 0)
+                clicks = action.get("clicks", 3)
+                if screen_access.scroll(x, y, clicks):
+                    return {"status": "success", "message": f"Scrolled ({x}, {y})"}
+                return {"status": "error", "message": "Failed to scroll"}
+
+            elif command == "get_mouse_position":
+                pos = screen_access.get_mouse_position()
+                return {
+                    "status": "success",
+                    "message": f"Mouse at {pos}",
+                    "position": pos
+                }
 
             else:
-                return {"status": "error", "message": "Unknown screen navigation command"}
+                return {"status": "error", "message": f"Unknown screen navigation command: {command}"}
 
         except Exception as e:
             return {"status": "error", "message": str(e)}

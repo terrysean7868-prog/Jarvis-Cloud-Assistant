@@ -1,15 +1,18 @@
 .dotted-rings {
   /* keep centered horizontally, allow vertical spacing via extra height & padding */
   position: absolute;
-  top: 30%;
+  top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  width: 240px;
-  height: 380px; /* large vertical spacing */
-  padding: 50px 0; /* extra generous space above and below rings */
+  width: 100%;
+  max-width: 500px;
+  height: 500px;
+  padding: 0;
   display: flex;
   justify-content: center;
   align-items: center;
+  pointer-events: none;
+  z-index: 2;
 }
 
 /* Structure: .ring-wrap handles scaling, .ring-inner rotates */
@@ -20,25 +23,34 @@
   display: flex;
   justify-content: center;
   align-items: center;
+  width: var(--size, 100px);
+  height: var(--size, 100px);
 }
 
 .ring-inner {
   position: absolute;
-  border: 2px dotted #00bcd4;
+  border: 2px dotted;
   border-radius: 50%;
   transition: opacity 140ms linear, box-shadow 140ms linear, transform 140ms linear;
-  background: linear-gradient(135deg, rgba(0, 187, 212, 0.349), rgba(0, 229, 255, 0.344));
-  animation: spin-cw 12s linear infinite, pulse-glow 3s ease-in-out infinite;
-  box-shadow: 0 0 20px rgba(0, 187, 212, 0.248), inset 0 0 20px rgba(0, 138, 212, 0.966);
+  background: radial-gradient(circle at 30% 30%, rgba(255, 255, 255, 0.1), transparent);
+  width: 100%;
+  height: 100%;
+  will-change: transform, opacity, box-shadow;
 }
 
-.ring1-wrap { width: 100px; height: 100px; }
-.ring2-wrap { width: 150px; height: 150px; }
-.ring3-wrap { width: 200px; height: 200px; }
+/* Individual ring sizes - responsive */
+.ring1-wrap { --size: 80px; }
+.ring2-wrap { --size: 120px; }
+.ring3-wrap { --size: 160px; }
+.ring4-wrap { --size: 200px; }
+.ring5-wrap { --size: 240px; }
 
-.ring1 { width: 100%; height: 100%; animation-delay: 0s, 0s; }
-.ring2 { width: 100%; height: 100%; animation-delay: 0.5s, -1s; }
-.ring3 { width: 100%; height: 100%; animation-delay: 1s, -2s; }
+/* Ring animations with different delays */
+.ring1 { animation-delay: 0s, 0s; }
+.ring2 { animation-delay: 0.3s, -0.5s; }
+.ring3 { animation-delay: 0.6s, -1s; }
+.ring4 { animation-delay: 0.9s, -1.5s; }
+.ring5 { animation-delay: 1.2s, -2s; }
 
 @keyframes rotate {
   0% {
@@ -79,10 +91,48 @@
   }
 }
 
-/* Small responsive tweaks */
-@media (max-width: 640px) {
-  .dotted-rings { top: 6%; width: 180px; height: 200px; }
-  .ring1-wrap { width: 70px; height: 70px; }
-  .ring2-wrap { width: 110px; height: 110px; }
-  .ring3-wrap { width: 140px; height: 140px; }
+/* Responsive design for mobile */
+@media (max-width: 768px) {
+  .dotted-rings {
+    top: 50%;
+    max-width: 400px;
+    height: 400px;
+  }
+  
+  .ring1-wrap { --size: 60px; }
+  .ring2-wrap { --size: 90px; }
+  .ring3-wrap { --size: 120px; }
+  .ring4-wrap { --size: 150px; }
+  .ring5-wrap { --size: 180px; }
+}
+
+@media (max-width: 480px) {
+  .dotted-rings {
+    top: 50%;
+    max-width: 300px;
+    height: 300px;
+  }
+  
+  .ring1-wrap { --size: 50px; }
+  .ring2-wrap { --size: 75px; }
+  .ring3-wrap { --size: 100px; }
+  .ring4-wrap { --size: 125px; }
+  .ring5-wrap { --size: 150px; }
+  
+  .ring-inner {
+    border-width: 1.5px;
+  }
+}
+
+@media (max-width: 360px) {
+  .dotted-rings {
+    max-width: 250px;
+    height: 250px;
+  }
+  
+  .ring1-wrap { --size: 40px; }
+  .ring2-wrap { --size: 60px; }
+  .ring3-wrap { --size: 80px; }
+  .ring4-wrap { --size: 100px; }
+  .ring5-wrap { --size: 120px; }
 }

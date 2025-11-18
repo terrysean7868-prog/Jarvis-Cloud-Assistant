@@ -71,6 +71,13 @@ gensim>=4.1.2
 # python-telegram-bot==13.15  # optional Telegram bot support
 selenium>=4.0.0              # Browser automation
 pyautogui>=0.9.53            # Screen navigation automation
+Pillow>=10.0.0               # Screen capture and image processing
+pytesseract>=0.3.10          # OCR for reading screen text
+opencv-python>=4.8.0         # Computer vision for screen analysis
+numpy>=1.21.0                # Required for opencv
+psutil>=5.9.0                # Process and system utilities
+pywin32>=306; sys_platform == 'win32'  # Windows API (Windows only)
+requests>=2.31.0             # For Render API access
 
 # =============================================================================
 # Translation and Language Tools

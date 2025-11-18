@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime
 from src.utils.db import db
 from src.core.llm_adapter import LLMAdapter
+from src.utils.task_manager import task_manager
 
 class JarvisBrain:
     """Enhanced brain with memory context, reasoning, and humanlike tone."""
@@ -19,13 +20,29 @@ class JarvisBrain:
         context = "\n".join([f"{m['role']}: {m['text']}" for m in self.memory[-6:]])
 
         try:
+            # Check if this is a self-update command
+            text_lower = text.lower()
+            is_self_update = any(keyword in text_lower for keyword in [
+                "update", "modify", "improve", "edit", "change", "add", "create", "make", "build"
+            ]) and any(keyword in text_lower for keyword in [
+                "file", "module", "component", "code", "system", "bot", "jarvis"
+            ])
+            
+            capabilities = ["open_url", "search", "calculate", "news", "mode_switch"]
+            if is_self_update:
+                capabilities.append("self_update")
+                capabilities.append("self_add")
+            
             response = await self.llm.generate_response(
-                text, context=context, mode=mode, capabilities=["open_url", "search", "calculate", "news", "mode_switch"]
+                text, context=context, mode=mode, capabilities=capabilities
             )
 
             # Save to memory
             self.memory.append({"role": "user", "text": text})
             self.memory.append({"role": "assistant", "text": response["text"]})
+
+            # Save context for wakeup command
+            task_manager.save_wakeup_context(text, response["text"], response.get("actions", []))
 
             # Auto memory trim
             if len(self.memory) > 50:

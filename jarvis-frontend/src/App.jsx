@@ -1,9 +1,10 @@
 // src/App.jsx
 import React, { useState, useEffect, useRef } from "react";
-import { listenOnce, speak } from "./utils/speech";
+import { listenOnce, speak, initAudioProcessing } from "./utils/speech";
 import { sendMessage } from "./utils/api";
 import ArcReactor from "./components/ArcReactor";
 import HUDLogs from "./components/HUDLogs";
+import AuthModal from "./components/AuthModal";
 import "./styles/jarvis.css";
 
 /**
@@ -30,6 +31,10 @@ export default function App() {
   const [emotion, setEmotion] = useState("calm"); // calm | action | analyzing | critical
   const [volume, setVolume] = useState(0); // 0..1 mic amplitude
   const [transformState, setTransformState] = useState("normal"); // visual transform commands
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [sessionId, setSessionId] = useState(null);
+  const [username, setUsername] = useState(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
 
   // refs
   const wakeRecognizer = useRef(null);
@@ -45,37 +50,67 @@ export default function App() {
     ]);
   };
 
-  // --- Mic amplitude analyzer for reactive visuals
+  // --- Enhanced Mic amplitude analyzer with noise reduction
   useEffect(() => {
-    let audioCtx = null;
-    let analyser = null;
-    let dataArray = null;
     let rafId = null;
+    let audioData = null;
 
     const init = async () => {
       try {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        micStreamRef.current = stream;
-        const src = audioCtx.createMediaStreamSource(stream);
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 256;
-        src.connect(analyser);
-        dataArray = new Uint8Array(analyser.frequencyBinCount);
+        // Initialize enhanced audio processing
+        audioData = await initAudioProcessing();
+        if (audioData && audioData.analyser) {
+          micStreamRef.current = audioData.stream;
+          const dataArray = new Uint8Array(audioData.analyser.frequencyBinCount);
 
-        const tick = () => {
-          analyser.getByteFrequencyData(dataArray);
-          // compute simple normalized RMS-like amplitude
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i] * dataArray[i];
-          const rms = Math.sqrt(sum / dataArray.length) / 255;
-          // smooth slightly
-          setVolume((v) => Math.min(1, v * 0.85 + rms * 0.15));
-          rafId = requestAnimationFrame(tick);
-        };
-        tick();
+          const tick = () => {
+            if (audioData.analyser) {
+              audioData.analyser.getByteFrequencyData(dataArray);
+              // compute normalized RMS-like amplitude with better smoothing
+              let sum = 0;
+              for (let i = 0; i < dataArray.length; i++) {
+                sum += dataArray[i] * dataArray[i];
+              }
+              const rms = Math.sqrt(sum / dataArray.length) / 255;
+              // Enhanced smoothing for better visualization
+              setVolume((v) => Math.min(1, v * 0.8 + rms * 0.2));
+            }
+            rafId = requestAnimationFrame(tick);
+          };
+          tick();
+        }
       } catch (err) {
-        console.warn("Mic analyzer init failed:", err);
+        console.warn("Enhanced mic analyzer init failed, falling back to basic:", err);
+        // Fallback to basic initialization
+        try {
+          const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          navigator.mediaDevices.getUserMedia({ 
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          }).then(stream => {
+            micStreamRef.current = stream;
+            const src = audioCtx.createMediaStreamSource(stream);
+            const analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 256;
+            src.connect(analyser);
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+            const tick = () => {
+              analyser.getByteFrequencyData(dataArray);
+              let sum = 0;
+              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i] * dataArray[i];
+              const rms = Math.sqrt(sum / dataArray.length) / 255;
+              setVolume((v) => Math.min(1, v * 0.85 + rms * 0.15));
+              rafId = requestAnimationFrame(tick);
+            };
+            tick();
+          });
+        } catch (fallbackErr) {
+          console.warn("Fallback mic init also failed:", fallbackErr);
+        }
       }
     };
 
@@ -85,9 +120,6 @@ export default function App() {
       if (rafId) cancelAnimationFrame(rafId);
       try {
         micStreamRef.current?.getTracks().forEach((t) => t.stop());
-      } catch {}
-      try {
-        audioCtx?.close();
       } catch {}
     };
   }, []);
@@ -132,8 +164,41 @@ export default function App() {
         // If currently handling command, ignore (we'll resume later)
         if (isHandlingCommand.current) return;
 
-        // Wake words
-        if (transcript.includes("hey jarvis") || transcript.includes("ok jarvis")) {
+        // Wake words - also check for "wakeup" command
+        if (transcript.includes("hey jarvis") || transcript.includes("ok jarvis") || 
+            transcript.includes("wake up") || transcript.includes("wakeup")) {
+          
+          // If "wakeup" command, load context and create task
+          if (transcript.includes("wake up") || transcript.includes("wakeup")) {
+            addLog("wake", "Wakeup command detected - loading context...");
+            // Fetch wakeup context
+            fetch(`${process.env.REACT_APP_API_URL || "http://localhost:8000"}/api/wakeup-context`)
+              .then(res => res.json())
+              .then(data => {
+                if (data.context && Object.keys(data.context).length > 0) {
+                  addLog("system", `Found ${Object.keys(data.context).length} context entries`);
+                  speak("Context loaded. I'm ready to manage your tasks step by step.", () => {
+                    setTimeout(async () => {
+                      await handleVoiceCommand();
+                    }, 200);
+                  });
+                } else {
+                  speak("No previous context found. Ready for new commands.", () => {
+                    setTimeout(async () => {
+                      await handleVoiceCommand();
+                    }, 200);
+                  });
+                }
+              })
+              .catch(() => {
+                speak("Ready for commands.", () => {
+                  setTimeout(async () => {
+                    await handleVoiceCommand();
+                  }, 200);
+                });
+              });
+            return;
+          }
           addLog("wake", "Wake word detected.");
           // visual pulse
           setWakePulse(true);
@@ -215,7 +280,13 @@ export default function App() {
     // listenOnce is expected to return a transcript string (or null)
     let transcript = null;
     try {
-      transcript = await listenOnce({ timeout: 8000, interim: false });
+      // Use enhanced voice recognition with better settings
+      transcript = await listenOnce({ 
+        timeout: 10000, 
+        interim: false,
+        language: "en-US",
+        maxAlternatives: 1
+      });
     } catch (err) {
       console.warn("listenOnce failed:", err);
     }
@@ -282,9 +353,39 @@ export default function App() {
       return;
     }
 
+    // Check for stop command
+    const textLower = transcript.toLowerCase();
+    if (textLower.includes("stop") || textLower === "stop" || textLower.includes("cancel")) {
+      addLog("system", "Stopping current operation...");
+      speak("Operation stopped.", () => {
+        try {
+          wakeRecognizer.current?.start();
+        } catch {}
+        isHandlingCommand.current = false;
+      });
+      
+      // Send stop command to backend
+      fetch(`${process.env.REACT_APP_API_URL || "http://localhost:8000"}/api/stop-task`, {
+        method: "POST"
+      }).catch(console.error);
+      
+      return;
+    }
+
+    // Check if this is a self-update command
+    const isSelfUpdate = (
+      (textLower.includes("update") || textLower.includes("modify") || 
+       textLower.includes("edit") || textLower.includes("add") || 
+       textLower.includes("create") || textLower.includes("change")) &&
+      (textLower.includes("file") || textLower.includes("module") || 
+       textLower.includes("component") || textLower.includes("code") ||
+       textLower.includes("system") || textLower.includes("bot") ||
+       textLower.includes("jarvis"))
+    );
+
     // If not a local command, send to backend
     try {
-      const res = await sendMessage(transcript);
+      const res = await sendMessage(transcript, "chat", sessionId);
       addLog("response", res.text || "No text returned.");
 
       // update emotion based on keywords
@@ -292,6 +393,7 @@ export default function App() {
       if (/\b(error|fail|cannot|no connection|critical|danger)\b/.test(tLower)) setEmotion("critical");
       else if (/\b(open|launch|execute|run|action)\b/.test(tLower)) setEmotion("action");
       else if (/\b(analyz|thinking|processing|research|search)\b/.test(tLower)) setEmotion("analyzing");
+      else if (isSelfUpdate || /\b(update|modify|edit|add|create)\b/.test(tLower)) setEmotion("analyzing");
       else setEmotion("calm");
 
       // speak response
@@ -309,9 +411,12 @@ export default function App() {
       // perform actions if present
       if (Array.isArray(res.actions) && res.actions.length) {
         for (const a of res.actions) {
-          addLog("action", `${a.type} ${a.value || a.url || ""}`);
+          addLog("action", `${a.type} ${a.value || a.url || a.file_path || ""}`);
           if (a.type === "open_url" && (a.value || a.url)) {
             window.open(a.value || a.url, "_blank");
+          } else if (a.type === "self_update" || a.type === "self_add") {
+            // Self-update actions are handled by the backend
+            addLog("system", `Self-update: ${a.type} - ${a.description || a.file_path || ""}`);
           }
           // Additional action types can be added here
         }
@@ -477,9 +582,118 @@ export default function App() {
     }
   };
 
+  // Handle authentication
+  const handleAuthSuccess = (newSessionId, newUsername) => {
+    setSessionId(newSessionId);
+    setUsername(newUsername);
+    setIsAuthenticated(true);
+    setShowAuthModal(false);
+    localStorage.setItem("jarvis_session", newSessionId);
+    localStorage.setItem("jarvis_username", newUsername);
+    addLog("system", `Authenticated as ${newUsername}`);
+  };
+
+  // Check for existing session on mount
+  useEffect(() => {
+    const storedSession = localStorage.getItem("jarvis_session");
+    const storedUsername = localStorage.getItem("jarvis_username");
+    
+    if (storedSession && storedUsername) {
+      // Validate session
+      fetch(`${process.env.REACT_APP_API_URL || "http://localhost:8000"}/api/validate-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: storedSession })
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.valid) {
+          setSessionId(storedSession);
+          setUsername(storedUsername);
+          setIsAuthenticated(true);
+        } else {
+          localStorage.removeItem("jarvis_session");
+          localStorage.removeItem("jarvis_username");
+          setShowAuthModal(true);
+        }
+      })
+      .catch(() => {
+        setShowAuthModal(true);
+      });
+    } else {
+      setShowAuthModal(true);
+    }
+  }, []);
+
   // --- Render ---
   return (
     <div className="jarvis-root">
+      {/* Authentication Modal */}
+      {showAuthModal && (
+        <AuthModal
+          onAuthSuccess={handleAuthSuccess}
+          onClose={() => {
+            if (!isAuthenticated) {
+              // Don't allow closing if not authenticated
+              speak("Authentication is required to use Jarvis.");
+            } else {
+              setShowAuthModal(false);
+            }
+          }}
+        />
+      )}
+
+      {/* User Info Display */}
+      {isAuthenticated && username && (
+        <div style={{
+          position: "fixed",
+          top: 20,
+          right: 20,
+          zIndex: 15,
+          background: "rgba(10, 10, 12, 0.8)",
+          padding: "10px 15px",
+          borderRadius: "20px",
+          border: "1px solid rgba(0, 255, 200, 0.3)",
+          display: "flex",
+          alignItems: "center",
+          gap: "10px",
+          backdropFilter: "blur(10px)"
+        }}>
+          <div style={{
+            width: "8px",
+            height: "8px",
+            borderRadius: "50%",
+            background: "#00ffc8",
+            boxShadow: "0 0 10px rgba(0, 255, 200, 0.6)"
+          }} />
+          <span style={{ color: "#00ffc8", fontSize: "14px" }}>{username}</span>
+          <button
+            onClick={() => {
+              localStorage.removeItem("jarvis_session");
+              localStorage.removeItem("jarvis_username");
+              setIsAuthenticated(false);
+              setSessionId(null);
+              setUsername(null);
+              setShowAuthModal(true);
+              speak("Logged out successfully.");
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#ff5050",
+              cursor: "pointer",
+              fontSize: "12px",
+              padding: "5px 10px",
+              borderRadius: "5px",
+              transition: "all 0.3s"
+            }}
+            onMouseEnter={(e) => e.target.style.background = "rgba(255, 80, 80, 0.2)"}
+            onMouseLeave={(e) => e.target.style.background = "transparent"}
+          >
+            Logout
+          </button>
+        </div>
+      )}
       {/* filament background canvas */}
       <canvas id="filamentCanvas" style={{ position: "fixed", inset: 0, zIndex: 1, pointerEvents: "none" }} />
 
