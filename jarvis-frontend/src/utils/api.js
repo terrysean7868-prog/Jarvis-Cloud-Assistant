@@ -1,54 +1,36 @@
 // src/utils/api.js
-const API_URL = process.env.REACT_APP_API_URL || 
+const API_URL = process.env.REACT_APP_API_URL ||
   (process.env.NODE_ENV === 'development' ? "http://localhost:8000" : "https://jarvis-cloud-assistant.onrender.com");
 
-export async function sendMessage(text, mode = "chat", sessionId = null) {
+const DEFAULT_TIMEOUT = parseInt(process.env.REACT_APP_API_TIMEOUT_MS || "20000", 10); // 20s
+
+function timeoutFetch(url, opts = {}, timeout = DEFAULT_TIMEOUT) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  const init = { ...opts, signal: controller.signal };
+
+  return fetch(url, init)
+    .finally(() => clearTimeout(id));
+}
+
+export async function sendMessage(text, mode = "chat", sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
   try {
-    const res = await fetch(`${API_URL}/api/chat`, {
+    const res = await timeoutFetch(`${API_URL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, mode, user: "user", session_id: sessionId }),
-    });
+    }, timeoutMs);
+
     if (!res.ok) {
-      throw new Error(`HTTP error! status: ${res.status}`);
+      // Try to parse error body for better messaging
+      let errText = await res.text().catch(() => `HTTP ${res.status}`);
+      throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
     }
     const data = await res.json();
-    
-    // Check if authentication is required
-    if (data.auth_required) {
-      return { text: data.text, actions: [], auth_required: true };
-    }
-    
     return data;
   } catch (err) {
-    console.error("API error:", err);
-    return { text: "Error contacting backend.", actions: [] };
+    console.error("sendMessage error:", err);
+    // return consistent error structure for UI to handle
+    return { status: "error", message: err.name === 'AbortError' ? "request_timeout" : err.message };
   }
 }
-
-export async function setGitHubConfig(config) {
-  try {
-    const res = await fetch(`${API_URL}/api/github-config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(config),
-    });
-    return await res.json();
-  } catch (err) {
-    console.error("GitHub config error:", err);
-    return { status: "error", message: err.message };
-  }
-}
-
-export async function triggerGitSync() {
-  try {
-    const res = await fetch(`${API_URL}/api/git-sync`, {
-      method: "POST",
-    });
-    return await res.json();
-  } catch (err) {
-    console.error("Git sync error:", err);
-    return { status: "error", message: err.message };
-  }
-}
-

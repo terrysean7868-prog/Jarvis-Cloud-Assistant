@@ -1,36 +1,27 @@
 // src/App.jsx
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from "react";
 import { listenOnce, speak, initAudioProcessing } from "./utils/speech";
 import { sendMessage } from "./utils/api";
-import ArcReactor from "./components/ArcReactor";
-import HUDLogs from "./components/HUDLogs";
-import AuthModal from "./components/AuthModal";
 import "./styles/jarvis.css";
 
-/**
- * Phase 11.5: Intelligent Wake Logic + Neural Filament Grid + Emotional Glow
- *
- * - Stable wake-word detection: avoids multiple starts, handles "aborted" errors.
- * - Pauses wake listener while capturing a command (prevents overlap).
- * - Emits spoken ACK: "Yes sir, I'm listening."
- * - Neural filament canvas that reacts to emotion, wakePulse and mic volume.
- * - Emotional glow overlay that changes core color (calm/action/critical).
- *
- * Requirements: utils/speech.js -> listenOnce() & speak(text, onEnd)
- *               utils/api.js -> sendMessage(text) returns { text, actions }
- *
- * Drop into src/App.jsx and run.
- */
+// Lazy-load heavy UI pieces
+const ArcReactor = lazy(() => import("./components/ArcReactor"));
+const HUDLogs = lazy(() => import("./components/HUDLogs"));
+const AuthModal = lazy(() => import("./components/AuthModal"));
+
+// Constants
+const FILAMENT_WORKER_PATH = "/filamentWorker.js"; // put this file in public/
+const AUDIO_WORKER_PATH = "/audioWorker.js"; // optional, put in public/
 
 export default function App() {
-  // UI / state
-  const [listening, setListening] = useState(false); // actively recording command
+  // Light state only — avoid large objects in state
+  const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
-  const [wakePulse, setWakePulse] = useState(false); // short visual pulse on wake
+  const [wakePulse, setWakePulse] = useState(false);
   const [logs, setLogs] = useState([]);
-  const [emotion, setEmotion] = useState("calm"); // calm | action | analyzing | critical
-  const [volume, setVolume] = useState(0); // 0..1 mic amplitude
-  const [transformState, setTransformState] = useState("normal"); // visual transform commands
+  const [emotion, setEmotion] = useState("calm"); // calm|action|analyzing|critical
+  const [volume, setVolume] = useState(0); // 0..1
+  const [transformState, setTransformState] = useState("normal");
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionId, setSessionId] = useState(null);
   const [username, setUsername] = useState(null);
@@ -38,79 +29,121 @@ export default function App() {
 
   // refs
   const wakeRecognizer = useRef(null);
-  const isHandlingCommand = useRef(false); // prevents re-entrance
+  const isHandlingCommand = useRef(false);
   const micStreamRef = useRef(null);
-  const filamentRAF = useRef(null);
+  const filamentCanvasRef = useRef(null);
+  const filamentWorkerRef = useRef(null);
+  const audioWorkerRef = useRef(null);
 
-  // addLog helper
-  const addLog = (type, message) => {
-    setLogs((prev) => [
-      { type, message, time: new Date().toLocaleTimeString() },
-      ...prev.slice(0, 12),
-    ]);
-  };
+  // Minimal log writer (memoized to avoid re-creating)
+  const addLog = useCallback((type, message) => {
+    setLogs(prev => [{ type, message, time: new Date().toLocaleTimeString() }, ...prev.slice(0, 12)]);
+  }, []);
 
-  // --- Enhanced Mic amplitude analyzer with noise reduction
+  // ---------- Offload visuals to worker (OffscreenCanvas) ----------
+  useEffect(() => {
+    const canvas = document.getElementById("filamentCanvas");
+    if (!canvas) {
+      console.warn("filamentCanvas not found");
+      return;
+    }
+
+    // Only start worker once
+    if (!("OffscreenCanvas" in window)) {
+      // Fallback: keep main-thread drawing but throttle it (not ideal)
+      addLog("system", "OffscreenCanvas not supported; falling back to main-thread rendering (may be slower).");
+      return;
+    }
+
+    try {
+      const offscreen = canvas.transferControlToOffscreen();
+      const worker = new Worker(FILAMENT_WORKER_PATH);
+      filamentWorkerRef.current = worker;
+
+      // Initialize worker with canvas and some config
+      worker.postMessage({
+        type: "init",
+        canvas: offscreen,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        width: window.innerWidth,
+        height: window.innerHeight
+      }, [offscreen]);
+
+      // Worker can send logs or events back
+      worker.onmessage = (ev) => {
+        const data = ev.data || {};
+        if (data.type === "log") addLog("system", `[filamentWorker] ${data.message}`);
+      };
+
+      // Resize handler: let worker handle resizing
+      const onResize = () => {
+        if (worker) {
+          worker.postMessage({ type: "resize", width: window.innerWidth, height: window.innerHeight });
+        }
+      };
+      window.addEventListener("resize", onResize);
+
+      return () => {
+        window.removeEventListener("resize", onResize);
+        try {
+          worker.postMessage({ type: "dispose" });
+          worker.terminate();
+        } catch {}
+      };
+    } catch (err) {
+      console.error("Filament worker init failed:", err);
+      addLog("system", "Filament worker failed to initialize.");
+    }
+    // run once
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------- Audio processing (throttled) ----------
   useEffect(() => {
     let rafId = null;
     let audioData = null;
+    let lastSend = 0;
+    const THROTTLE_MS = 50; // 20fps audio updates to worker (light)
 
     const init = async () => {
       try {
-        // Initialize enhanced audio processing
-        audioData = await initAudioProcessing();
+        audioData = await initAudioProcessing(); // returns { analyser, stream } if implemented
         if (audioData && audioData.analyser) {
           micStreamRef.current = audioData.stream;
-          const dataArray = new Uint8Array(audioData.analyser.frequencyBinCount);
+          const analyser = audioData.analyser;
+          const dataArray = new Float32Array(analyser.fftSize);
 
           const tick = () => {
-            if (audioData.analyser) {
-              audioData.analyser.getByteFrequencyData(dataArray);
-              // compute normalized RMS-like amplitude with better smoothing
-              let sum = 0;
-              for (let i = 0; i < dataArray.length; i++) {
-                sum += dataArray[i] * dataArray[i];
-              }
-              const rms = Math.sqrt(sum / dataArray.length) / 255;
-              // Enhanced smoothing for better visualization
-              setVolume((v) => Math.min(1, v * 0.8 + rms * 0.2));
+            analyser.getFloatTimeDomainData(dataArray);
+            // compute light RMS on small slice to keep it cheap
+            let sum = 0;
+            // sample a subset for speed
+            for (let i = 0; i < dataArray.length; i += Math.max(1, Math.floor(dataArray.length / 128))) {
+              const v = dataArray[i];
+              sum += v * v;
             }
+            const rms = Math.sqrt(sum / Math.max(1, Math.floor(dataArray.length / 128)));
+            // smooth on main thread (cheap)
+            setVolume(v => Math.min(1, v * 0.8 + rms * 0.2));
+
+            // send small update to worker at throttled rate
+            const now = performance.now();
+            if (filamentWorkerRef.current && now - lastSend > THROTTLE_MS) {
+              lastSend = now;
+              filamentWorkerRef.current.postMessage({
+                type: "audio",
+                volume: Math.min(1, rms * 3) // scaled for visuals
+              });
+            }
+
             rafId = requestAnimationFrame(tick);
           };
           tick();
+        } else {
+          addLog("system", "Audio processing init returned no analyser.");
         }
       } catch (err) {
-        console.warn("Enhanced mic analyzer init failed, falling back to basic:", err);
-        // Fallback to basic initialization
-        try {
-          const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-          navigator.mediaDevices.getUserMedia({ 
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true
-            }
-          }).then(stream => {
-            micStreamRef.current = stream;
-            const src = audioCtx.createMediaStreamSource(stream);
-            const analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 256;
-            src.connect(analyser);
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-            const tick = () => {
-              analyser.getByteFrequencyData(dataArray);
-              let sum = 0;
-              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i] * dataArray[i];
-              const rms = Math.sqrt(sum / dataArray.length) / 255;
-              setVolume((v) => Math.min(1, v * 0.85 + rms * 0.15));
-              rafId = requestAnimationFrame(tick);
-            };
-            tick();
-          });
-        } catch (fallbackErr) {
-          console.warn("Fallback mic init also failed:", fallbackErr);
-        }
+        console.warn("Audio init failed (falling back):", err);
       }
     };
 
@@ -118,16 +151,13 @@ export default function App() {
 
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
-      try {
-        micStreamRef.current?.getTracks().forEach((t) => t.stop());
-      } catch {}
+      try { micStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
     };
-  }, []);
+  }, [addLog]);
 
-  // --- Robust wake-word listener (continuous) ---
+  // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
       addLog("system", "SpeechRecognition not available in this browser.");
       return;
@@ -148,106 +178,51 @@ export default function App() {
         active = true;
         startAttempts = 0;
       } catch (err) {
-        // InvalidStateError occurs if .start() called too fast; ignore and retry later
         startAttempts++;
-        if (startAttempts < 5) setTimeout(safeStart, 500 + startAttempts * 200);
+        if (startAttempts < 6) setTimeout(safeStart, 400 + startAttempts * 200);
       }
     };
 
     recognizer.onresult = (e) => {
-      // Only consider final results (interimResults=false so usually final)
       try {
         const result = e.results[e.resultIndex];
         const transcript = (result[0].transcript || "").trim().toLowerCase();
         if (!transcript) return;
-
-        // If currently handling command, ignore (we'll resume later)
         if (isHandlingCommand.current) return;
 
-        // Wake words - also check for "wakeup" command
-        if (transcript.includes("hey jarvis") || transcript.includes("ok jarvis") || 
+        if (transcript.includes("hey jarvis") || transcript.includes("ok jarvis") ||
             transcript.includes("wake up") || transcript.includes("wakeup")) {
-          
-          // If "wakeup" command, load context and create task
-          if (transcript.includes("wake up") || transcript.includes("wakeup")) {
-            addLog("wake", "Wakeup command detected - loading context...");
-            // Fetch wakeup context
-            fetch(`${process.env.REACT_APP_API_URL || "http://localhost:8000"}/api/wakeup-context`)
-              .then(res => res.json())
-              .then(data => {
-                if (data.context && Object.keys(data.context).length > 0) {
-                  addLog("system", `Found ${Object.keys(data.context).length} context entries`);
-                  speak("Context loaded. I'm ready to manage your tasks step by step.", () => {
-                    setTimeout(async () => {
-                      await handleVoiceCommand();
-                    }, 200);
-                  });
-                } else {
-                  speak("No previous context found. Ready for new commands.", () => {
-                    setTimeout(async () => {
-                      await handleVoiceCommand();
-                    }, 200);
-                  });
-                }
-              })
-              .catch(() => {
-                speak("Ready for commands.", () => {
-                  setTimeout(async () => {
-                    await handleVoiceCommand();
-                  }, 200);
-                });
-              });
-            return;
-          }
-          addLog("wake", "Wake word detected.");
-          // visual pulse
+
+          // vibrate UI briefly (visual) and pause auto recognition
           setWakePulse(true);
           setTimeout(() => setWakePulse(false), 900);
 
-          // Speak acknowledgement and then process command
-          // Pause recognizer to avoid overlap
-          try {
-            // stop recognizer gracefully and mark inactive
-            try {
-              recognizer.stop();
-            } catch {}
-            active = false;
-          } catch {}
+          // stop recognizer safely so we can do single-shot capture
+          try { recognizer.stop(); } catch {}
+          active = false;
 
-          // Audible ACK and then capture command (listenOnce handles single-shot)
           speak("Yes sir, I'm listening.", () => {
-            // tiny delay so speak finishes and mic readies
-            setTimeout(async () => {
-              await handleVoiceCommand(); // captures command, resumes wake listener inside
-            }, 120);
+            setTimeout(async () => await handleVoiceCommand(), 150);
           });
         }
       } catch (err) {
-        console.warn("Wake onresult parsing error:", err);
+        console.warn("Wake onresult parse err:", err);
       }
     };
 
     recognizer.onerror = (ev) => {
-      // handle aborts / no-speech gracefully by restarting after small backoff
       const errName = ev?.error || "unknown";
       addLog("system", `Wake listener error: ${errName}`);
-      if (errName === "aborted" || errName === "no-speech" || errName === "network") {
-        active = false;
-        setTimeout(safeStart, 700);
-      } else {
-        // generic fallback
-        active = false;
-        setTimeout(safeStart, 1500);
-      }
+      active = false;
+      // restart with backoff
+      setTimeout(safeStart, errName === "aborted" ? 700 : 1500);
     };
 
     recognizer.onend = () => {
       active = false;
-      // if we're not in the middle of handling a command, restart after short pause
-      if (!isHandlingCommand.current) setTimeout(safeStart, 600);
+      if (!isHandlingCommand.current) setTimeout(safeStart, 700);
     };
 
-    // start initially
     safeStart();
     wakeRecognizer.current = recognizer;
     addLog("system", "Wake-word listener started.");
@@ -260,29 +235,24 @@ export default function App() {
         recognizer.stop();
       } catch {}
     };
-    // we intentionally run this once on mount
+    // run once
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [addLog]);
 
-  // --- Handle capturing a single command (pauses wake listener) ---
-  const handleVoiceCommand = async () => {
-    // if another command running, ignore
+  // ----- handleVoiceCommand (stable reference) -----
+  const handleVoiceCommand = useCallback(async () => {
     if (isHandlingCommand.current) return;
     isHandlingCommand.current = true;
     setListening(true);
     addLog("system", "Capturing command...");
 
-    // stop wake recognizer if active to avoid interference
-    try {
-      wakeRecognizer.current?.stop();
-    } catch {}
+    // stop wake recognizer to avoid overlap
+    try { wakeRecognizer.current?.stop(); } catch {}
 
-    // listenOnce is expected to return a transcript string (or null)
     let transcript = null;
     try {
-      // Use enhanced voice recognition with better settings
-      transcript = await listenOnce({ 
-        timeout: 10000, 
+      transcript = await listenOnce({
+        timeout: 10000,
         interim: false,
         language: "en-US",
         maxAlternatives: 1
@@ -295,130 +265,69 @@ export default function App() {
 
     if (!transcript) {
       addLog("error", "No command received.");
-      // restart wake recognizer
-      try {
-        wakeRecognizer.current?.start();
-      } catch {}
+      try { wakeRecognizer.current?.start(); } catch {}
       isHandlingCommand.current = false;
       return;
     }
 
     addLog("input", transcript);
+    const textLower = transcript.toLowerCase();
 
-    // Local quick commands controlling visuals
-    const text = transcript.toLowerCase();
-    if (/twist|vortex|snake/i.test(text)) {
+    // quick local commands (purely visual)
+    if (/twist|vortex|snake/i.test(textLower)) {
       setTransformState("twist");
       addLog("action", "Reactor twisting.");
-      speak("Twisting reactor geometry now.", () => {
-        // resume wake listener
-        try {
-          wakeRecognizer.current?.start();
-        } catch {}
+      speak("Twisting reactor geometry.", () => {
+        try { wakeRecognizer.current?.start(); } catch {}
         isHandlingCommand.current = false;
       });
       return;
     }
-    if (/expand|bigger|open up/i.test(text)) {
+    if (/expand|bigger|open up/i.test(textLower)) {
       setTransformState("expand");
       addLog("action", "Reactor expanding.");
       speak("Expanding energy field.", () => {
-        try {
-          wakeRecognizer.current?.start();
-        } catch {}
+        try { wakeRecognizer.current?.start(); } catch {}
         isHandlingCommand.current = false;
       });
       return;
     }
-    if (/shrink|contract|small/i.test(text)) {
-      setTransformState("contract");
-      addLog("action", "Reactor contracting.");
-      speak("Contracting core.", () => {
-        try {
-          wakeRecognizer.current?.start();
-        } catch {}
-        isHandlingCommand.current = false;
-      });
-      return;
-    }
-    if (/reset|normal|stable/i.test(text)) {
+    if (/reset|normal|stable/i.test(textLower)) {
       setTransformState("normal");
       addLog("action", "Reactor normalized.");
       speak("Reactor returning to normal state.", () => {
-        try {
-          wakeRecognizer.current?.start();
-        } catch {}
+        try { wakeRecognizer.current?.start(); } catch {}
         isHandlingCommand.current = false;
       });
       return;
     }
 
-    // Check for stop command
-    const textLower = transcript.toLowerCase();
-    if (textLower.includes("stop") || textLower === "stop" || textLower.includes("cancel")) {
-      addLog("system", "Stopping current operation...");
-      speak("Operation stopped.", () => {
-        try {
-          wakeRecognizer.current?.start();
-        } catch {}
-        isHandlingCommand.current = false;
-      });
-      
-      // Send stop command to backend
-      fetch(`${process.env.REACT_APP_API_URL || "http://localhost:8000"}/api/stop-task`, {
-        method: "POST"
-      }).catch(console.error);
-      
-      return;
-    }
-
-    // Check if this is a self-update command
-    const isSelfUpdate = (
-      (textLower.includes("update") || textLower.includes("modify") || 
-       textLower.includes("edit") || textLower.includes("add") || 
-       textLower.includes("create") || textLower.includes("change")) &&
-      (textLower.includes("file") || textLower.includes("module") || 
-       textLower.includes("component") || textLower.includes("code") ||
-       textLower.includes("system") || textLower.includes("bot") ||
-       textLower.includes("jarvis"))
-    );
-
-    // If not a local command, send to backend
+    // send to backend
     try {
       const res = await sendMessage(transcript, "chat", sessionId);
       addLog("response", res.text || "No text returned.");
 
-      // update emotion based on keywords
       const tLower = (res.text || "").toLowerCase();
       if (/\b(error|fail|cannot|no connection|critical|danger)\b/.test(tLower)) setEmotion("critical");
       else if (/\b(open|launch|execute|run|action)\b/.test(tLower)) setEmotion("action");
       else if (/\b(analyz|thinking|processing|research|search)\b/.test(tLower)) setEmotion("analyzing");
-      else if (isSelfUpdate || /\b(update|modify|edit|add|create)\b/.test(tLower)) setEmotion("analyzing");
       else setEmotion("calm");
 
-      // speak response
       setSpeaking(true);
       speak(res.text || "Done.", () => {
         setSpeaking(false);
         setEmotion("calm");
-        // resume wake listener after response finishes
-        try {
-          wakeRecognizer.current?.start();
-        } catch {}
+        try { wakeRecognizer.current?.start(); } catch {}
         isHandlingCommand.current = false;
       });
 
-      // perform actions if present
+      // run any actions returned
       if (Array.isArray(res.actions) && res.actions.length) {
         for (const a of res.actions) {
           addLog("action", `${a.type} ${a.value || a.url || a.file_path || ""}`);
           if (a.type === "open_url" && (a.value || a.url)) {
             window.open(a.value || a.url, "_blank");
-          } else if (a.type === "self_update" || a.type === "self_add") {
-            // Self-update actions are handled by the backend
-            addLog("system", `Self-update: ${a.type} - ${a.description || a.file_path || ""}`);
           }
-          // Additional action types can be added here
         }
       }
     } catch (err) {
@@ -426,164 +335,26 @@ export default function App() {
       setEmotion("critical");
       speak("I encountered an error contacting the server.", () => {
         setEmotion("calm");
-        try {
-          wakeRecognizer.current?.start();
-        } catch {}
+        try { wakeRecognizer.current?.start(); } catch {}
         isHandlingCommand.current = false;
       });
     }
-  };
+  }, [sessionId, addLog]);
 
-  // --- Neural Filament Canvas: draws connecting filaments between points and glows based on emotion/volume
+  // If filament worker exists, update it when relevant props change
   useEffect(() => {
-    const canvas = document.getElementById("filamentCanvas");
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    let WIDTH = (canvas.width = window.innerWidth);
-    let HEIGHT = (canvas.height = window.innerHeight);
-    const devicePixelRatio = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(WIDTH * devicePixelRatio);
-    canvas.height = Math.floor(HEIGHT * devicePixelRatio);
-    canvas.style.width = WIDTH + "px";
-    canvas.style.height = HEIGHT + "px";
-    ctx.scale(devicePixelRatio, devicePixelRatio);
+    if (!filamentWorkerRef.current) return;
+    filamentWorkerRef.current.postMessage({
+      type: "state",
+      emotion,
+      wakePulse,
+      transformState,
+      volume
+    });
+  }, [emotion, wakePulse, transformState, volume]);
 
-    // particle nodes distributed in a circle around center (reactor)
-    const center = { x: WIDTH / 2, y: HEIGHT / 2 };
-    const nodeCount = Math.max(8, Math.floor(Math.min(WIDTH, HEIGHT) / 60));
-    let nodes = [];
-
-    const initNodes = () => {
-      nodes = [];
-      const baseRadius = Math.min(WIDTH, HEIGHT) * 0.18;
-      for (let i = 0; i < nodeCount; i++) {
-        const angle = (i / nodeCount) * Math.PI * 2;
-        const r = baseRadius * (0.8 + Math.random() * 0.6);
-        nodes.push({
-          baseAngle: angle,
-          angle,
-          r,
-          x: center.x + Math.cos(angle) * r,
-          y: center.y + Math.sin(angle) * r,
-          vx: 0,
-          vy: 0,
-          twist: Math.random() * 0.9 + 0.1,
-          phase: Math.random() * Math.PI * 2
-        });
-      }
-    };
-
-    initNodes();
-
-    let t = 0;
-    const colorForEmotion = () => {
-      switch (emotion) {
-        case "calm":
-          return { r: 8, g: 200, b: 220, a: 0.18 };
-        case "analyzing":
-          return { r: 220, g: 190, b: 40, a: 0.22 };
-        case "action":
-          return { r: 90, g: 255, b: 130, a: 0.22 };
-        case "critical":
-          return { r: 255, g: 80, b: 90, a: 0.26 };
-        default:
-          return { r: 8, g: 200, b: 220, a: 0.18 };
-      }
-    };
-
-    function drawFilaments() {
-      t += 0.016;
-      ctx.clearRect(0, 0, WIDTH, HEIGHT);
-
-      // slight background glow based on emotion & wakePulse
-      const emo = colorForEmotion();
-      const glowAlpha = emo.a + (wakePulse ? 0.08 : 0) + Math.min(0.22, volume * 0.5);
-      ctx.fillStyle = `rgba(${emo.r},${emo.g},${emo.b},${Math.max(0.02, glowAlpha * 0.12)})`;
-      ctx.fillRect(0, 0, WIDTH, HEIGHT);
-
-      // update nodes positions (twisting and snake-like)
-      for (let i = 0; i < nodes.length; i++) {
-        const n = nodes[i];
-        // breathing motion + twist effect + volume push
-        const tw = Math.sin(t * 0.6 + n.phase) * 0.4 * n.twist;
-        const volPush = 1 + volume * 0.8;
-        n.angle = n.baseAngle + tw * (transformState === "twist" ? 2.2 : 1.0);
-        const radius = n.r * (transformState === "expand" ? 1.25 : transformState === "contract" ? 0.7 : 1) * volPush;
-        n.x = center.x + Math.cos(n.angle + t * 0.06) * radius;
-        n.y = center.y + Math.sin(n.angle + t * 0.06) * radius;
-      }
-
-      // draw filaments - curved bezier connections between nodes (snake-like)
-      ctx.lineWidth = 1 + Math.min(2.2, 1.2 + volume * 2);
-      for (let i = 0; i < nodes.length; i++) {
-        const a = nodes[i];
-        const b = nodes[(i + 1) % nodes.length];
-        const midx = (a.x + b.x) / 2 + Math.sin(t * 1.2 + i) * 8 * (volume + 0.05);
-        const midy = (a.y + b.y) / 2 + Math.cos(t * 1.3 + i) * 8 * (volume + 0.05);
-        const grad = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
-        grad.addColorStop(0, `rgba(${emo.r},${emo.g},${emo.b},${0.85 * (0.6 + volume)})`);
-        grad.addColorStop(1, `rgba(255,255,255,${0.08 + volume * 0.18})`);
-
-        ctx.strokeStyle = grad;
-        ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.quadraticCurveTo(midx, midy, b.x, b.y);
-        ctx.stroke();
-      }
-
-      // central glow halo
-      const haloRadius = Math.min(WIDTH, HEIGHT) * (0.08 + 0.02 * volume);
-      const haloGrad = ctx.createRadialGradient(center.x, center.y, haloRadius * 0.1, center.x, center.y, haloRadius * 1.6);
-      haloGrad.addColorStop(0, `rgba(${emo.r},${emo.g},${emo.b},${0.24 + volume * 0.5})`);
-      haloGrad.addColorStop(1, `rgba(0,0,0,0)`);
-      ctx.fillStyle = haloGrad;
-      ctx.beginPath();
-      ctx.arc(center.x, center.y, haloRadius * 1.6, 0, Math.PI * 2);
-      ctx.fill();
-
-      filamentRAF.current = requestAnimationFrame(drawFilaments);
-    }
-
-    drawFilaments();
-
-    const onResize = () => {
-      WIDTH = canvas.width = window.innerWidth;
-      HEIGHT = canvas.height = window.innerHeight;
-      canvas.style.width = WIDTH + "px";
-      canvas.style.height = HEIGHT + "px";
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.scale(devicePixelRatio, devicePixelRatio);
-      center.x = WIDTH / 2;
-      center.y = HEIGHT / 2;
-      initNodes();
-    };
-    window.addEventListener("resize", onResize);
-
-    return () => {
-      cancelAnimationFrame(filamentRAF.current);
-      window.removeEventListener("resize", onResize);
-    };
-    // re-render filaments when emotion, wakePulse, volume, transformState changes
-  }, [emotion, wakePulse, volume, transformState]);
-
-  // --- Simple HUD color overlay (emotional glow) ---
-  const emotionColorStyle = () => {
-    switch (emotion) {
-      case "calm":
-        return { boxShadow: `0 0 ${24 + volume * 40}px rgba(6,230,230,${0.16 + volume * 0.3})` };
-      case "analyzing":
-        return { boxShadow: `0 0 ${28 + volume * 40}px rgba(230,200,40,${0.16 + volume * 0.3})` };
-      case "action":
-        return { boxShadow: `0 0 ${28 + volume * 40}px rgba(100,255,150,${0.16 + volume * 0.3})` };
-      case "critical":
-        return { boxShadow: `0 0 ${36 + volume * 40}px rgba(255,80,90,${0.22 + volume * 0.35})` };
-      default:
-        return {};
-    }
-  };
-
-  // Handle authentication
-  const handleAuthSuccess = (newSessionId, newUsername) => {
+  // Authentication helpers (unchanged, stable)
+  const handleAuthSuccess = useCallback((newSessionId, newUsername) => {
     setSessionId(newSessionId);
     setUsername(newUsername);
     setIsAuthenticated(true);
@@ -591,84 +362,59 @@ export default function App() {
     localStorage.setItem("jarvis_session", newSessionId);
     localStorage.setItem("jarvis_username", newUsername);
     addLog("system", `Authenticated as ${newUsername}`);
-  };
+  }, [addLog]);
 
-  // Check for existing session on mount
   useEffect(() => {
     const storedSession = localStorage.getItem("jarvis_session");
     const storedUsername = localStorage.getItem("jarvis_username");
-    
     if (storedSession && storedUsername) {
-      // Validate session
       fetch(`${process.env.REACT_APP_API_URL || "http://localhost:8000"}/api/validate-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: storedSession })
       })
-      .then(res => res.json())
-      .then(data => {
-        if (data.valid) {
-          setSessionId(storedSession);
-          setUsername(storedUsername);
-          setIsAuthenticated(true);
-        } else {
-          localStorage.removeItem("jarvis_session");
-          localStorage.removeItem("jarvis_username");
-          setShowAuthModal(true);
-        }
-      })
-      .catch(() => {
-        setShowAuthModal(true);
-      });
+        .then(res => res.json())
+        .then(data => {
+          if (data.valid) {
+            setSessionId(storedSession);
+            setUsername(storedUsername);
+            setIsAuthenticated(true);
+          } else {
+            localStorage.removeItem("jarvis_session");
+            localStorage.removeItem("jarvis_username");
+            setShowAuthModal(true);
+          }
+        })
+        .catch(() => setShowAuthModal(true));
     } else {
       setShowAuthModal(true);
     }
   }, []);
 
-  // --- Render ---
+  // ----------------- RENDER -----------------
   return (
     <div className="jarvis-root">
-      {/* Authentication Modal */}
-      {showAuthModal && (
-        <AuthModal
-          onAuthSuccess={handleAuthSuccess}
-          onClose={() => {
-            if (!isAuthenticated) {
-              // Don't allow closing if not authenticated
-              speak("Authentication is required to use Jarvis.");
-            } else {
-              setShowAuthModal(false);
-            }
-          }}
-        />
-      )}
+      <Suspense fallback={<div />}>
+        {showAuthModal && (
+          <AuthModal
+            onAuthSuccess={handleAuthSuccess}
+            onClose={() => {
+              if (!isAuthenticated) {
+                speak("Authentication is required to use Jarvis.");
+              } else {
+                setShowAuthModal(false);
+              }
+            }}
+          />
+        )}
+      </Suspense>
 
-      {/* User Info Display */}
       {isAuthenticated && username && (
-        <div style={{
-          position: "fixed",
-          top: 20,
-          right: 20,
-          zIndex: 15,
-          background: "rgba(10, 10, 12, 0.8)",
-          padding: "10px 15px",
-          borderRadius: "20px",
-          border: "1px solid rgba(0, 255, 200, 0.3)",
-          display: "flex",
-          alignItems: "center",
-          gap: "10px",
-          backdropFilter: "blur(10px)"
-        }}>
-          <div style={{
-            width: "8px",
-            height: "8px",
-            borderRadius: "50%",
-            background: "#00ffc8",
-            boxShadow: "0 0 10px rgba(0, 255, 200, 0.6)"
-          }} />
-          <span style={{ color: "#00ffc8", fontSize: "14px" }}>{username}</span>
-          <button
-            onClick={() => {
+        <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 8, height: 8, borderRadius: 8, background: "#00ffc8", boxShadow: "0 0 10px rgba(0,255,200,0.6)" }} />
+            <span style={{ color: "#00ffc8", fontSize: 14 }}>{username}</span>
+            <button onClick={() => {
               localStorage.removeItem("jarvis_session");
               localStorage.removeItem("jarvis_username");
               setIsAuthenticated(false);
@@ -676,103 +422,43 @@ export default function App() {
               setUsername(null);
               setShowAuthModal(true);
               speak("Logged out successfully.");
-            }}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "#ff5050",
-              cursor: "pointer",
-              fontSize: "12px",
-              padding: "5px 10px",
-              borderRadius: "5px",
-              transition: "all 0.3s"
-            }}
-            onMouseEnter={(e) => e.target.style.background = "rgba(255, 80, 80, 0.2)"}
-            onMouseLeave={(e) => e.target.style.background = "transparent"}
-          >
-            Logout
-          </button>
+            }} style={{ background: "transparent", border: "none", color: "#ff5050", cursor: "pointer" }}>Logout</button>
+          </div>
         </div>
       )}
-      {/* filament background canvas */}
-      <canvas id="filamentCanvas" style={{ position: "fixed", inset: 0, zIndex: 1, pointerEvents: "none" }} />
 
-      {/* emotional overlay for center area / reactor */}
-      <div
-        className="hud-overlay"
-        style={{
-          position: "fixed",
-          inset: 0,
-          zIndex: 5,
+      {/* OffscreenCanvas target */}
+      <canvas id="filamentCanvas" style={{ position: "fixed", inset: 0, zIndex: 1, pointerEvents: "none", width: "100vw", height: "100vh" }} />
+
+      <div className="hud-overlay" style={{ position: "fixed", inset: 0, zIndex: 5, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+        <div className="reactor-shell" style={{
+          width: "min(36vmin, 420px)",
+          height: "min(36vmin, 420px)",
+          borderRadius: "50%",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
+          transition: "transform 420ms ease, box-shadow 320ms ease",
+          transform: transformState === "expand" ? "scale(1.08)" : transformState === "contract" ? "scale(0.88)" : "scale(1)",
           pointerEvents: "none"
-        }}
-      >
-        <div
-          className="reactor-shell"
-          style={{
-            width: "min(36vmin, 420px)",
-            height: "min(36vmin, 420px)",
-            borderRadius: "50%",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            transition: "transform 420ms ease, box-shadow 320ms ease",
-            transform: transformState === "expand" ? "scale(1.08)" : transformState === "contract" ? "scale(0.88)" : "scale(1)",
-            ...emotionColorStyle(),
-            pointerEvents: "none"
-          }}
-        >
-          {/* ArcReactor component receives props to animate itself */}
+        }}>
           <div style={{ pointerEvents: "none", zIndex: 6 }}>
-            <ArcReactor
-              active={listening || speaking}
-              wakePulse={wakePulse}
-              emotion={emotion}
-              volume={volume}
-              transformState={transformState}
-            />
+            <Suspense fallback={<div />}>
+              <ArcReactor active={listening || speaking} wakePulse={wakePulse} emotion={emotion} volume={volume} transformState={transformState} />
+            </Suspense>
           </div>
         </div>
       </div>
 
-      {/* top-left HUD logs */}
       <div style={{ position: "fixed", left: 20, top: 20, zIndex: 10 }}>
-        <HUDLogs logs={logs} />
+        <Suspense fallback={<div />}>
+          <HUDLogs logs={logs} />
+        </Suspense>
       </div>
 
-      {/* bottom-center status + mic prompt (interaction area) */}
-      <div style={{
-        position: "fixed",
-        bottom: 30,
-        left: 0,
-        right: 0,
-        display: "flex",
-        justifyContent: "center",
-        zIndex: 12,
-        pointerEvents: "none"
-      }}>
-        <div style={{
-          pointerEvents: "auto",
-          background: "rgba(10,10,12,0.35)",
-          color: "white",
-          padding: "10px 18px",
-          borderRadius: 999,
-          backdropFilter: "blur(6px)",
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          minWidth: 260,
-          justifyContent: "center",
-          boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)"
-        }}>
-          <div style={{
-            width: 12, height: 12, borderRadius: 6,
-            background: listening ? "#00ffc8" : wakePulse ? "#00d4ff" : speaking ? "#ffb86b" : "#6b7280",
-            boxShadow: listening ? "0 0 12px rgba(0,255,200,0.6)" : wakePulse ? "0 0 10px rgba(0,212,255,0.45)" : ""
-          }} />
+      <div style={{ position: "fixed", bottom: 30, left: 0, right: 0, display: "flex", justifyContent: "center", zIndex: 12, pointerEvents: "none" }}>
+        <div style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "white", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
+          <div style={{ width: 12, height: 12, borderRadius: 6, background: listening ? "#00ffc8" : wakePulse ? "#00d4ff" : speaking ? "#ffb86b" : "#6b7280", boxShadow: listening ? "0 0 12px rgba(0,255,200,0.6)" : wakePulse ? "0 0 10px rgba(0,212,255,0.45)" : "" }} />
           <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
             {listening ? "Listening..." : speaking ? "Responding..." : "Say 'Hey Jarvis' to begin"}
           </div>

@@ -10,4 +10,7 @@ const ChatMessage = ({ text, sender }) => {
   );
 };
 
-export default ChatMessage;
+// wrap in React.memo to avoid re-rendering unless props change
+export default React.memo(ChatMessage, (prevProps, nextProps) => {
+  return prevProps.text === nextProps.text && prevProps.sender === nextProps.sender;
+});
