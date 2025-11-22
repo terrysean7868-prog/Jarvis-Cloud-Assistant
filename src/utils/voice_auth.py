@@ -1,186 +1,171 @@
+
 # src/utils/voice_auth.py
 """
-Voice-based authentication system for Jarvis
-Uses voice recognition to authenticate users
+Robust voice-based authentication system for Jarvis.
+
+Provides:
+- register_user(username, voice_sample_hash, password=None, role='user')
+- authenticate_by_voice(username, voice_sample_hash, password=None) -> (True, session_id) or (False, error)
+- validate_session(session_id) -> (is_valid, username_or_none)
+- logout(session_id) -> bool
+- is_admin(username) -> bool
+
+Storage: a JSON file at data/auth_users.json (project-local). Sessions kept in-memory with safe random tokens.
+This implementation is intentionally simple and file-based for portability. For production,
+replace voice hash comparison with real voice biometrics / external service.
 """
+
 import os
-import hashlib
 import json
+import hashlib
+import secrets
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
 from datetime import datetime, timedelta
+from typing import Tuple, Optional
 
 logger = logging.getLogger("jarvis.voice_auth")
+logger.setLevel(logging.INFO)
 
-# Voice authentication storage
-AUTH_FILE = Path(__file__).parent.parent.parent / "data" / "voice_auth.json"
-AUTH_FILE.parent.mkdir(exist_ok=True)
+# Configuration
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # go up to project root
+AUTH_FILE = PROJECT_ROOT / "data" / "auth_users.json"
+SESSION_DURATION = timedelta(hours=8)  # sessions valid for 8 hours
 
-# Session management
-SESSION_DURATION = timedelta(hours=24)  # 24 hour sessions
+def _ensure_auth_file():
+    if not AUTH_FILE.parent.exists():
+        AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not AUTH_FILE.exists():
+        AUTH_FILE.write_text(json.dumps({"users":{}}, indent=2))
 
+def _hash_password(password: str, salt: Optional[str] = None) -> Tuple[str,str]:
+    """Return (salt, hashed). If salt not provided, generate one."""
+    if salt is None:
+        salt = secrets.token_hex(8)
+    hashed = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return salt, hashed
 
 class VoiceAuth:
-    """Voice-based authentication manager"""
-    
     def __init__(self):
-        self.auth_data = self._load_auth_data()
-        self.active_sessions = {}  # session_id -> {user, expires_at, voice_hash}
-    
-    def _load_auth_data(self) -> Dict:
-        """Load authentication data from file"""
-        if AUTH_FILE.exists():
-            try:
-                with open(AUTH_FILE, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Failed to load auth data: {e}")
-        return {"users": {}, "voice_samples": {}}
-    
-    def _save_auth_data(self):
-        """Save authentication data to file"""
+        _ensure_auth_file()
+        self._load()
+        self.active_sessions = {}  # session_id -> {"username", "expires_at"}
+
+    def _load(self):
         try:
-            with open(AUTH_FILE, 'w') as f:
-                json.dump(self.auth_data, f, indent=2)
+            with open(AUTH_FILE, "r", encoding="utf-8") as fh:
+                self.auth_data = json.load(fh)
+            if "users" not in self.auth_data:
+                self.auth_data["users"] = {}
+        except Exception:
+            self.auth_data = {"users": {}}
+            self._save()
+
+    def _save(self):
+        try:
+            with open(AUTH_FILE, "w", encoding="utf-8") as fh:
+                json.dump(self.auth_data, fh, indent=2)
         except Exception as e:
-            logger.error(f"Failed to save auth data: {e}")
-    
-    def create_voice_hash(self, audio_data: bytes) -> str:
-        """Create hash from voice audio data"""
-        return hashlib.sha256(audio_data).hexdigest()
-    
-    def register_user(self, username: str, voice_sample_hash: str, password: Optional[str] = None) -> Dict:
+            logger.exception("Failed to save auth data: %s", e)
+
+    def register_user(self, username: str, voice_sample_hash: str, password: Optional[str]=None, role: str="user") -> dict:
         """
-        Register a new user with voice authentication
-        
-        Args:
-            username: Username
-            voice_sample_hash: Hash of voice sample
-            password: Optional backup password
+        Register a new user.
+        role: 'user' or 'admin'
+        Returns dict status message.
         """
-        if username in self.auth_data["users"]:
-            return {
-                "status": "error",
-                "message": "User already exists"
-            }
-        
-        self.auth_data["users"][username] = {
-            "voice_hash": voice_sample_hash,
-            "password_hash": hashlib.sha256(password.encode()).hexdigest() if password else None,
-            "created_at": datetime.now().isoformat(),
-            "last_login": None
-        }
-        
-        self._save_auth_data()
-        
-        return {
-            "status": "success",
-            "message": f"User {username} registered successfully"
-        }
-    
-    def authenticate_by_voice(self, username: str, voice_sample_hash: str) -> Tuple[bool, Optional[str]]:
+        username = username.strip().lower()
+        if not username:
+            return {"status":"error","message":"Username required"}
+        if username in self.auth_data.get("users", {}):
+            return {"status":"error","message":"User already exists"}
+        user = {"voice_hash": voice_sample_hash, "role": role, "created_at": datetime.utcnow().isoformat()}
+        if password:
+            salt, hashed = _hash_password(password)
+            user["password_salt"] = salt
+            user["password_hash"] = hashed
+        self.auth_data.setdefault("users", {})[username] = user
+        self._save()
+        logger.info("Registered user '%s' with role '%s'", username, role)
+        return {"status":"success","message":"User registered", "username": username, "role": role}
+
+    def _compare_voice_hashes(self, stored_hash: str, provided_hash: str, threshold: float = 0.9) -> bool:
         """
-        Authenticate user by voice
-        
-        Returns:
-            (is_authenticated, session_id or error_message)
+        Compare stored and provided voice hash. This is a placeholder for
+        a real voice biometric comparison. For now use exact match or prefix match.
         """
-        if username not in self.auth_data["users"]:
+        if not stored_hash or not provided_hash:
+            return False
+        if stored_hash == provided_hash:
+            return True
+        # allow small differences: check prefix equality
+        return stored_hash.startswith(provided_hash) or provided_hash.startswith(stored_hash)
+
+    def authenticate_by_voice(self, username: str, voice_sample_hash: str, password: Optional[str]=None) -> Tuple[bool, str]:
+        """
+        Authenticate by voice (and optionally password). Returns (True, session_id) or (False, error_message)
+        """
+        username_l = (username or "").strip().lower()
+        if username_l not in self.auth_data.get("users", {}):
             return False, "User not found"
-        
-        stored_hash = self.auth_data["users"][username].get("voice_hash")
-        
-        # Simple hash comparison (in production, use more sophisticated voice matching)
-        # For now, we'll use a similarity threshold
-        if stored_hash and self._compare_voice_hashes(stored_hash, voice_sample_hash):
-            # Create session
-            session_id = self._create_session(username)
-            self.auth_data["users"][username]["last_login"] = datetime.now().isoformat()
-            self._save_auth_data()
-            
-            return True, session_id
-        
-        return False, "Voice authentication failed"
-    
-    def _compare_voice_hashes(self, stored_hash: str, provided_hash: str, threshold: float = 0.8) -> bool:
-        """
-        Compare voice hashes with similarity threshold
-        In production, use proper voice recognition/verification
-        """
-        # For now, simple exact match (in production, use voice verification API)
-        # This is a placeholder - real implementation would use voice biometrics
-        return stored_hash == provided_hash
-    
+        user = self.auth_data["users"][username_l]
+        # If user has password, verify if provided
+        if "password_hash" in user:
+            if not password:
+                return False, "Password required for this account"
+            salt = user.get("password_salt")
+            _, hashed = _hash_password(password, salt=salt)
+            if hashed != user.get("password_hash"):
+                return False, "Password incorrect"
+        # Verify voice sample
+        if not self._compare_voice_hashes(user.get("voice_hash",""), voice_sample_hash):
+            return False, "Voice sample did not match"
+        # Create session
+        session_id = self._create_session(username_l)
+        # Update last login
+        user["last_login"] = datetime.utcnow().isoformat()
+        self._save()
+        return True, session_id
+
     def _create_session(self, username: str) -> str:
-        """Create authentication session"""
-        import secrets
-        session_id = secrets.token_urlsafe(32)
-        expires_at = datetime.now() + SESSION_DURATION
-        
-        self.active_sessions[session_id] = {
-            "username": username,
-            "expires_at": expires_at.isoformat(),
-            "created_at": datetime.now().isoformat()
-        }
-        
-        return session_id
-    
+        sid = secrets.token_urlsafe(32)
+        expires_at = (datetime.utcnow() + SESSION_DURATION).isoformat()
+        self.active_sessions[sid] = {"username": username, "expires_at": expires_at, "created_at": datetime.utcnow().isoformat()}
+        return sid
+
     def validate_session(self, session_id: str) -> Tuple[bool, Optional[str]]:
-        """
-        Validate session token
-        
-        Returns:
-            (is_valid, username or None)
-        """
-        if session_id not in self.active_sessions:
+        if not session_id:
             return False, None
-        
-        session = self.active_sessions[session_id]
-        expires_at = datetime.fromisoformat(session["expires_at"])
-        
-        if datetime.now() > expires_at:
-            # Session expired
+        s = self.active_sessions.get(session_id)
+        if not s:
+            return False, None
+        expires = datetime.fromisoformat(s["expires_at"])
+        if datetime.utcnow() > expires:
+            # expired
             del self.active_sessions[session_id]
             return False, None
-        
-        return True, session["username"]
-    
+        return True, s["username"]
+
     def logout(self, session_id: str) -> bool:
-        """Logout and invalidate session"""
         if session_id in self.active_sessions:
             del self.active_sessions[session_id]
             return True
         return False
-    
-    def get_user_info(self, username: str) -> Optional[Dict]:
-        """Get user information"""
-        return self.auth_data["users"].get(username)
-    
-    def update_voice_sample(self, username: str, voice_sample_hash: str) -> bool:
-        """Update user's voice sample"""
-        if username not in self.auth_data["users"]:
+
+    def is_admin(self, username: str) -> bool:
+        if not username:
             return False
-        
-        self.auth_data["users"][username]["voice_hash"] = voice_sample_hash
-        self._save_auth_data()
-        return True
-    
+        u = self.auth_data.get("users", {}).get(username.lower())
+        return bool(u and u.get("role") == "admin")
+
+    def get_user(self, username: str) -> Optional[dict]:
+        return self.auth_data.get("users", {}).get((username or "").lower())
+
     def cleanup_expired_sessions(self):
-        """Remove expired sessions"""
-        now = datetime.now()
-        expired = [
-            sid for sid, session in self.active_sessions.items()
-            if datetime.fromisoformat(session["expires_at"]) < now
-        ]
+        now = datetime.utcnow()
+        expired = [sid for sid,s in list(self.active_sessions.items()) if datetime.fromisoformat(s["expires_at"]) < now]
         for sid in expired:
             del self.active_sessions[sid]
 
-
-# Global instance
+# Create global instance
 voice_auth = VoiceAuth()
-
-# Cleanup expired sessions periodically
-import atexit
-atexit.register(voice_auth.cleanup_expired_sessions)
-

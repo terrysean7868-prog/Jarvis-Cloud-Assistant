@@ -62,6 +62,7 @@ class VoiceAuthRequest(BaseModel):
     voice_sample_hash: str | None = None
     password: str | None = None
     action: str  # "register" or "login"
+    role: str | None = None  # optional: 'admin' or 'user'
 
 # =========================================================
 # 🔐 Voice Authentication Endpoints
@@ -76,7 +77,8 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
             result = voice_auth.register_user(
                 auth_req.username,
                 auth_req.voice_sample_hash,
-                auth_req.password
+                auth_req.password,
+                role=(auth_req.role or 'user')
             )
             return result
         
@@ -214,11 +216,21 @@ class SelfUpdateRequest(BaseModel):
     command: str
     file_path: str | None = None
     description: str | None = None
+    session_id: str | None = None  # session id of the caller (required for admin actions)
 
 @app.post("/api/self-update")
 async def handle_self_update(request: SelfUpdateRequest):
     """Handle self-update commands from voice input."""
     try:
+        # Validate session and admin privileges before allowing self-update
+        if not request.session_id:
+            return {"status":"error","message":"Admin session required"}
+        is_valid, username = voice_auth.validate_session(request.session_id)
+        if not is_valid or not username:
+            return {"status":"error","message":"Invalid or expired session"}
+        if not voice_auth.is_admin(username):
+            return {"status":"error","message":"Admin privileges required"}
+
         # Parse voice command
         parsed = parse_voice_command(request.command)
         
