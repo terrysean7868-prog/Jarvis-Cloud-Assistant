@@ -18,7 +18,20 @@ from src.utils.git_sync import git_sync
 from src.config.config import Config
 
 logger = logging.getLogger("jarvis.self_update")
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") or os.getenv("PRIMARY_API_KEY"))
+
+# Lazy-load OpenAI client to avoid errors during import if API key is not set
+_client = None
+
+def get_openai_client():
+    """Get or create OpenAI client (lazy-loaded)."""
+    global _client
+    if _client is None:
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("PRIMARY_API_KEY")
+        if not api_key:
+            raise RuntimeError("OpenAI API key not found in OPENAI_API_KEY or PRIMARY_API_KEY")
+        _client = OpenAI(api_key=api_key)
+    return _client
+
 
 ROOT_DIR = Path(__file__).parent.parent.parent
 MODULES_DIR = ROOT_DIR / "modules"
@@ -84,6 +97,7 @@ Context: {context}
 Provide complete, production-ready code."""
 
     try:
+        client = get_openai_client()
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[

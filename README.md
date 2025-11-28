@@ -46,47 +46,53 @@ modules/               # Plugin modules
 
 ## 🚀 Quick Start
 
-### Windows (Easiest)
+### Windows (Single Launcher)
 ```bash
-# Just run the batch file
-JARVIS.bat
+# Double-click run.bat
+# Or from PowerShell:
+.\run.bat
 ```
 
-### Manual Setup
+**That's it!** The launcher will:
+- Load `.env` variables
+- Create a Python virtual environment (if needed)
+- Install dependencies
+- Start backend (port 8000) and frontend (port 3000) in separate windows
 
-1. **Clone Repository:**
-   ```bash
-   git clone https://github.com/terrysean7868-prog/Jarvis-Cloud-Assistant.git
-   cd Jarvis-Cloud-Assistant
+### Manual Setup (Windows PowerShell)
+
+1. **Copy and edit `.env`:**
+   ```powershell
+   copy .env.example .env
+   notepad .env
    ```
 
-2. **Create Virtual Environment:**
-   ```bash
+2. **Create virtual environment:**
+   ```powershell
    python -m venv venv
-   venv\Scripts\activate  # Windows
-   source venv/bin/activate  # Mac/Linux
+   venv\Scripts\Activate.ps1
    ```
 
-3. **Install Dependencies:**
-   ```bash
+3. **Install dependencies:**
+   ```powershell
    pip install -r requirements.txt
    ```
 
-4. **Configure Environment:**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your credentials
+4. **Start backend (development with auto-reload):**
+   ```powershell
+   python -m uvicorn app:app --reload --host 0.0.0.0 --port 8000
    ```
 
-5. **Run Application:**
-   ```bash
-   python app.py
+5. **In another PowerShell window, start frontend:**
+   ```powershell
+   cd jarvis-frontend
+   npm start
    ```
 
-6. **Test:**
-   ```bash
-   curl http://localhost:8000/health
-   ```
+6. **Visit in browser:**
+   - Backend: `http://localhost:8000`
+   - Frontend: `http://localhost:3000`
+
 
 ## ⚙️ Requirements
 
@@ -215,30 +221,67 @@ git push heroku main
 # Or use: python app.py --port 8001
 ```
 
-## 📊 Performance
+## 🚀 Deployment
 
-| Feature | Speed | Notes |
-|---------|-------|-------|
-| Chat (cached) | 50-100ms | Training data |
-| Web Search | 500-1500ms | Fresh search |
-| Research | 3-8 seconds | 3 sources |
-| News | 500-1500ms | Latest articles |
-| Question | 1-3 seconds | Web search |
+### Run Locally (Windows / PowerShell)
+- Create `.env` from `.env.example` and fill values:
 
-## 🔐 Security
+```powershell
+copy .env.example .env
+# Edit .env in Notepad or your editor
+notepad .env
+```
 
-- ✅ Never commit `.env` file
-- ✅ Use strong API keys
-- ✅ Enable MongoDB authentication
+- Create and activate virtualenv, install deps:
+
+```powershell
+python -m venv venv
+venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+- Start backend (development):
+
+```powershell
 - ✅ Keep dependencies updated
 - ✅ Use HTTPS in production
 
 ## 📈 Project Statistics
 
 ```
+
+- Frontend (optional):
+
+```powershell
+```
 Total Code:           2000+ lines
 Documentation:        2500+ lines
 API Endpoints:        6+ endpoints
+
+Visit `http://localhost:8000` (API) and `http://localhost:3000` (frontend)
+
+### Deploy to Render.com
+
+Render injects environment variables through the dashboard — do NOT commit a `.env` file. Use the following steps:
+
+1. Push your repo: `git push origin main`
+2. Create a new **Web Service** on Render and connect your GitHub repo.
+3. Set the **Environment** to `Python 3` and set the **Start Command** to:
+
+```
+gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:$PORT
+```
+
+4. In Render dashboard, add environment variables (MONGODB_URI, MONGODB_DB_NAME, OPENAI_API_KEY, etc.). Recommended variables are listed in `.env.example`.
+5. (Optional) Add `RENDER=true` to the Render environment to enable Render-specific behaviors already checked in code.
+6. Deploy — Render runs the build and start commands specified. Use the `Procfile` or `render.yaml` in repo as a starting point.
+
+### Production notes
+- Use a managed MongoDB (Atlas) with IP whitelist or VPC peering.
+- Use `gunicorn` + `uvicorn` worker for production (see start command above).
+- Configure logging and monitoring in Render dashboard.
+- Keep secrets in Render environment variables (do not commit `.env`).
+
 Database Collections: 5+ collections
 Background Jobs:      5 scheduled
 Test Coverage:        100% (new)

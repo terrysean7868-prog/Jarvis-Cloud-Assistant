@@ -9,7 +9,19 @@ from typing import Dict, Optional, List
 from datetime import datetime
 from openai import OpenAI
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") or os.getenv("PRIMARY_API_KEY"))
+# Lazy-load OpenAI client
+_client = None
+
+def get_openai_client():
+    """Get or create OpenAI client (lazy-loaded)."""
+    global _client
+    if _client is None:
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("PRIMARY_API_KEY")
+        if not api_key:
+            raise RuntimeError("OpenAI API key not found")
+        _client = OpenAI(api_key=api_key)
+    return _client
+
 
 
 class EmailGenerator:
@@ -54,6 +66,7 @@ Return JSON format:
   "body": "email body here"
 }}"""
             
+            client = get_openai_client()
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[

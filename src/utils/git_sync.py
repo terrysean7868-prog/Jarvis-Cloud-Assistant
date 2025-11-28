@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 # ==============================================================
-# 🧠 Utility Command Runner
+# Utility Command Runner
 # ==============================================================
 
 def run(cmd: str, cwd: str = ".", check=True, env=None):
@@ -28,56 +28,55 @@ def run(cmd: str, cwd: str = ".", check=True, env=None):
 
 
 # ==============================================================
-# 🔐 SSH Trust Setup (startup)
+# SSH Trust Setup (startup)
 # ==============================================================
 
 def setup_ssh_trust():
     """
     Fetch GitHub's SSH host key dynamically and trust it.
     Prevents 'Host key verification failed' or 'REMOTE HOST IDENTIFICATION HAS CHANGED'.
+    Only runs if SSH_KEY is configured. Silent fail on Windows/systems without ssh-keyscan.
     """
     ssh_key = os.getenv("SSH_KEY")
     if not ssh_key:
-        print("[SSH INIT] ⚠️ No SSH_KEY found in environment — skipping SSH setup.")
-        return
+        return  # Silent skip if no SSH_KEY configured
 
     ssh_dir = os.path.expanduser("~/.ssh")
-    os.makedirs(ssh_dir, exist_ok=True)
-    key_path = os.path.join(ssh_dir, "id_rsa")
-
-    # Save private key securely
-    with open(key_path, "w") as f:
-        f.write(ssh_key)
-    os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
-
-    # Dynamically fetch GitHub host key
     try:
-        result = subprocess.run(
-            ["ssh-keyscan", "github.com"],
-            capture_output=True, text=True, check=True
-        )
-        github_host_key = result.stdout.strip()
-        if github_host_key:
-            known_hosts_path = os.path.join(ssh_dir, "known_hosts")
-            with open(known_hosts_path, "w") as kh:
-                kh.write(github_host_key + "\n")
-            print("[SSH INIT] ✅ GitHub host key fetched dynamically.")
-        else:
-            print("[SSH INIT] ⚠️ ssh-keyscan returned no output.")
-    except Exception as e:
-        print(f"[SSH INIT] ⚠️ ssh-keyscan failed: {e}")
+        os.makedirs(ssh_dir, exist_ok=True)
+        key_path = os.path.join(ssh_dir, "id_rsa")
 
-    # Start ssh-agent and add key
-    try:
-        subprocess.run("eval $(ssh-agent -s)", shell=True, check=False)
-        subprocess.run(f"ssh-add {key_path}", shell=True, check=False)
-        print("[SSH INIT] 🔑 SSH key added and GitHub trusted.")
-    except Exception as e:
-        print(f"[SSH INIT] ⚠️ SSH agent setup failed: {e}")
+        # Save private key securely
+        with open(key_path, "w") as f:
+            f.write(ssh_key)
+        os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+
+        # Dynamically fetch GitHub host key (may fail on Windows)
+        try:
+            result = subprocess.run(
+                ["ssh-keyscan", "github.com"],
+                capture_output=True, text=True, check=False, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                known_hosts_path = os.path.join(ssh_dir, "known_hosts")
+                with open(known_hosts_path, "w") as kh:
+                    kh.write(result.stdout.strip() + "\n")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # ssh-keyscan not available on this system
+
+        # Try to add SSH key to agent (may fail on Windows)
+        try:
+            subprocess.run("ssh-agent -s", shell=True, capture_output=True, timeout=5)
+            subprocess.run(f"ssh-add {key_path}", shell=True, capture_output=True, timeout=5)
+        except:
+            pass  # SSH agent not available on this system
+    
+    except Exception:
+        pass  # Silent fail - SSH optional for local dev
 
 
 # ==============================================================
-# 🧩 Ensure Git Remote Exists
+# Ensure Git Remote Exists
 # ==============================================================
 
 def ensure_remote(repo_path: str, repo_url: str):
@@ -98,7 +97,7 @@ def ensure_remote(repo_path: str, repo_url: str):
 
 
 # ==============================================================
-# 🧩 Dynamic Re-Fetch of GitHub Host Key (mid-sync fallback)
+# Dynamic Re-Fetch of GitHub Host Key (mid-sync fallback)
 # ==============================================================
 
 def refresh_github_host_key():
@@ -122,7 +121,7 @@ def refresh_github_host_key():
 
 
 # ==============================================================
-# 🚀 Git Sync Function (SSH-only, auto-healing)
+# Git Sync Function (SSH-only, auto-healing)
 # ==============================================================
 
 def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):

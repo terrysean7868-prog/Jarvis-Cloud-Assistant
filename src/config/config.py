@@ -19,8 +19,8 @@ class Config:
     for dir_path in [DATA_DIR, MODELS_DIR]:
         dir_path.mkdir(exist_ok=True)
     
-    # Database settings
-    MONGODB_URI = os.getenv('MONGODB_URI')
+    # Database settings (defaults to local if not configured)
+    MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/jarvis')
     MONGODB_DB = os.getenv('MONGODB_DB_NAME', 'jarvis_db')
     SQLITE_PATH = DATA_DIR / 'jarvis_memory.db'
     
@@ -101,8 +101,13 @@ class Config:
     ALLOWED_PATHS = [p.strip() for p in os.getenv('ALLOWED_PATHS', ','.join(DEFAULT_ALLOWED_PATHS)).split(',')]
     
     @classmethod
-    def validate(cls) -> bool:
-        """Validate required configuration settings"""
+    def validate(cls, strict=False) -> bool:
+        """Validate configuration settings. In dev mode, missing optional fields only warn.
+        
+        Args:
+            strict (bool): If True, raise error on missing critical fields.
+                          If False (default), only warn in debug mode.
+        """
         required_settings = [
             ('MONGODB_URI', cls.MONGODB_URI),
             ('PRIMARY_API_KEY', cls.LLM_CONFIG['primary']['api_key']),
@@ -112,7 +117,11 @@ class Config:
         missing = [key for key, value in required_settings if not value]
         
         if missing:
-            raise ValueError(f"Missing required configuration: {', '.join(missing)}")
+            msg = f"Missing configuration: {', '.join(missing)}"
+            if cls.SYSTEM_CONFIG['debug_mode']:
+                print(f"[WARN] {msg}")
+            if strict:
+                raise ValueError(msg)
         
         return True
     

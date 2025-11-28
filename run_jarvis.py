@@ -70,72 +70,85 @@ def start_frontend():
     return subprocess.Popen(["npm", "start"], cwd=FRONTEND_DIR, env=env, shell=True)
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("🚀 Starting JARVIS Cloud Assistant")
-    print("=" * 50)
-    
-    # Check if backend port is already in use
-    if is_port_in_use(BACKEND_PORT):
-        print(f"⚠️  Warning: Port {BACKEND_PORT} is already in use. Backend might already be running.")
-    
-    # Start backend
-    b = start_backend()
-    
-    if b is None:
-        print("❌ Failed to start backend. Please install dependencies first:")
-        print("   pip install -r requirements.txt")
-        print("   Or run: install_dependencies.bat")
-        sys.exit(1)
-    
-    # Wait for backend to be ready
-    print("⏳ Waiting for backend to start...")
-    if wait_for_backend(BACKEND_PORT):
-        print("✅ Backend is ready!")
-    else:
-        print("⚠️  Warning: Backend may not be ready yet. Continuing anyway...")
-        print("   Check backend logs above for errors.")
-    
-    # Start frontend
-    time.sleep(2)  # Additional delay to ensure backend is fully up
-    f = start_frontend()
-    
-    if f is None:
-        print("❌ Failed to start frontend.")
-        if b:
-            b.terminate()
-        sys.exit(1)
-    
-    print("=" * 50)
-    print("✅ JARVIS Started Successfully!")
-    print(f"   Backend:  http://localhost:{BACKEND_PORT}")
-    print("   Frontend: http://localhost:3000")
-    print("=" * 50)
-    print("📢 Say 'Hey Jarvis' to activate voice commands")
-    print("Press Ctrl+C to stop")
-    print("=" * 50)
-    
     try:
-        # Wait for both processes
-        while True:
-            if b.poll() is not None:
-                print("❌ Backend process ended unexpectedly")
-                break
-            if f.poll() is not None:
-                print("❌ Frontend process ended unexpectedly")
-                break
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n🛑 Shutting down JARVIS...")
+        print("=" * 50)
+        print("🚀 Starting JARVIS Cloud Assistant")
+        print("=" * 50)
+        
+        # Check if backend port is already in use
+        if is_port_in_use(BACKEND_PORT):
+            print(f"⚠️  Warning: Port {BACKEND_PORT} is already in use. Backend might already be running.")
+        
+        # Start backend
+        b = start_backend()
+        
+        if b is None:
+            print("❌ Failed to start backend. Please install dependencies first:")
+            print("   pip install -r requirements.txt")
+            print("   Or run: install_dependencies.bat")
+            input("Press Enter to exit...")
+            sys.exit(1)
+        
+        # Wait for backend to be ready
+        print("⏳ Waiting for backend to start...")
+        if wait_for_backend(BACKEND_PORT):
+            print("✅ Backend is ready!")
+        else:
+            print("⚠️  Warning: Backend may not be ready yet. Continuing anyway...")
+            print("   Check backend logs above for errors.")
+        
+        # Start frontend
+        time.sleep(2)  # Additional delay to ensure backend is fully up
+        f = start_frontend()
+        
+        if f is None:
+            print("❌ Failed to start frontend.")
+            if b:
+                b.terminate()
+            input("Press Enter to exit...")
+            sys.exit(1)
+        
+        print("=" * 50)
+        print("✅ JARVIS Started Successfully!")
+        print(f"   Backend:  http://localhost:{BACKEND_PORT}")
+        print("   Frontend: http://localhost:3000")
+        print("=" * 50)
+        print("📢 Say 'Hey Jarvis' to activate voice commands")
+        print("Press Ctrl+C to stop")
+        print("=" * 50)
+        
         try:
-            b.terminate()
-            f.terminate()
-            b.wait(timeout=5)
-            f.wait(timeout=5)
-        except:
+            # Wait for both processes
+            while True:
+                if b.poll() is not None:
+                    print("❌ Backend process ended unexpectedly")
+                    break
+                if f.poll() is not None:
+                    print("❌ Frontend process ended unexpectedly")
+                    break
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n🛑 Shutting down JARVIS...")
             try:
-                b.kill()
-                f.kill()
+                b.terminate()
+                f.terminate()
+                b.wait(timeout=5)
+                f.wait(timeout=5)
             except:
-                pass
-        print("✅ JARVIS stopped")
-        sys.exit(0)
+                try:
+                    b.kill()
+                    f.kill()
+                except:
+                    pass
+            print("✅ JARVIS stopped")
+            sys.exit(0)
+    except Exception as e:
+        import traceback
+        print("\n[ERROR] Unexpected exception while starting JARVIS:")
+        traceback.print_exc()
+        try:
+            # give user time to read error when double-clicked
+            input("Press Enter to exit...")
+        except Exception:
+            pass
+        sys.exit(1)

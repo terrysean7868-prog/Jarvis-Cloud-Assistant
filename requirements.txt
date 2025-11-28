@@ -1,6 +1,8 @@
-# =============================================================================
-# Core Dependencies (Required)
-# =============================================================================
+# ===============================================
+# JARVIS Cloud Assistant - All Dependencies
+# Consolidated from requirements-core.txt, requirements-extras.txt, requirements-light.txt
+# ===============================================
+
 # Web Framework and API
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
@@ -16,13 +18,11 @@ paramiko
 python-jose[cryptography]>=3.3.0
 cryptography>=41.0.0
 
-# Database and Storage
+# Database (MongoDB only - no SQLite fallback)
 pymongo>=4.4.0
 aiofiles>=23.0.0
 
-# =============================================================================
-# LLM and AI
-# =============================================================================
+# LLM and AI Models
 openai>=1.0.0
 google-generativeai>=0.3.0
 
@@ -36,59 +36,36 @@ APScheduler>=3.10.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 
-# =============================================================================
-# Basic ML / Data Science (for reasoning, pattern recognition)
-# =============================================================================
+# Data Science and ML (for reasoning, pattern recognition)
 numpy>=1.21.0
 scikit-learn>=1.0.2
 networkx>=2.6.3
 scipy>=1.7.3
 
-# =============================================================================
 # Voice Recognition and Audio Processing
-# =============================================================================
 SpeechRecognition==3.8.1
 pydub==0.25.1
 vosk==0.3.42
 pyttsx3>=2.90
 pocketsphinx>=0.1.15
-# Optional:
-# webrtcvad==2.0.10
-# sounddevice>=0.4.6
-# soundfile>=0.12.1
 
-# =============================================================================
-# Advanced AI / ML Features (optional, heavy)
-# =============================================================================
+# Advanced ML Features (optional but included)
 tensorflow>=2.13.0
 pandas>=1.3.3
 nltk>=3.6.5
 gensim>=4.1.2
 
-# =============================================================================
-# Integrations
-# =============================================================================
-# python-telegram-bot==13.15  # optional Telegram bot support
-selenium>=4.0.0              # Browser automation
-pyautogui>=0.9.53            # Screen navigation automation
-Pillow>=10.0.0               # Screen capture and image processing
-pytesseract>=0.3.10          # OCR for reading screen text
-opencv-python>=4.8.0         # Computer vision for screen analysis
-numpy>=1.21.0                # Required for opencv
-psutil>=5.9.0                # Process and system utilities
-pywin32>=306; sys_platform == 'win32'  # Windows API (Windows only)
-requests>=2.31.0             # For Render API access
+# Desktop Integration and Automation
+selenium>=4.0.0
+pyautogui>=0.9.53
+Pillow>=10.0.0
+pytesseract>=0.3.10
+opencv-python>=4.8.0
+psutil>=5.9.0
+pywin32>=306; sys_platform == 'win32'
 
-# =============================================================================
-# Translation and Language Tools
-# =============================================================================
-googletrans==4.0.2       # For language translation (Executor)
+# Language Translation
+googletrans==4.0.2
 
-# =============================================================================
-# Development / Optional Tools
-# =============================================================================
-# ffmpeg-python==0.2.0
-# gunicorn==20.1.0
-# PyYAML>=6.0.1
-# sqlalchemy
-# tqdm
+# Production Server (optional)
+gunicorn>=21.0.0

@@ -25,15 +25,35 @@ class Database:
         if cls._instance is None:
             cls._instance = super(Database, cls).__new__(cls)
             cls._instance._initialized = False
+            cls._instance.client = None
+            cls._instance.db = None
+            cls._instance._error = None
         return cls._instance
     
     def __init__(self):
         if self._initialized:
             return
-            
+        
+        # Lazy-load database; don't fail on startup
+        self._initialized = True
+        # Don't connect until first database call
+    
+    def _ensure_connected(self):
+        """Ensure database is connected before use."""
+        if self.client is None:
+            self._connect()
+    
+    def _connect(self):
+        """Connect to MongoDB. Required - no fallback."""
+        if self.client is not None:
+            return  # Already connected
+        
         uri = os.getenv('MONGODB_URI') or os.getenv('MONGO_URI')
         if not uri:
-            raise ValueError("MongoDB URI not found in environment variables")
+            raise ValueError(
+                "MONGODB_URI not set in environment. "
+                "Set MONGODB_URI=mongodb://localhost:27017/jarvis or your MongoDB Atlas URI"
+            )
             
         try:
             # Handle MongoDB URI with special characters
@@ -56,7 +76,6 @@ class Database:
                 
                 # Reconstruct URI with escaped characters
                 self.uri = f"{prefix}{quote_plus(username)}:{quote_plus(password)}@{host_part}"
-                print("MongoDB URI successfully parsed and escaped")
             else:
                 self.uri = uri
                 
@@ -64,55 +83,15 @@ class Database:
             self.client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
             self.client.admin.command('ping')
             self.db = self.client[os.getenv('MONGODB_DB_NAME', 'jarvis_db')]
-            self._initialized = True
             self._setup_collections()
-            
-            print("Successfully connected to MongoDB")
-            
-        except Exception as e:
-            print(f"MongoDB connection error: {str(e)}")
-            # Fallback to local storage if MongoDB connection fails
-            self._setup_local_fallback()
-            raise ConnectionError(f'MongoDB connection failed: {e}')
-            
-    def _setup_local_fallback(self):
-        """Setup local SQLite database as fallback"""
-        try:
-            db_path = Path("jarvis_local.db")
-            self.local_db = sqlite3.connect(str(db_path))
-            cursor = self.local_db.cursor()
-            
-            # Create tables for essential data
-            cursor.executescript("""
-                CREATE TABLE IF NOT EXISTS chat_history (
-                    id INTEGER PRIMARY KEY,
-                    user_id TEXT,
-                    message TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                
-                CREATE TABLE IF NOT EXISTS system_events (
-                    id INTEGER PRIMARY KEY,
-                    event_type TEXT,
-                    description TEXT,
-                    status TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                
-                CREATE INDEX IF NOT EXISTS idx_chat_timestamp 
-                ON chat_history(timestamp DESC);
-                
-                CREATE INDEX IF NOT EXISTS idx_events_type 
-                ON system_events(event_type);
-            """)
-            
-            self.local_db.commit()
-            print("Local SQLite database initialized as fallback")
+            print("[DB] SUCCESS - Connected to MongoDB")
             
         except Exception as e:
-            print(f"Failed to setup local fallback: {e}")
+            self._error = str(e)
+            print(f"[DB] ERROR: Failed to connect to MongoDB: {str(e)[:100]}")
+            print(f"[DB] Make sure MongoDB is running locally or set MONGODB_URI to your Atlas cluster")
             raise
-    
+            
     def _setup_collections(self):
         """Setup collections with proper indexes and schemas"""
         # Chat History Collection

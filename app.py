@@ -21,13 +21,13 @@ from src.utils.task_manager import task_manager
 from src.utils.error_handler import error_handler
 
 # =========================================================
-# 🚀 FastAPI Initialization
+# FastAPI Initialization
 # =========================================================
 app = FastAPI(title="Jarvis Cloud Assistant")
 load_dotenv()
 
 # =========================================================
-# 🌐 CORS Configuration
+# CORS Configuration
 # =========================================================
 cors_origins = [
     "http://localhost:3000",
@@ -45,7 +45,7 @@ app.add_middleware(
 )
 
 # =========================================================
-# 🧠 Core Initialization
+# Core Initialization
 # =========================================================
 llm = LLMAdapter()
 brain = JarvisBrain(llm=llm)
@@ -65,7 +65,7 @@ class VoiceAuthRequest(BaseModel):
     role: str | None = None  # optional: 'admin' or 'user'
 
 # =========================================================
-# 🔐 Voice Authentication Endpoints
+# Voice Authentication Endpoints
 # =========================================================
 @app.post("/api/voice-auth")
 async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
@@ -104,6 +104,12 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
+# Simple health endpoint used by local startup checks
+@app.get("/health")
+async def health_check():
+    return JSONResponse({"status": "ok"}, status_code=200)
+
 @app.post("/api/validate-session")
 async def validate_session_endpoint(session_id: dict):
     """Validate authentication session"""
@@ -121,7 +127,7 @@ async def logout(session_id: str):
     return {"status": "success" if success else "error"}
 
 # =========================================================
-# 💬 Main Chat Endpoint (With Auth Check)
+# Main Chat Endpoint (With Auth Check)
 # =========================================================
 @app.post("/api/chat")
 async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
@@ -149,18 +155,18 @@ async def message_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     return await chat_endpoint(msg, background_tasks)
 
 # =========================================================
-# 🛠️ Git Sync API
+# Git Sync API
 # =========================================================
 @app.post("/api/git-sync")
 async def trigger_git_sync():
     try:
         git_sync(repo_path=".")
-        return {"status": "success", "message": "✅ Code pushed to main branch."}
+        return {"status": "success", "message": "[OK] Code pushed to main branch."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 # =========================================================
-# 🔧 GitHub Configuration API
+# GitHub Configuration API
 # =========================================================
 class GitHubConfig(BaseModel):
     repo_url: str | None = None
@@ -210,7 +216,7 @@ async def set_github_config(config: GitHubConfig):
         return {"status": "error", "message": str(e)}
 
 # =========================================================
-# 🔄 Self-Update API (Voice-triggered)
+# Self-Update API (Voice-triggered)
 # =========================================================
 class SelfUpdateRequest(BaseModel):
     command: str
@@ -261,7 +267,7 @@ async def handle_self_update(request: SelfUpdateRequest):
         return {"status": "error", "message": str(e)}
 
 # =========================================================
-# 📧 Email Generation API
+# Email Generation API
 # =========================================================
 class EmailRequest(BaseModel):
     recipient: str
@@ -293,7 +299,7 @@ async def get_email_drafts():
     return {"drafts": email_generator.get_drafts()}
 
 # =========================================================
-# 🖥️ Screen Access API
+# Screen Access API
 # =========================================================
 @app.post("/api/capture-screen")
 async def capture_screen_endpoint(region: dict | None = None):
@@ -320,7 +326,7 @@ async def read_screen_endpoint(region: dict | None = None):
         return {"error": str(e), "status": "error"}
 
 # =========================================================
-# 🖥️ Application Management API
+# Application Management API
 # =========================================================
 class OpenAppRequest(BaseModel):
     app_name: str
@@ -359,7 +365,7 @@ async def execute_command_endpoint(request: ExecuteCommandRequest):
     return app_manager.execute_command(request.command, request.wait)
 
 # =========================================================
-# 📋 Task Management API
+# Task Management API
 # =========================================================
 class CreateTaskRequest(BaseModel):
     description: str
@@ -394,7 +400,7 @@ async def get_wakeup_context():
     return {"context": task_manager.get_wakeup_context()}
 
 # =========================================================
-# 🔧 Error Handling API
+# Error Handling API
 # =========================================================
 @app.post("/api/check-errors")
 async def check_errors_endpoint():
@@ -412,18 +418,19 @@ async def fix_error_endpoint(error: dict):
     return error_handler.auto_fix_error(error)
 
 # =========================================================
-# 🕒 Startup Event
+# Startup Event
 # =========================================================
+
 @app.on_event("startup")
 async def startup_event():
-    setup_ssh_trust()
+    # Run SSH setup in background thread to not block startup
+    asyncio.create_task(asyncio.to_thread(setup_ssh_trust))
     interval = int(os.getenv("GIT_PULL_INTERVAL_SEC", "0"))
     if interval > 0:
         asyncio.create_task(asyncio.to_thread(git_sync, repo_path="."))
-    print("✅ Jarvis server started and git-sync initialized.")
-
+    print("[OK] Jarvis server started and git-sync initialized.")
 # =========================================================
-# 🎨 Serve Frontend (React build)
+# Serve Frontend (React build)
 # =========================================================
 frontend_build_path = os.path.join(os.getcwd(), "jarvis-frontend", "build")
 
