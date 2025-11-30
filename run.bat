@@ -99,9 +99,10 @@ set PATH=%SCRIPT_DIR%venv\Scripts;%PATH%
 
 REM ===== Install/check dependencies =====
 echo [*] Checking Python dependencies...
+timeout /t 1 /nobreak >nul
 %PYTHON_EXEC% -m pip install -q --upgrade pip 2>nul
 echo [*] Installing/updating all requirements...
-%PYTHON_EXEC% -m pip install -r requirements.txt --quiet
+%PYTHON_EXEC% -m pip install -r requirements.txt --no-warn-script-location 2>nul
 if errorlevel 1 (
     echo [WARNING] Some packages failed to install, but continuing...
 )
@@ -110,6 +111,7 @@ if errorlevel 1 (
     echo [ERROR] FastAPI not installed - installation failed
     pause
     exit /b 1
+)
 echo [OK] Python dependencies ready
 echo.
 

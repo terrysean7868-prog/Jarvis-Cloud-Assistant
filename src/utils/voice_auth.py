@@ -20,7 +20,10 @@ import json
 import hashlib
 import secrets
 import logging
+import threading
+import time
 from pathlib import Path
+from src.utils.db import db
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 
@@ -31,6 +34,9 @@ logger.setLevel(logging.INFO)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # go up to project root
 AUTH_FILE = PROJECT_ROOT / "data" / "auth_users.json"
 SESSION_DURATION = timedelta(hours=8)  # sessions valid for 8 hours
+AUTH_USE_DB = os.getenv("AUTH_USE_DB", "true").lower() in ("1", "true", "yes")
+PENDING_QUEUE_FILE = PROJECT_ROOT / "data" / "auth_pending_queue.json"
+QUEUE_FLUSH_INTERVAL = int(os.getenv("AUTH_QUEUE_FLUSH_INTERVAL", "10"))  # seconds
 
 def _ensure_auth_file():
     if not AUTH_FILE.parent.exists():
@@ -50,8 +56,34 @@ class VoiceAuth:
         _ensure_auth_file()
         self._load()
         self.active_sessions = {}  # session_id -> {"username", "expires_at"}
+        # pending registrations queued while DB is unavailable
+        self._pending_lock = threading.Lock()
+        self._load_pending_queue()
+        self._stop_queue_thread = False
+        self._queue_thread = threading.Thread(target=self._pending_worker, daemon=True)
+        self._queue_thread.start()
 
     def _load(self):
+        # Load from MongoDB when AUTH_USE_DB is enabled. Do not read/write local file when DB is primary.
+        if AUTH_USE_DB:
+            try:
+                db._ensure_connected()
+                users = list(db.db.auth_users.find({}))
+                # Convert list of docs into dict keyed by username
+                self.auth_data = {"users": {}}
+                for u in users:
+                    uname = (u.get("username") or "").lower()
+                    if uname:
+                        u.pop("_id", None)
+                        self.auth_data["users"][uname] = u
+                return
+            except Exception:
+                # DB not available - treat as empty (do not fallback to local file)
+                logger.warning("AUTH_USE_DB enabled but MongoDB not available; starting with empty auth store")
+                self.auth_data = {"users": {}}
+                return
+
+        # Fallback behavior: read local file (when AUTH_USE_DB is disabled)
         try:
             with open(AUTH_FILE, "r", encoding="utf-8") as fh:
                 self.auth_data = json.load(fh)
@@ -62,11 +94,29 @@ class VoiceAuth:
             self._save()
 
     def _save(self):
+        # If using DB as primary store, persist only to MongoDB.
+        if AUTH_USE_DB:
+            try:
+                db._ensure_connected()
+                users_col = db.db.auth_users
+                # Ensure username index
+                users_col.create_index([("username", 1)], unique=True)
+                for uname, udata in self.auth_data.get("users", {}).items():
+                    doc = dict(udata)
+                    doc["username"] = uname
+                    users_col.update_one({"username": uname}, {"$set": doc}, upsert=True)
+                return
+            except Exception as e:
+                # DB not available - log and raise so caller can handle (avoid silent local save)
+                logger.exception("Failed to persist auth data to MongoDB: %s", e)
+                raise
+
+        # If DB is not primary, save to local file
         try:
             with open(AUTH_FILE, "w", encoding="utf-8") as fh:
                 json.dump(self.auth_data, fh, indent=2)
         except Exception as e:
-            logger.exception("Failed to save auth data: %s", e)
+            logger.exception("Failed to save auth data to file: %s", e)
 
     def register_user(self, username: str, voice_sample_hash: str, password: Optional[str]=None, role: str="user") -> dict:
         """
@@ -84,10 +134,48 @@ class VoiceAuth:
             salt, hashed = _hash_password(password)
             user["password_salt"] = salt
             user["password_hash"] = hashed
+        # Add to in-memory store immediately (so auth attempts can work locally once flushed)
         self.auth_data.setdefault("users", {})[username] = user
-        self._save()
-        logger.info("Registered user '%s' with role '%s'", username, role)
-        return {"status":"success","message":"User registered", "username": username, "role": role}
+        # If configured to use DB as primary store, attempt to persist; if DB unavailable, queue for later
+        if AUTH_USE_DB:
+            try:
+                # Ensure DB connection is attempted
+                db._ensure_connected()
+                # Wait briefly for background connection to complete
+                if db.db is None:
+                    # Give background reconnect thread a moment to connect
+                    for attempt in range(3):
+                        time.sleep(0.5)
+                        if db.db is not None:
+                            break
+                # Check if DB is now connected
+                if db.db is None:
+                    raise RuntimeError('MongoDB not yet connected')
+                users_col = db.db.auth_users
+                users_col.create_index([("username", 1)], unique=True)
+                doc = dict(user)
+                doc["username"] = username
+                users_col.update_one({"username": username}, {"$set": doc}, upsert=True)
+                logger.info("Registered user '%s' persisted to MongoDB", username)
+                return {"status":"success","message":"User registered", "username": username, "role": role}
+            except Exception as e:
+                # DB unavailable — queue the registration and continue
+                logger.warning(f"MongoDB unavailable for registration of user '{username}': {e}")
+                self._enqueue_pending({"username": username, "user": user})
+                # Persist pending queue to disk
+                self._persist_pending_queue()
+                logger.info(f"Queued registration for user '{username}' - will flush when DB available")
+                return {"status":"queued", "message":"Database unavailable; registration queued", "username": username}
+
+        # Fallback/local save when DB not used
+        try:
+            self._save()
+            logger.info("Registered user '%s' saved locally", username)
+            return {"status":"success","message":"User registered (local)", "username": username, "role": role}
+        except Exception as e:
+            logger.exception("Failed to save user locally: %s", e)
+            self.auth_data.get("users", {}).pop(username, None)
+            return {"status":"error", "message": "Failed to save user locally"}
 
     def _compare_voice_hashes(self, stored_hash: str, provided_hash: str, threshold: float = 0.9) -> bool:
         """
@@ -166,6 +254,86 @@ class VoiceAuth:
         expired = [sid for sid,s in list(self.active_sessions.items()) if datetime.fromisoformat(s["expires_at"]) < now]
         for sid in expired:
             del self.active_sessions[sid]
+
+    # Pending queue helpers
+    def _load_pending_queue(self):
+        try:
+            if not PENDING_QUEUE_FILE.parent.exists():
+                PENDING_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            if PENDING_QUEUE_FILE.exists():
+                with open(PENDING_QUEUE_FILE, 'r', encoding='utf-8') as fh:
+                    self._pending_queue = json.load(fh)
+            else:
+                self._pending_queue = []
+        except Exception:
+            self._pending_queue = []
+
+    def _persist_pending_queue(self):
+        try:
+            with open(PENDING_QUEUE_FILE, 'w', encoding='utf-8') as fh:
+                json.dump(self._pending_queue, fh, indent=2)
+        except Exception:
+            logger.exception("Failed to persist pending auth queue")
+
+    def _enqueue_pending(self, item: dict):
+        with self._pending_lock:
+            self._pending_queue.append(item)
+
+    def _dequeue_pending(self):
+        with self._pending_lock:
+            if not self._pending_queue:
+                return None
+            item = self._pending_queue.pop(0)
+            return item
+
+    def _pending_worker(self):
+        """Background worker that flushes pending registrations to DB when available."""
+        while not getattr(self, '_stop_queue_thread', False):
+            try:
+                # Try to flush while DB is available
+                if getattr(db, 'db', None) is None:
+                    # Ensure DB reconnect process is running
+                    db._ensure_connected()
+                if getattr(db, 'db', None):
+                    # flush all queued items
+                    flushed_any = False
+                    while True:
+                        item = None
+                        with self._pending_lock:
+                            if self._pending_queue:
+                                item = self._pending_queue.pop(0)
+                        if not item:
+                            break
+                        try:
+                            uname = item.get('username')
+                            udoc = dict(item.get('user') or {})
+                            udoc['username'] = uname
+                            users_col = db.db.auth_users
+                            users_col.create_index([('username', 1)], unique=True)
+                            users_col.update_one({'username': uname}, {'$set': udoc}, upsert=True)
+                            logger.info("Flushed pending registration for '%s' to MongoDB", uname)
+                            flushed_any = True
+                        except Exception:
+                            # Put back at front and stop trying for now
+                            with self._pending_lock:
+                                self._pending_queue.insert(0, item)
+                            break
+                    if flushed_any:
+                        # persist queue state
+                        self._persist_pending_queue()
+                # sleep before next attempt
+            except Exception:
+                logger.debug("Pending worker encountered an error; will retry")
+            time.sleep(QUEUE_FLUSH_INTERVAL)
+
+    def stop(self):
+        """Stop background threads (used in shutdown/tests)."""
+        self._stop_queue_thread = True
+        try:
+            if self._queue_thread:
+                self._queue_thread.join(timeout=1)
+        except Exception:
+            pass
 
 # Create global instance
 voice_auth = VoiceAuth()

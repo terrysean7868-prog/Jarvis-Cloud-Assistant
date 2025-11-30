@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from typing import List
+from typing import List, Optional
 
 from src.core.llm_adapter import LLMAdapter
 from src.core.jarvis_brain import JarvisBrain
@@ -14,11 +14,16 @@ from src.core.executor import ActionExecutor
 from src.utils.git_sync import git_sync, setup_ssh_trust
 from src.utils.self_update import parse_voice_command, self_update_file, self_add_feature
 from src.utils.voice_auth import voice_auth
+from src.utils.db import db as database
 from src.utils.email_generator import email_generator
 from src.utils.screen_access import screen_access
 from src.utils.app_manager import app_manager
 from src.utils.task_manager import task_manager
 from src.utils.error_handler import error_handler
+from src.utils.telegram_bot import telegram_bot
+from src.utils.session_manager import session_manager, start_session_cleanup_task
+from src.utils.mcp_file_ops import file_ops
+from src.utils.system_operations import system_ops
 
 # =========================================================
 # FastAPI Initialization
@@ -127,6 +132,131 @@ async def logout(session_id: str):
     return {"status": "success" if success else "error"}
 
 # =========================================================
+# Telegram Bot Endpoints
+# =========================================================
+class TelegramAuthRequest(BaseModel):
+    user_id: str
+    username: str
+    action: str  # "register" or "login"
+    voice_sample_hash: str | None = None
+    password: str | None = None
+    role: str | None = None
+
+@app.post("/api/telegram/register-start")
+async def telegram_register_start(req: dict):
+    """Start Telegram registration process"""
+    user_id = req.get("user_id")
+    username = req.get("username")
+    
+    if not user_id or not username:
+        return {"status": "error", "message": "user_id and username required"}
+    
+    result = telegram_bot.start_registration(user_id, username)
+    return result
+
+@app.post("/api/telegram/process-voice")
+async def telegram_process_voice(req: dict):
+    """Process voice sample from Telegram"""
+    user_id = req.get("user_id")
+    voice_file_id = req.get("voice_file_id")
+    # In production, download voice file from Telegram and get bytes
+    voice_bytes = req.get("voice_bytes", b"")
+    
+    if not user_id or not voice_file_id:
+        return {"status": "error", "message": "user_id and voice_file_id required"}
+    
+    result = telegram_bot.process_voice_sample(user_id, voice_file_id, voice_bytes)
+    return result
+
+@app.post("/api/telegram/complete-registration")
+async def telegram_complete_registration(auth_req: TelegramAuthRequest):
+    """Complete Telegram registration"""
+    if not auth_req.voice_sample_hash or not auth_req.password:
+        return {"status": "error", "message": "voice_sample_hash and password required"}
+    
+    result = telegram_bot.complete_registration(
+        auth_req.user_id,
+        auth_req.voice_sample_hash,
+        auth_req.password,
+        auth_req.username,
+        auth_req.role or "user"
+    )
+    return result
+
+@app.post("/api/telegram/login")
+async def telegram_login(auth_req: TelegramAuthRequest):
+    """Handle Telegram user login"""
+    if not auth_req.voice_sample_hash:
+        return {"status": "error", "message": "voice_sample_hash required"}
+    
+    result = telegram_bot.telegram_login(
+        auth_req.user_id,
+        auth_req.username,
+        auth_req.voice_sample_hash
+    )
+    return result
+
+@app.post("/api/telegram/validate-session")
+async def telegram_validate_session(req: dict):
+    """Validate Telegram user session"""
+    user_id = req.get("user_id")
+    if not user_id:
+        return {"status": "error", "message": "user_id required"}
+    
+    is_valid, username = telegram_bot.validate_telegram_session(user_id)
+    return {
+        "valid": is_valid,
+        "username": username,
+        "user_info": telegram_bot.get_user_info(user_id)
+    }
+
+@app.post("/api/telegram/logout")
+async def telegram_logout(req: dict):
+    """Logout Telegram user"""
+    user_id = req.get("user_id")
+    if not user_id:
+        return {"status": "error", "message": "user_id required"}
+    
+    success = telegram_bot.logout_telegram_user(user_id)
+    return {
+        "status": "success" if success else "error",
+        "message": "Logged out successfully" if success else "User not found"
+    }
+
+@app.post("/api/telegram/chat")
+async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
+    """Handle chat message from Telegram user"""
+    user_id = req.get("user_id")
+    text = req.get("text")
+    
+    if not user_id or not text:
+        return {"status": "error", "message": "user_id and text required"}
+    
+    # Validate session
+    is_valid, username = telegram_bot.validate_telegram_session(user_id)
+    if not is_valid:
+        return {
+            "status": "auth_required",
+            "message": "Please login first",
+            "action": "redirect_to_login"
+        }
+    
+    # Process message through brain
+    response = await brain.handle_message(text, mode="chat")
+    actions = response.get("actions", [])
+    
+    if actions:
+        background_tasks.add_task(executor.process_actions, actions, username)
+    
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "username": username,
+        "response": response.get("text", ""),
+        "actions": actions
+    }
+
+# =========================================================
 # Main Chat Endpoint (With Auth Check)
 # =========================================================
 @app.post("/api/chat")
@@ -153,6 +283,118 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
 async def message_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     """Alias for /api/chat endpoint for backward compatibility"""
     return await chat_endpoint(msg, background_tasks)
+
+# =========================================================
+# Internet Access API (Web Search & Data Retrieval)
+# =========================================================
+class SearchRequest(BaseModel):
+    query: str
+    num_results: int | None = 5
+    session_id: str | None = None
+
+@app.post("/api/internet/search")
+async def search_web(req: SearchRequest):
+    """Search the web for information"""
+    try:
+        from src.internet.internet import InternetAccess
+        
+        internet = InternetAccess()
+        await internet.initialize()
+        
+        results = await internet.search(req.query, num_results=req.num_results or 5)
+        
+        await internet.close()
+        
+        return {
+            "status": "success",
+            "query": req.query,
+            "results": results,
+            "count": len(results)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+class FetchRequest(BaseModel):
+    url: str
+    include_content: bool | None = True
+    session_id: str | None = None
+
+@app.post("/api/internet/fetch")
+async def fetch_webpage(req: FetchRequest):
+    """Fetch and parse a webpage"""
+    try:
+        from src.internet.internet import InternetAccess
+        
+        internet = InternetAccess()
+        await internet.initialize()
+        
+        result = await internet.fetch_webpage(req.url, include_content=req.include_content or True)
+        
+        await internet.close()
+        
+        return {
+            "status": "success",
+            "url": req.url,
+            "content": result
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.post("/api/internet/search-summarize")
+async def search_and_summarize(req: SearchRequest):
+    """Search web and get summaries of top results"""
+    try:
+        from src.internet.internet import InternetAccess
+        
+        internet = InternetAccess()
+        await internet.initialize()
+        
+        results = await internet.search_and_summarize(req.query, num_results=req.num_results or 3)
+        
+        await internet.close()
+        
+        return {
+            "status": "success",
+            "query": req.query,
+            "results": results,
+            "count": len(results)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.get("/api/internet/news")
+async def get_news_endpoint(topic: str = "latest", num_results: int = 5):
+    """Get latest news on a topic"""
+    try:
+        from src.internet.internet import InternetAccess
+        
+        internet = InternetAccess()
+        await internet.initialize()
+        
+        news = await internet.get_news(topic, num_results)
+        
+        await internet.close()
+        
+        return {
+            "status": "success",
+            "topic": topic,
+            "news": news,
+            "count": len(news)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 # =========================================================
 # Git Sync API
@@ -418,17 +660,278 @@ async def fix_error_endpoint(error: dict):
     return error_handler.auto_fix_error(error)
 
 # =========================================================
+# File Operations API (Via MCP or Local)
+# =========================================================
+class FileRequest(BaseModel):
+    path: str
+    session_id: str | None = None
+
+class FileWriteRequest(BaseModel):
+    path: str
+    content: str
+    session_id: str | None = None
+
+class FileCopyRequest(BaseModel):
+    source: str
+    destination: str
+    session_id: str | None = None
+
+@app.post("/api/files/read")
+async def read_file_endpoint(req: FileRequest):
+    """Read file content"""
+    try:
+        result = file_ops.read_file(req.path)
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/files/write")
+async def write_file_endpoint(req: FileWriteRequest):
+    """Write content to file"""
+    try:
+        result = file_ops.write_file(req.path, req.content)
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/files/list")
+async def list_files_endpoint(req: FileRequest):
+    """List files in directory"""
+    try:
+        result = file_ops.list_files(req.path)
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/files/delete")
+async def delete_file_endpoint(req: FileRequest):
+    """Delete a file"""
+    try:
+        result = file_ops.delete_file(req.path)
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/files/mkdir")
+async def create_directory_endpoint(req: FileRequest):
+    """Create a directory"""
+    try:
+        result = file_ops.create_directory(req.path)
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/files/copy")
+async def copy_file_endpoint(req: FileCopyRequest):
+    """Copy a file"""
+    try:
+        result = file_ops.copy_file(req.source, req.destination)
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/files/cleanup")
+async def cleanup_project_endpoint():
+    """Clean up project cache files"""
+    try:
+        result = file_ops.cleanup_project()
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# =========================================================
+# System Operations API (Digital Assistant PC Control)
+# =========================================================
+@app.get("/api/system/info")
+async def get_system_info():
+    """Get current system information"""
+    return system_ops.get_system_info()
+
+@app.get("/api/system/processes")
+async def list_processes_endpoint(filter: Optional[str] = None):
+    """List running processes"""
+    return system_ops.list_processes(filter)
+
+@app.post("/api/system/process-kill")
+async def kill_process_endpoint(req: dict):
+    """Kill a process by name"""
+    process_name = req.get("process_name")
+    if not process_name:
+        return {"status": "error", "message": "process_name required"}
+    return system_ops.kill_process(process_name)
+
+@app.post("/api/system/launch-app")
+async def launch_application_endpoint(req: dict):
+    """Launch an application"""
+    app_path = req.get("app_path")
+    args = req.get("args", [])
+    if not app_path:
+        return {"status": "error", "message": "app_path required"}
+    return system_ops.launch_application(app_path, args)
+
+@app.post("/api/system/execute")
+async def execute_command_endpoint(req: dict):
+    """Execute a shell command"""
+    command = req.get("command")
+    timeout = req.get("timeout", 30)
+    if not command:
+        return {"status": "error", "message": "command required"}
+    return system_ops.execute_command(command, timeout)
+
+@app.get("/api/system/screen")
+async def get_screen_info():
+    """Get screen/display information"""
+    return system_ops.get_screen_info()
+
+@app.post("/api/system/screenshot")
+async def take_screenshot(req: dict = None):
+    """Take a screenshot"""
+    save_path = req.get("save_path") if req else None
+    return system_ops.take_screenshot(save_path)
+
+@app.post("/api/system/mouse-move")
+async def move_mouse_endpoint(req: dict):
+    """Move mouse to position"""
+    x = req.get("x")
+    y = req.get("y")
+    if x is None or y is None:
+        return {"status": "error", "message": "x and y required"}
+    return system_ops.move_mouse(int(x), int(y))
+
+@app.post("/api/system/mouse-click")
+async def click_mouse_endpoint(req: dict):
+    """Click mouse at position"""
+    x = req.get("x")
+    y = req.get("y")
+    button = req.get("button", "left")
+    if x is None or y is None:
+        return {"status": "error", "message": "x and y required"}
+    return system_ops.click_mouse(int(x), int(y), button)
+
+@app.post("/api/system/type-text")
+async def type_text_endpoint(req: dict):
+    """Type text using keyboard"""
+    text = req.get("text")
+    interval = req.get("interval", 0.1)
+    if not text:
+        return {"status": "error", "message": "text required"}
+    return system_ops.type_text(text, interval)
+
+@app.post("/api/system/press-key")
+async def press_key_endpoint(req: dict):
+    """Press a keyboard key"""
+    key = req.get("key")
+    if not key:
+        return {"status": "error", "message": "key required"}
+    return system_ops.press_key(key)
+
+@app.post("/api/system/open-file")
+async def open_file_endpoint(req: dict):
+    """Open a file with default application"""
+    file_path = req.get("file_path")
+    if not file_path:
+        return {"status": "error", "message": "file_path required"}
+    return system_ops.open_file(file_path)
+
+@app.get("/api/system/windows")
+async def get_open_windows():
+    """Get list of open windows"""
+    return system_ops.get_open_windows()
+
+@app.post("/api/system/window-focus")
+async def focus_window_endpoint(req: dict):
+    """Focus a window by title"""
+    window_title = req.get("window_title")
+    if not window_title:
+        return {"status": "error", "message": "window_title required"}
+    return system_ops.focus_window(window_title)
+
+# =========================================================
+# Session Management Endpoints
+# =========================================================
+@app.post("/api/session/extend")
+async def extend_session_endpoint(req: dict):
+    """Extend current session on page reload"""
+    session_id = req.get("session_id")
+    if not session_id:
+        return {"status": "error", "message": "session_id required"}
+    
+    is_valid, username = session_manager.validate_session(session_id, update_activity=True)
+    if not is_valid:
+        return {
+            "status": "session_expired",
+            "message": "Session expired. Please login again.",
+            "action": "redirect_to_login"
+        }
+    
+    # Extend session
+    extended = session_manager.extend_session(session_id)
+    
+    return {
+        "status": "success" if extended else "error",
+        "message": "Session extended" if extended else "Failed to extend session",
+        "username": username,
+        "session_info": session_manager.get_session_info(session_id)
+    }
+
+@app.post("/api/session/check")
+async def check_session_endpoint(req: dict):
+    """Check if session is still valid"""
+    session_id = req.get("session_id")
+    if not session_id:
+        return {"valid": False, "message": "No session_id provided"}
+    
+    is_valid, username = session_manager.validate_session(session_id, update_activity=False)
+    
+    return {
+        "valid": is_valid,
+        "username": username,
+        "session_info": session_manager.get_session_info(session_id) if is_valid else None
+    }
+
+@app.post("/api/session/logout")
+async def logout_session_endpoint(req: dict):
+    """Logout from current session"""
+    session_id = req.get("session_id")
+    if not session_id:
+        return {"status": "error", "message": "session_id required"}
+    
+    success = session_manager.invalidate_session(session_id)
+    
+    return {
+        "status": "success" if success else "error",
+        "message": "Logged out successfully" if success else "Session not found"
+    }
+
+@app.get("/api/session/stats")
+async def get_session_stats():
+    """Get session statistics"""
+    return session_manager.get_session_stats()
+
+# =========================================================
 # Startup Event
 # =========================================================
 
 @app.on_event("startup")
 async def startup_event():
-    # Run SSH setup in background thread to not block startup
-    asyncio.create_task(asyncio.to_thread(setup_ssh_trust))
-    interval = int(os.getenv("GIT_PULL_INTERVAL_SEC", "0"))
-    if interval > 0:
-        asyncio.create_task(asyncio.to_thread(git_sync, repo_path="."))
+    print("[OK] Jarvis server startup event running")
+    try:
+        database._ensure_connected()
+        print("[DB] Connection check complete")
+    except Exception as e:
+        print(f"[INFO] DB error during startup (will retry): {e}")
+    
+    # Start session cleanup task
+    try:
+        # start_session_cleanup_task()
+        print("[OK] Session cleanup task skipped for now")
+    except Exception as e:
+        print(f"[INFO] Could not start session cleanup (already running): {e}")
+    
     print("[OK] Jarvis server started and git-sync initialized.")
+
+
+# Shutdown event removed - let background threads continue gracefully
 # =========================================================
 # Serve Frontend (React build)
 # =========================================================

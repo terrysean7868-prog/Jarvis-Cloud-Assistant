@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 import json
 from bson import ObjectId
 from urllib.parse import quote_plus, urlparse
+import threading
+import time
 
 load_dotenv()
 
@@ -37,60 +39,76 @@ class Database:
         # Lazy-load database; don't fail on startup
         self._initialized = True
         # Don't connect until first database call
+        self._reconnect_thread = None
+        self._reconnect_lock = threading.Lock()
+        self._stop_reconnect = False
     
     def _ensure_connected(self):
         """Ensure database is connected before use."""
         if self.client is None:
-            self._connect()
+            # Try a non-raising connect first
+            self._connect(raise_on_fail=False)
+            if self.client is None:
+                # start background reconnect attempts
+                self._start_reconnect_thread()
     
-    def _connect(self):
-        """Connect to MongoDB. Required - no fallback."""
+    def _connect(self, raise_on_fail=True):
+        """Connect to MongoDB. If raise_on_fail is False, failures won't raise but will set client to None."""
         if self.client is not None:
             return  # Already connected
-        
+
         uri = os.getenv('MONGODB_URI') or os.getenv('MONGO_URI')
         if not uri:
-            raise ValueError(
+            msg = (
                 "MONGODB_URI not set in environment. "
                 "Set MONGODB_URI=mongodb://localhost:27017/jarvis or your MongoDB Atlas URI"
             )
-            
+            if raise_on_fail:
+                raise ValueError(msg)
+            else:
+                self._error = msg
+                return
+
         try:
             # Handle MongoDB URI with special characters
             if 'mongodb+srv://' in uri:
                 # Split the URI into parts
                 prefix = 'mongodb+srv://'
                 rest = uri.replace(prefix, '')
-                
+
                 # Find the position of the last @ before the hostname
                 last_at = rest.rindex('@')
-                
+
                 # Split credentials and host info
                 credentials = rest[:last_at]
                 host_part = rest[last_at + 1:]
-                
+
                 # Find username and password
                 username_end = credentials.find(':')
                 username = credentials[:username_end]
                 password = credentials[username_end + 1:]
-                
+
                 # Reconstruct URI with escaped characters
                 self.uri = f"{prefix}{quote_plus(username)}:{quote_plus(password)}@{host_part}"
             else:
                 self.uri = uri
-                
+
             # Initialize MongoDB connection
             self.client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
             self.client.admin.command('ping')
             self.db = self.client[os.getenv('MONGODB_DB_NAME', 'jarvis_db')]
             self._setup_collections()
             print("[DB] SUCCESS - Connected to MongoDB")
-            
+
         except Exception as e:
             self._error = str(e)
-            print(f"[DB] ERROR: Failed to connect to MongoDB: {str(e)[:100]}")
+            print(f"[DB] ERROR: Failed to connect to MongoDB: {str(e)[:200]}")
             print(f"[DB] Make sure MongoDB is running locally or set MONGODB_URI to your Atlas cluster")
-            raise
+            # cleanup partial state
+            self.client = None
+            self.db = None
+            if raise_on_fail:
+                raise
             
     def _setup_collections(self):
         """Setup collections with proper indexes and schemas"""
@@ -134,6 +152,43 @@ class Database:
             IndexModel([("commit_hash", ASCENDING)]),
             IndexModel([("status", ASCENDING)])
         ])
+        # end _setup_collections
+
+    def _start_reconnect_thread(self):
+        """Start background thread to attempt reconnection if not already running."""
+        with self._reconnect_lock:
+            if getattr(self, '_reconnect_thread', None) and self._reconnect_thread.is_alive():
+                return
+            self._stop_reconnect = False
+            t = threading.Thread(target=self._reconnect_loop, daemon=True)
+            self._reconnect_thread = t
+            t.start()
+
+    def _reconnect_loop(self):
+        """Background loop that periodically attempts to connect to MongoDB."""
+        attempt = 0
+        while not self._stop_reconnect and (self.client is None):
+            try:
+                attempt += 1
+                print(f"[DB] Reconnect attempt {attempt}...")
+                self._connect(raise_on_fail=False)
+                if self.client:
+                    print("[DB] Reconnected to MongoDB")
+                    break
+            except Exception:
+                pass
+            # backoff with cap
+            sleep_sec = min(10 + attempt * 5, 60)
+            time.sleep(sleep_sec)
+
+    def stop_reconnect(self):
+        """Stop the reconnect background thread (used in shutdown/tests)."""
+        self._stop_reconnect = True
+        try:
+            if self._reconnect_thread:
+                self._reconnect_thread.join(timeout=1)
+        except Exception:
+            pass
     
     def save_chat(self, user_input, bot_response, session_id=None, intent=None, context=None):
         """
