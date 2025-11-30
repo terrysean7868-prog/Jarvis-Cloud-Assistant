@@ -1,6 +1,6 @@
 # ===============================================
 # JARVIS Cloud Assistant - All Dependencies
-# Consolidated from requirements-core.txt, requirements-extras.txt, requirements-light.txt
+# Consolidated from requirements.txt
 # ===============================================
 
 # Web Framework and API
