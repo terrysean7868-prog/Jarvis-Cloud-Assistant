@@ -14,12 +14,20 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 try:
-    import pyautogui
     import psutil
-    PYAUTOGUI_AVAILABLE = True
+    PSUTIL_AVAILABLE = True
 except ImportError:
-    PYAUTOGUI_AVAILABLE = False
-    logger.warning("pyautogui or psutil not available")
+    PSUTIL_AVAILABLE = False
+    logger.warning("psutil not available")
+
+# pyautogui will be imported lazily to avoid DISPLAY requirement on headless servers
+PYAUTOGUI_AVAILABLE = False
+try:
+    import pyautogui
+    PYAUTOGUI_AVAILABLE = True
+except (ImportError, KeyError, Exception):
+    # KeyError happens on headless systems (no DISPLAY env var)
+    logger.warning("pyautogui not available (likely running on headless system)")
 
 try:
     import win32gui
@@ -38,7 +46,7 @@ class SystemOperations:
     def get_system_info() -> Dict[str, Any]:
         """Get current system information"""
         try:
-            if not PYAUTOGUI_AVAILABLE:
+            if not PSUTIL_AVAILABLE:
                 return {"status": "error", "message": "psutil not available"}
             
             return {
@@ -57,7 +65,7 @@ class SystemOperations:
     def list_processes(filter_name: Optional[str] = None) -> Dict[str, Any]:
         """List running processes"""
         try:
-            if not PYAUTOGUI_AVAILABLE:
+            if not PSUTIL_AVAILABLE:
                 return {"status": "error", "message": "psutil not available"}
             
             processes = []
@@ -86,7 +94,7 @@ class SystemOperations:
     def kill_process(process_name: str) -> Dict[str, Any]:
         """Kill a process by name"""
         try:
-            if not PYAUTOGUI_AVAILABLE:
+            if not PSUTIL_AVAILABLE:
                 return {"status": "error", "message": "psutil not available"}
             
             killed = []
