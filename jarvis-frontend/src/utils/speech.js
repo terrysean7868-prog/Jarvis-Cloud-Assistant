@@ -55,9 +55,9 @@ export async function listenOnce(options = {}) {
     recognition.continuous = continuous;
     recognition.interimResults = interim;
     recognition.maxAlternatives = maxAlternatives;
-    
-    // Better recognition settings
-    recognition.grammars = null; // Use default grammar for better accuracy
+
+    // Do not set recognition.grammars here.
+    // Some browsers throw when assigning a non-SpeechGrammarList value.
     
     let timeoutId = null;
     let finalTranscript = "";

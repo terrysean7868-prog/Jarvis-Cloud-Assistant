@@ -3,6 +3,7 @@ import asyncio
 import os
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Any
 
 from src.utils.db import db
@@ -44,6 +45,67 @@ class JarvisBrain:
         # Safety toggle: require manual approval before any automated code change
         self.require_manual_approval = os.getenv("REQUIRE_MANUAL_APPROVAL", "true").lower() == "true"
 
+        # Filesystem sandboxing
+        self.project_root = Path(__file__).resolve().parents[2]
+        # Default allowlist: keep self-modifying actions inside the repo only.
+        # You can override with JARVIS_ALLOWED_PATHS (comma-separated, relative to project root).
+        allowed = os.getenv("JARVIS_ALLOWED_PATHS", "src,modules,jarvis-frontend/src,docs,data").strip()
+        self.allowed_roots = []
+        for rel in [p.strip() for p in allowed.split(",") if p.strip()]:
+            self.allowed_roots.append((self.project_root / rel).resolve())
+
+        # Blocklist for sensitive files/dirs even if under allowed roots
+        self.blocked_names = {
+            ".env",
+            ".env.example",
+            "id_rsa",
+            "id_rsa.pub",
+        }
+        self.blocked_dirnames = {
+            ".git",
+            "venv",
+            "__pycache__",
+            ".pytest_cache",
+            "node_modules",
+        }
+
+    def is_path_allowed(self, path: str) -> bool:
+        """Return True if the given path is inside the allowed sandbox.
+
+        This is used by the action executor to prevent arbitrary file access.
+        """
+        try:
+            if not path:
+                return False
+
+            p = Path(path)
+            if not p.is_absolute():
+                p = (self.project_root / p)
+            rp = p.resolve()
+
+            # Must be inside project root at all
+            try:
+                rp.relative_to(self.project_root)
+            except Exception:
+                return False
+
+            # Block sensitive names / directories
+            if rp.name in self.blocked_names:
+                return False
+            if any(part in self.blocked_dirnames for part in rp.parts):
+                return False
+
+            # Must be inside one of the allowed roots
+            for root in self.allowed_roots:
+                try:
+                    rp.relative_to(root)
+                    return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
     # -------------------------
     # MCP helpers (non-breaking)
     # -------------------------
@@ -76,6 +138,25 @@ class JarvisBrain:
     # -------------------------
     # Self-learning utilities
     # -------------------------
+    def _redact_for_storage(self, text: str) -> str:
+        """Best-effort secret redaction before saving to DB."""
+        try:
+            if not text:
+                return text
+            import re
+
+            out = text
+
+            # Common API key patterns / env dumps
+            out = re.sub(r"sk-[A-Za-z0-9]{20,}", "[REDACTED_API_KEY]", out)
+            out = re.sub(r"(?i)(OPENAI_API_KEY|PRIMARY_API_KEY|JARVIS_JWT_SECRET|MONGODB_URI)\s*[:=]\s*[^\s\n\r]+", r"\1=[REDACTED]", out)
+
+            # Bearer tokens
+            out = re.sub(r"(?i)Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*", "Bearer [REDACTED]", out)
+            return out
+        except Exception:
+            return text
+
     def save_interaction_for_learning(self, user_text: str, assistant_text: str, actions: List[Dict]=None):
         """
         Add a curated example to the learning buffer.
@@ -104,6 +185,20 @@ class JarvisBrain:
             }
 
             self.learning_buffer.append(example)
+
+            # Persist to DB (opt-out via env)
+            if os.getenv("JARVIS_LEARNING_ENABLED", "true").lower() in ("1", "true", "yes", "y"):
+                try:
+                    db.save_learning_example(
+                        user_id=self.user_id,
+                        prompt=self._redact_for_storage(prompt),
+                        completion=self._redact_for_storage(completion),
+                        meta=example.get("meta", {}),
+                        tags=[],
+                    )
+                except Exception as e:
+                    # Non-fatal
+                    db.save_system_event("learn_persist_error", str(e), "warning")
 
             # Keep buffer bounded in memory
             max_buf = int(os.getenv("LEARNING_BUFFER_MAX", "2000"))
@@ -237,7 +332,62 @@ class JarvisBrain:
     async def handle_message(self, text: str, mode="chat", user_id=None):
         """Main conversational + action reasoning pipeline."""
         session_id = user_id or self.user_id
+        # Keep brain identity aligned with the caller for learning/persistence.
+        self.user_id = session_id
         context = "\n".join([f"{m['role']}: {m['text']}" for m in self.memory[-6:]])
+
+        # RAG-lite: pull a few relevant past examples from DB and inject as additional context
+        try:
+            if os.getenv("JARVIS_LEARNING_RETRIEVE", "true").lower() in ("1", "true", "yes", "y"):
+                k = int(os.getenv("JARVIS_LEARNING_RETRIEVAL_K", "3"))
+                k = max(0, min(k, 8))
+                if k:
+                    hits = db.search_learning_examples(text, user_id=session_id, limit=k)
+                    if hits:
+                        max_chars = int(os.getenv("JARVIS_LEARNING_MAX_CONTEXT_CHARS", "1200"))
+                        parts = []
+                        for h in hits:
+                            p = (h.get("prompt") or "").strip()
+                            c = (h.get("completion") or "").strip()
+                            if not p or not c:
+                                continue
+                            parts.append(f"User: {p}\nAssistant: {c}")
+                        learned_block = "\n---\n".join(parts)
+                        learned_block = learned_block[:max_chars]
+                        if learned_block:
+                            context = (context + "\n\n" if context else "") + "Learned examples (use as guidance, not verbatim):\n" + learned_block
+        except Exception:
+            # Never block replies on retrieval issues
+            pass
+
+        # Web knowledge: inject a few relevant internet-fetched summaries (stored in DB)
+        try:
+            if os.getenv("JARVIS_WEB_KNOWLEDGE_CONTEXT", "true").lower() in ("1", "true", "yes", "y"):
+                k = int(os.getenv("JARVIS_WEB_KNOWLEDGE_K", "3"))
+                k = max(0, min(k, 6))
+                if k:
+                    items = db.search_web_training(text, limit=k)
+                    if items:
+                        max_chars = int(os.getenv("JARVIS_WEB_KNOWLEDGE_MAX_CHARS", "1200"))
+                        chunks = []
+                        for it in items:
+                            title = (it.get("title") or "").strip()
+                            url = (it.get("url") or "").strip()
+                            snippet = (it.get("snippet") or "").strip()
+                            summary = (it.get("summary") or "").strip()
+                            body = summary or snippet
+                            if not body:
+                                continue
+                            header = title if title else (it.get("topic") or "").strip()
+                            if url:
+                                chunks.append(f"- {header}\n  {body}\n  Source: {url}")
+                            else:
+                                chunks.append(f"- {header}\n  {body}")
+                        web_block = "\n".join(chunks)[:max_chars]
+                        if web_block:
+                            context = (context + "\n\n" if context else "") + "Recent web knowledge (summaries; verify if critical):\n" + web_block
+        except Exception:
+            pass
 
         try:
             # Detect self-updates
@@ -267,6 +417,14 @@ class JarvisBrain:
 
             for action in actions:
                 if action.get("type") == "mcp_tool":
+                    # Cloud deployments must not perform server-side tool execution.
+                    if os.getenv("JARVIS_CLOUD_MODE", "false").lower() in ("1", "true", "yes", "y"):
+                        tool_results.append({
+                            "tool": action.get("tool"),
+                            "args": action.get("args", {}),
+                            "result": "[MCP] Disabled in cloud mode."
+                        })
+                        continue
                     tool_name = action.get("tool")
                     args = action.get("args", {})
 

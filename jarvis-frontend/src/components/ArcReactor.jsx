@@ -35,12 +35,24 @@ export default function ArcReactor({
 
     async function initMic() {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: false,
-        });
+        // Mobile-friendly audio constraints
+        const audioConstraints = {
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: { ideal: 16000 }
+          },
+          video: false
+        };
+        
+        const stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
         micStreamRef.current = stream;
-        audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        
+        // Use webkitAudioContext for Safari compatibility
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        audioCtxRef.current = new AudioContext();
+        
         const source = audioCtxRef.current.createMediaStreamSource(stream);
         const analyser = audioCtxRef.current.createAnalyser();
         analyser.fftSize = 256;

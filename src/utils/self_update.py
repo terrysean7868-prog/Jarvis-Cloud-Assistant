@@ -13,7 +13,6 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
-from openai import OpenAI
 from src.utils.git_sync import git_sync
 from src.config.config import Config
 
@@ -26,6 +25,10 @@ def get_openai_client():
     """Get or create OpenAI client (lazy-loaded)."""
     global _client
     if _client is None:
+        try:
+            from openai import OpenAI
+        except Exception as e:
+            raise RuntimeError(f"OpenAI SDK not available: {e}")
         api_key = os.getenv("OPENAI_API_KEY") or os.getenv("PRIMARY_API_KEY")
         if not api_key:
             raise RuntimeError("OpenAI API key not found in OPENAI_API_KEY or PRIMARY_API_KEY")

@@ -1,6 +1,6 @@
 // src/utils/api.js
-const API_URL = process.env.REACT_APP_API_URL ||
-  (process.env.NODE_ENV === 'development' ? "http://localhost:8000" : "https://jarvis-cloud-assistant.onrender.com");
+export const API_URL = process.env.REACT_APP_API_URL ||
+  (process.env.NODE_ENV === 'development' ? "http://localhost:18001" : "https://jarvis-cloud-assistant.onrender.com");
 
 const DEFAULT_TIMEOUT = parseInt(process.env.REACT_APP_API_TIMEOUT_MS || "20000", 10); // 20s
 

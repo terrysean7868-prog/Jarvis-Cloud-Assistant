@@ -61,19 +61,26 @@ class JobScheduler:
 
     def register_default_jobs(self):
         """Register all default background jobs"""
-        # GitHub auto-sync every 5 minutes
-        self.add_job(
-            auto_sync_github,
-            interval_seconds=300,
-            job_id="github_sync"
-        )
+        enable_git_sync = os.getenv("JARVIS_AUTO_GIT_SYNC", "false").lower() in ("1", "true", "yes", "y")
+        enable_db_maintenance = os.getenv("JARVIS_ENABLE_DB_MAINTENANCE", "true").lower() in ("1", "true", "yes", "y")
+        enable_web_training = os.getenv("JARVIS_ENABLE_WEB_TRAINING_JOB", "true").lower() in ("1", "true", "yes", "y")
+        enable_memory_optimization = os.getenv("JARVIS_ENABLE_MEMORY_OPTIMIZATION", "false").lower() in ("1", "true", "yes", "y")
+
+        # GitHub auto-sync every 5 minutes (off by default for hosted deploys)
+        if enable_git_sync:
+            self.add_job(
+                auto_sync_github,
+                interval_seconds=300,
+                job_id="github_sync"
+            )
 
         # Database cleanup every hour
-        self.add_job(
-            cleanup_database,
-            interval_seconds=3600,
-            job_id="db_cleanup"
-        )
+        if enable_db_maintenance:
+            self.add_job(
+                cleanup_database,
+                interval_seconds=3600,
+                job_id="db_cleanup"
+            )
 
         # Fetch training data every 24 hours
         self.add_job(
@@ -83,18 +90,29 @@ class JobScheduler:
         )
         
         # Fetch web training data every 12 hours
-        self.add_job(
-            fetch_web_training_data,
-            interval_seconds=43200,
-            job_id="web_training_fetch"
-        )
+        if enable_web_training:
+            self.add_job(
+                fetch_web_training_data,
+                interval_seconds=43200,
+                job_id="web_training_fetch"
+            )
 
-        # Memory optimization every 6 hours
-        self.add_job(
-            optimize_memory,
-            interval_seconds=21600,
-            job_id="memory_optimization"
-        )
+        # Memory optimization every 6 hours (off by default; can be expensive)
+        if enable_memory_optimization:
+            self.add_job(
+                optimize_memory,
+                interval_seconds=21600,
+                job_id="memory_optimization"
+            )
+
+
+def _db_available() -> bool:
+    """Best-effort check for MongoDB availability."""
+    try:
+        db._ensure_connected()
+    except Exception:
+        return False
+    return getattr(db, "db", None) is not None
 
 
 # ===== Default Background Jobs =====
@@ -106,26 +124,32 @@ def auto_sync_github():
         git_sync(repo_path=".")
         
         # Log the sync event
-        db.save_system_event(
-            event_type='auto_sync_github',
-            description='Automatic GitHub sync completed',
-            status='success',
-            details={'timestamp': datetime.utcnow().isoformat()}
-        )
+        if _db_available():
+            db.save_system_event(
+                event_type='auto_sync_github',
+                description='Automatic GitHub sync completed',
+                status='success',
+                details={'timestamp': datetime.utcnow().isoformat()}
+            )
         print("✅ [AUTO-SYNC] GitHub sync completed")
     except Exception as e:
         print(f"❌ [AUTO-SYNC] GitHub sync failed: {e}")
-        db.save_system_event(
-            event_type='auto_sync_error',
-            description=f'GitHub auto-sync failed: {str(e)}',
-            status='error'
-        )
+        if _db_available():
+            db.save_system_event(
+                event_type='auto_sync_error',
+                description=f'GitHub auto-sync failed: {str(e)}',
+                status='error'
+            )
 
 
 def cleanup_database():
     """Clean up old data from MongoDB"""
     try:
         print(f"\n🧹 [CLEANUP] Starting database cleanup at {datetime.utcnow().isoformat()}")
+
+        if not _db_available():
+            print("⚠️  [CLEANUP] MongoDB not connected; skipping")
+            return
         
         # Remove conversations older than 30 days
         cutoff_date = datetime.utcnow() - timedelta(days=30)
@@ -150,11 +174,12 @@ def cleanup_database():
         )
     except Exception as e:
         print(f"❌ [CLEANUP] Database cleanup failed: {e}")
-        db.save_system_event(
-            event_type='cleanup_error',
-            description=f'Database cleanup failed: {str(e)}',
-            status='error'
-        )
+        if _db_available():
+            db.save_system_event(
+                event_type='cleanup_error',
+                description=f'Database cleanup failed: {str(e)}',
+                status='error'
+            )
 
 
 def update_training_data():
@@ -168,26 +193,32 @@ def update_training_data():
         # Here you can add web scraping logic to fetch training data
         # For now, we'll just log the update
         
-        db.save_system_event(
-            event_type='training_data_update',
-            description='Periodic training data update completed',
-            status='success',
-            details={'timestamp': datetime.utcnow().isoformat()}
-        )
+        if _db_available():
+            db.save_system_event(
+                event_type='training_data_update',
+                description='Periodic training data update completed',
+                status='success',
+                details={'timestamp': datetime.utcnow().isoformat()}
+            )
         print("✅ [TRAINING] Training data update completed")
     except Exception as e:
         print(f"❌ [TRAINING] Training data update failed: {e}")
-        db.save_system_event(
-            event_type='training_update_error',
-            description=f'Training data update failed: {str(e)}',
-            status='error'
-        )
+        if _db_available():
+            db.save_system_event(
+                event_type='training_update_error',
+                description=f'Training data update failed: {str(e)}',
+                status='error'
+            )
 
 
 def optimize_memory():
     """Optimize memory and database indexes"""
     try:
         print(f"\n⚡ [OPTIMIZE] Starting memory optimization at {datetime.utcnow().isoformat()}")
+
+        if not _db_available():
+            print("⚠️  [OPTIMIZE] MongoDB not connected; skipping")
+            return
         
         # Rebuild indexes for faster queries
         db.db['conversations'].reindex()
@@ -233,11 +264,12 @@ def fetch_web_training_data():
         
         print("✅ [WEB-TRAINING] Web training data fetch completed")
         
-        db.save_system_event(
-            event_type='web_training_fetch',
-            description='Fetched latest training data from web',
-            status='success'
-        )
+        if _db_available():
+            db.save_system_event(
+                event_type='web_training_fetch',
+                description='Fetched latest training data from web',
+                status='success'
+            )
     except Exception as e:
         print(f"❌ [WEB-TRAINING] Web training data fetch failed: {e}")
 
@@ -245,9 +277,18 @@ def fetch_web_training_data():
 async def _fetch_training_data_async(topics):
     """Helper function to async fetch training data"""
     try:
-        from internet import get_internet
+        from src.internet.internet import get_internet
         
         internet = await get_internet()
+
+        # Ensure DB connection (best-effort)
+        try:
+            db._ensure_connected()
+        except Exception:
+            pass
+        if getattr(db, "db", None) is None:
+            print("  ⚠️ MongoDB not connected; skipping web training data store")
+            return
         
         for topic in topics:
             try:
@@ -256,15 +297,18 @@ async def _fetch_training_data_async(topics):
                 
                 # Store in database
                 for result in results:
-                    db.db['web_training_data'].insert_one({
-                        'topic': topic,
-                        'title': result.get('title'),
-                        'snippet': result.get('snippet'),
-                        'summary': result.get('content_summary'),
-                        'url': result.get('url'),
-                        'fetched_at': datetime.utcnow(),
-                        'source': 'web'
-                    })
+                    try:
+                        db.save_web_training_item(
+                            topic=topic,
+                            title=result.get('title'),
+                            snippet=result.get('snippet'),
+                            summary=(result.get('content_summary') or result.get('summary')),
+                            url=result.get('url'),
+                            source='web',
+                        )
+                    except Exception:
+                        # Ignore per-item failures
+                        pass
                 
                 print(f"  ✓ Fetched training data for: {topic}")
             except Exception as e:

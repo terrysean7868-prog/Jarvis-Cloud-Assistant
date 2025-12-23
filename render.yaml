@@ -4,10 +4,31 @@ services:
     name: jarvis-cloud-assistant
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:$PORT"
+    buildCommand: "bash .render-build.sh"
+    # Use a single worker: the DeviceHub is in-memory (no Redis broker).
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
     envVars:
-      - key: PORT
-        value: 8000
+      - key: JARVIS_CLOUD_MODE
+        value: "true"
+      - key: JARVIS_DEFAULT_DEVICE_ID
+        value: "primary"
+      - key: JARVIS_DEVICE_OWNER_USERNAME
+        value: ""
+      - key: JARVIS_AGENT_SHARED_SECRET
+        generateValue: true
+      - key: JARVIS_JWT_SECRET
+        generateValue: true
+      - key: REQUIRE_MANUAL_APPROVAL
+        value: "true"
+      - key: JARVIS_AUTO_GIT_SYNC
+        value: "false"
+      - key: JARVIS_ENABLE_SCHEDULER
+        value: "true"
+      - key: JARVIS_ENABLE_DB_MAINTENANCE
+        value: "true"
+      - key: JARVIS_ENABLE_WEB_TRAINING_JOB
+        value: "true"
+      - key: JARVIS_ENABLE_MEMORY_OPTIMIZATION
+        value: "false"
       - key: MONGODB_URI
         value: ""

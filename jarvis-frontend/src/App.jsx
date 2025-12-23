@@ -1,7 +1,7 @@
 // src/App.jsx
 import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from "react";
 import { listenOnce, speak, initAudioProcessing } from "./utils/speech";
-import { sendMessage } from "./utils/api";
+import { sendMessage, API_URL } from "./utils/api";
 import "./styles/jarvis.css";
 
 // Lazy-load heavy UI pieces
@@ -25,6 +25,8 @@ export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionId, setSessionId] = useState(null);
   const [username, setUsername] = useState(null);
+  const [role, setRole] = useState(null);
+  const [permissions, setPermissions] = useState(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
 
   // refs
@@ -354,21 +356,27 @@ export default function App() {
   }, [emotion, wakePulse, transformState, volume]);
 
   // Authentication helpers (unchanged, stable)
-  const handleAuthSuccess = useCallback((newSessionId, newUsername) => {
+  const handleAuthSuccess = useCallback((newSessionId, newUsername, newRole, newPermissions) => {
     setSessionId(newSessionId);
     setUsername(newUsername);
+    setRole(newRole || null);
+    setPermissions(newPermissions || null);
     setIsAuthenticated(true);
     setShowAuthModal(false);
     localStorage.setItem("jarvis_session", newSessionId);
     localStorage.setItem("jarvis_username", newUsername);
-    addLog("system", `Authenticated as ${newUsername}`);
+    if (newRole) localStorage.setItem("jarvis_role", newRole);
+    if (newPermissions) localStorage.setItem("jarvis_permissions", JSON.stringify(newPermissions));
+    addLog("system", `Authenticated as ${newUsername}${newRole ? ` (${newRole})` : ""}`);
   }, [addLog]);
 
   useEffect(() => {
     const storedSession = localStorage.getItem("jarvis_session");
     const storedUsername = localStorage.getItem("jarvis_username");
+    const storedRole = localStorage.getItem("jarvis_role");
+    const storedPermissionsRaw = localStorage.getItem("jarvis_permissions");
     if (storedSession && storedUsername) {
-      fetch(`${process.env.REACT_APP_API_URL || "http://localhost:8000"}/api/validate-session`, {
+      fetch(`${API_URL}/api/validate-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: storedSession })
@@ -378,10 +386,18 @@ export default function App() {
           if (data.valid) {
             setSessionId(storedSession);
             setUsername(storedUsername);
+            setRole(data.role || storedRole || null);
+            try {
+              setPermissions(data.permissions || (storedPermissionsRaw ? JSON.parse(storedPermissionsRaw) : null));
+            } catch {
+              setPermissions(data.permissions || null);
+            }
             setIsAuthenticated(true);
           } else {
             localStorage.removeItem("jarvis_session");
             localStorage.removeItem("jarvis_username");
+            localStorage.removeItem("jarvis_role");
+            localStorage.removeItem("jarvis_permissions");
             setShowAuthModal(true);
           }
         })
@@ -413,13 +429,19 @@ export default function App() {
         <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ width: 8, height: 8, borderRadius: 8, background: "#00ffc8", boxShadow: "0 0 10px rgba(0,255,200,0.6)" }} />
-            <span style={{ color: "#00ffc8", fontSize: 14 }}>{username}</span>
+            <span style={{ color: "#00ffc8", fontSize: 14 }}>
+              {username}{role ? ` (${role})` : ""}
+            </span>
             <button onClick={() => {
               localStorage.removeItem("jarvis_session");
               localStorage.removeItem("jarvis_username");
+              localStorage.removeItem("jarvis_role");
+              localStorage.removeItem("jarvis_permissions");
               setIsAuthenticated(false);
               setSessionId(null);
               setUsername(null);
+              setRole(null);
+              setPermissions(null);
               setShowAuthModal(true);
               speak("Logged out successfully.");
             }} style={{ background: "transparent", border: "none", color: "#ff5050", cursor: "pointer" }}>Logout</button>

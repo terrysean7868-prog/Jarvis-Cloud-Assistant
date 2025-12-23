@@ -14,11 +14,33 @@ from src.utils.email_generator import email_generator
 from src.utils.app_manager import app_manager
 from src.utils.task_manager import task_manager
 from src.utils.error_handler import error_handler
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from googletrans import Translator
+
+# Optional dependencies (avoid hard failures on cloud builds)
+SELENIUM_AVAILABLE = False
+webdriver = None
+By = None
+Service = None
+Options = None
+try:
+    from selenium import webdriver  # type: ignore
+    from selenium.webdriver.common.by import By  # type: ignore
+    from selenium.webdriver.chrome.service import Service  # type: ignore
+    from selenium.webdriver.chrome.options import Options  # type: ignore
+    SELENIUM_AVAILABLE = True
+except Exception:
+    SELENIUM_AVAILABLE = False
+
+TRANSLATE_AVAILABLE = False
+Translator = None
+try:
+    from googletrans import Translator  # type: ignore
+    TRANSLATE_AVAILABLE = True
+except Exception:
+    TRANSLATE_AVAILABLE = False
+
+# Runtime mode
+CLOUD_MODE = os.getenv("JARVIS_CLOUD_MODE", "false").lower() in ("1", "true", "yes", "y")
+AUTO_GIT_SYNC = os.getenv("JARVIS_AUTO_GIT_SYNC", "false").lower() in ("1", "true", "yes", "y")
 
 # Optional: pyautogui for screen navigation (only on desktop with display)
 # Check for headless environment before importing
@@ -98,15 +120,8 @@ class ActionExecutor:
             'nytimes': 'https://www.nytimes.com',
         })
         self.browser = None
-        self.translator = Translator()
+        self.translator = Translator() if TRANSLATE_AVAILABLE and Translator else None
         self.default_language = "en"  # Default language is English
-        self.authenticated_users = {"admin": "password123"}  # Example credentials
-
-    def authenticate_user(self, username: str, password: str) -> bool:
-        """
-        Authenticates a user based on username and password.
-        """
-        return self.authenticated_users.get(username) == password
 
     async def process_actions(self, actions: List[dict], user: str = "user", password: str = "", language: str = "en"):
         """
@@ -120,9 +135,8 @@ class ActionExecutor:
             task_manager.stop_requested = False
             return [{"status": "stopped", "message": "Operation stopped by user"}]
 
-        # Authenticate user (if password provided)
-        if password and not self.authenticate_user(user, password):
-            return [{"status": "error", "message": "Authentication failed"}]
+        # NOTE: API auth should be enforced at the HTTP layer.
+        # The executor intentionally does not implement its own credential system.
 
         results = []
         changed_files = []
@@ -130,6 +144,22 @@ class ActionExecutor:
         for action in actions:
             action_type = action.get("type")
             path = os.path.normpath(action.get("path", "")) if action.get("path") else None
+
+            # Cloud deployments must never execute local/PC control, file writes, or self-modifying actions.
+            if CLOUD_MODE:
+                if action_type in {
+                    "write", "edit", "delete", "move",
+                    "execute_command",
+                    "open_app", "close_app", "switch_app",
+                    "capture_screen", "screen_navigation",
+                    "self_update", "self_add",
+                }:
+                    results.append({
+                        "status": "forbidden",
+                        "action_type": action_type,
+                        "message": "Action disabled in cloud mode"
+                    })
+                    continue
 
             # Handle internet search actions
             if action_type == "web_search":
@@ -171,6 +201,13 @@ class ActionExecutor:
 
             # Handle self-update actions
             if action_type == "self_update":
+                if getattr(self.brain, "require_manual_approval", True):
+                    results.append({
+                        "status": "approval_required",
+                        "action_type": "self_update",
+                        "message": "Self-update requires manual approval (set REQUIRE_MANUAL_APPROVAL=false to allow)."
+                    })
+                    continue
                 description = action.get("description", "")
                 file_path = action.get("file_path", "")
                 if description and file_path:
@@ -182,6 +219,13 @@ class ActionExecutor:
 
             # Handle self-add actions
             if action_type == "self_add":
+                if getattr(self.brain, "require_manual_approval", True):
+                    results.append({
+                        "status": "approval_required",
+                        "action_type": "self_add",
+                        "message": "Self-add requires manual approval (set REQUIRE_MANUAL_APPROVAL=false to allow)."
+                    })
+                    continue
                 description = action.get("description", "")
                 feature_type = action.get("feature_type", "module")
                 result = self_add_feature(description, feature_type)
@@ -273,9 +317,13 @@ class ActionExecutor:
                 continue
 
             # File operations (existing code)
-            if not path or not self.brain.is_path_allowed(path):
-                results.append({"status": "forbidden", "action": action})
-                continue
+            # For file actions, enforce sandbox.
+            if action_type in ("read", "list", "mkdir", "write", "edit", "delete", "move", "copy", "cleanup"):
+                # cleanup has no path
+                if action_type != "cleanup":
+                    if not path or not self.brain.is_path_allowed(path):
+                        results.append({"status": "forbidden", "action": action})
+                        continue
 
             try:
                 if action_type in ("write", "edit"):
@@ -291,6 +339,42 @@ class ActionExecutor:
                         "status": "edited" if file_existed else "written",
                         "path": path
                     })
+
+                elif action_type == "read":
+                    if not os.path.exists(path) or not os.path.isfile(path):
+                        results.append({"status": "not_found", "path": path})
+                    else:
+                        with open(path, "r", encoding="utf-8") as f:
+                            results.append({"status": "success", "path": path, "content": f.read()})
+
+                elif action_type == "list":
+                    if not os.path.exists(path) or not os.path.isdir(path):
+                        results.append({"status": "not_found", "path": path})
+                    else:
+                        items = []
+                        for name in os.listdir(path):
+                            full = os.path.join(path, name)
+                            items.append({"name": name, "type": "directory" if os.path.isdir(full) else "file"})
+                        results.append({"status": "success", "path": path, "items": items})
+
+                elif action_type == "mkdir":
+                    os.makedirs(path, exist_ok=True)
+                    changed_files.append(path)
+                    results.append({"status": "success", "path": path})
+
+                elif action_type == "copy":
+                    src = os.path.normpath(action.get("source", ""))
+                    dest = os.path.normpath(action.get("destination", ""))
+                    if not src or not dest:
+                        results.append({"status": "error", "message": "source and destination required", "action": action})
+                        continue
+                    if not self.brain.is_path_allowed(src) or not self.brain.is_path_allowed(dest):
+                        results.append({"status": "forbidden", "action": action})
+                        continue
+                    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+                    shutil.copy2(src, dest)
+                    changed_files.append(dest)
+                    results.append({"status": "copied", "from": src, "to": dest})
 
                 elif action_type == "delete":
                     if os.path.exists(path):
@@ -315,6 +399,19 @@ class ActionExecutor:
                     else:
                         results.append({"status": "source_not_found", "path": path})
 
+                elif action_type == "cleanup":
+                    # Lightweight cleanup of common cache folders inside repo
+                    deleted = 0
+                    for root, dirs, _files in os.walk("."):
+                        for cache_dir in ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"):
+                            if cache_dir in dirs:
+                                try:
+                                    shutil.rmtree(os.path.join(root, cache_dir))
+                                    deleted += 1
+                                except Exception:
+                                    pass
+                    results.append({"status": "success", "deleted": deleted})
+
                 else:
                     results.append({"status": "unknown_action", "action": action})
 
@@ -325,8 +422,8 @@ class ActionExecutor:
                     "action": action
                 })
 
-        # === Git sync after changes ===
-        if changed_files:
+        # === Git sync after changes (opt-in only, never in cloud) ===
+        if changed_files and AUTO_GIT_SYNC and (not CLOUD_MODE):
             try:
                 print(f"🧩 Applying auto-sync for {len(changed_files)} modified files...")
                 await asyncio.to_thread(

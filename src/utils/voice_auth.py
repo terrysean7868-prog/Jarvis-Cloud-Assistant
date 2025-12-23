@@ -37,6 +37,7 @@ SESSION_DURATION = timedelta(hours=8)  # sessions valid for 8 hours
 AUTH_USE_DB = os.getenv("AUTH_USE_DB", "true").lower() in ("1", "true", "yes")
 PENDING_QUEUE_FILE = PROJECT_ROOT / "data" / "auth_pending_queue.json"
 QUEUE_FLUSH_INTERVAL = int(os.getenv("AUTH_QUEUE_FLUSH_INTERVAL", "10"))  # seconds
+VOICE_HASH_PREFIX_MATCH = os.getenv("VOICE_HASH_PREFIX_MATCH", "false").lower() in ("1", "true", "yes")
 
 def _ensure_auth_file():
     if not AUTH_FILE.parent.exists():
@@ -78,10 +79,19 @@ class VoiceAuth:
                         self.auth_data["users"][uname] = u
                 return
             except Exception:
-                # DB not available - treat as empty (do not fallback to local file)
-                logger.warning("AUTH_USE_DB enabled but MongoDB not available; starting with empty auth store")
-                self.auth_data = {"users": {}}
-                return
+                # DB not available - log and FALLBACK to local file so auth still works
+                logger.warning("AUTH_USE_DB enabled but MongoDB not available; falling back to local auth file")
+                # try to load local file as a fallback so previously-registered users remain available
+                try:
+                    with open(AUTH_FILE, "r", encoding="utf-8") as fh:
+                        self.auth_data = json.load(fh)
+                    if "users" not in self.auth_data:
+                        self.auth_data["users"] = {}
+                    return
+                except Exception:
+                    logger.exception("Failed to load fallback local auth file; starting with empty auth store")
+                    self.auth_data = {"users": {}}
+                    return
 
         # Fallback behavior: read local file (when AUTH_USE_DB is disabled)
         try:
@@ -107,9 +117,16 @@ class VoiceAuth:
                     users_col.update_one({"username": uname}, {"$set": doc}, upsert=True)
                 return
             except Exception as e:
-                # DB not available - log and raise so caller can handle (avoid silent local save)
-                logger.exception("Failed to persist auth data to MongoDB: %s", e)
-                raise
+                # DB not available - log and FALLBACK to local file so auth updates aren't lost
+                logger.exception("Failed to persist auth data to MongoDB: %s; falling back to local file", e)
+                try:
+                    with open(AUTH_FILE, "w", encoding="utf-8") as fh:
+                        json.dump(self.auth_data, fh, indent=2)
+                    return
+                except Exception:
+                    logger.exception("Failed to persist auth data to local file after DB failure")
+                    # raise original exception to notify caller if desired
+                    raise
 
         # If DB is not primary, save to local file
         try:
@@ -180,14 +197,18 @@ class VoiceAuth:
     def _compare_voice_hashes(self, stored_hash: str, provided_hash: str, threshold: float = 0.9) -> bool:
         """
         Compare stored and provided voice hash. This is a placeholder for
-        a real voice biometric comparison. For now use exact match or prefix match.
+        a real voice biometric comparison.
+
+        Default: exact match only.
+        Optional: prefix match can be enabled for legacy behavior via VOICE_HASH_PREFIX_MATCH=true.
         """
         if not stored_hash or not provided_hash:
             return False
         if stored_hash == provided_hash:
             return True
-        # allow small differences: check prefix equality
-        return stored_hash.startswith(provided_hash) or provided_hash.startswith(stored_hash)
+        if VOICE_HASH_PREFIX_MATCH:
+            return stored_hash.startswith(provided_hash) or provided_hash.startswith(stored_hash)
+        return False
 
     def authenticate_by_voice(self, username: str, voice_sample_hash: str, password: Optional[str]=None) -> Tuple[bool, str]:
         """
@@ -248,6 +269,105 @@ class VoiceAuth:
 
     def get_user(self, username: str) -> Optional[dict]:
         return self.auth_data.get("users", {}).get((username or "").lower())
+
+    def get_role(self, username: str) -> str:
+        u = self.get_user(username) or {}
+        r = (u.get("role") or "user").strip().lower()
+        return r if r in ("user", "admin") else "user"
+
+    def update_user(self, username: str, new_username: Optional[str] = None, new_role: Optional[str] = None) -> dict:
+        """Update an existing user's username and/or role.
+
+        Notes:
+        - For JWT sessions, existing tokens keep the old username/role until re-login.
+        - For local/dev in-memory sessions, we update active session username references.
+        """
+        old_uname = (username or "").strip().lower()
+        if not old_uname:
+            return {"status": "error", "message": "Username required"}
+
+        users = self.auth_data.setdefault("users", {})
+        if old_uname not in users:
+            return {"status": "error", "message": "User not found"}
+
+        target_uname = (new_username or "").strip().lower() if new_username else old_uname
+        if new_username:
+            if not target_uname:
+                return {"status": "error", "message": "New username required"}
+            if target_uname != old_uname and target_uname in users:
+                return {"status": "error", "message": "New username already exists"}
+
+        role = None
+        if new_role is not None:
+            role = (new_role or "").strip().lower()
+            if role not in ("user", "admin"):
+                return {"status": "error", "message": "Invalid role"}
+
+        # Update user record in memory
+        user_doc = dict(users[old_uname])
+        if role is not None:
+            user_doc["role"] = role
+        user_doc["updated_at"] = datetime.utcnow().isoformat()
+
+        # Rename key if needed
+        if target_uname != old_uname:
+            users.pop(old_uname, None)
+            users[target_uname] = user_doc
+
+            # Update in-memory sessions (legacy local sessions)
+            for sid, s in list(self.active_sessions.items()):
+                try:
+                    if (s.get("username") or "").lower() == old_uname:
+                        s["username"] = target_uname
+                except Exception:
+                    continue
+        else:
+            users[old_uname] = user_doc
+
+        # Persist
+        try:
+            if AUTH_USE_DB:
+                db._ensure_connected()
+                if db.db is not None:
+                    col = db.db.auth_users
+                    col.create_index([("username", 1)], unique=True)
+                    # If username changed, create new doc then delete old.
+                    if target_uname != old_uname:
+                        new_doc = dict(user_doc)
+                        new_doc["username"] = target_uname
+                        col.update_one({"username": target_uname}, {"$set": new_doc}, upsert=True)
+                        col.delete_one({"username": old_uname})
+                    else:
+                        col.update_one({"username": old_uname}, {"$set": user_doc}, upsert=True)
+
+                    return {
+                        "status": "success",
+                        "message": "User updated",
+                        "username": target_uname,
+                        "role": user_doc.get("role", "user"),
+                        "note": "Existing JWT sessions require re-login" if True else "",
+                    }
+
+                # DB configured but unavailable -> fallback to local file persistence
+                self._save()
+                return {
+                    "status": "success",
+                    "message": "User updated (local fallback)",
+                    "username": target_uname,
+                    "role": user_doc.get("role", "user"),
+                }
+
+            # Local file store
+            self._save()
+            return {
+                "status": "success",
+                "message": "User updated",
+                "username": target_uname,
+                "role": user_doc.get("role", "user"),
+            }
+        except Exception as e:
+            logger.exception("Failed to update user: %s", e)
+            return {"status": "error", "message": "Failed to persist user update"}
 
     def cleanup_expired_sessions(self):
         now = datetime.utcnow()

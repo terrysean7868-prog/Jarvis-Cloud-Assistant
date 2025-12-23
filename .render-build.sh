@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
-echo "🪶 Using lightweight dependencies for Render"
+echo "🪶 Installing dependencies"
 pip install --upgrade pip
-pip install -r requirements.txt
+if [ -f requirements.render.txt ]; then
+	echo "🪶 Using requirements.render.txt"
+	pip install -r requirements.render.txt
+else
+	pip install -r requirements.txt
+fi

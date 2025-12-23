@@ -209,10 +209,23 @@ This launches both backend and frontend in new windows!
 ### Render.com
 1. Push to GitHub
 2. Create Web Service on Render
-3. Set build command: `pip install -r requirements.txt && cd jarvis-frontend && npm install && npm run build`
+3. Set build command: `pip install -r requirements-cloud.txt`
 4. Set start command: `gunicorn -w 4 -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:$PORT`
-5. Add environment variables
+5. Add environment variables (minimum):
+   - `JARVIS_CLOUD_MODE=true`
+   - `OPENAI_API_KEY=...` (or `PRIMARY_API_KEY`)
+   - `MONGODB_URI=...` (if using MongoDB)
 6. Deploy!
+
+#### Important (Cloud vs Desktop)
+
+When deployed to Render (cloud mode), Jarvis runs on a remote server. For safety, these features are disabled in cloud mode:
+- PC control (mouse/keyboard/apps/processes)
+- Local filesystem operations (read/write/delete)
+- Self-updating/self-modifying code
+
+Voice commands still work through the web UI (browser speech recognition) and are sent as text to `/api/chat`.
+To automate your personal PC “from anywhere”, you typically need a small local agent running on your PC that the cloud service can securely talk to.
 
 ## 💬 Usage Examples
 

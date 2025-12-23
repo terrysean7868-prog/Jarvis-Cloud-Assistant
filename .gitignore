@@ -29,5 +29,6 @@ voice.ogg
 voice.wav
 .DS_Store
 *.log
+*.err
 .env
 /node_modules

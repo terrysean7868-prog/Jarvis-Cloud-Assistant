@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 try:
     import pytesseract
     TESSERACT_AVAILABLE = True
-except ImportError:
+except Exception:
     TESSERACT_AVAILABLE = False
 
 # Screen navigation
