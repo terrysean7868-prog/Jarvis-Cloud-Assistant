@@ -99,7 +99,7 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
     }
 
     setIsRecording(true);
-    setStatus("Recording voice sample... Speak now.");
+    setStatus("Recording voice sample... Say the same short phrase you will use for both register and login.");
 
     try {
       const { analyser, mediaRecorder } = audioDataRef.current;
@@ -139,7 +139,7 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
                 const transcript = await transcriptPromise;
                 if (transcript && transcript.trim()) {
                   const hash = await createTextHash(transcript);
-                  resolve(hash);
+                  resolve({ voice_hash: hash, voice_text: transcript });
                   return;
                 }
               } catch (e) {
@@ -154,10 +154,10 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
                 const hashBuffer = await crypto.subtle.digest('SHA-256', data);
                 const hashArray = Array.from(new Uint8Array(hashBuffer));
                 const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                resolve(hash);
+                resolve({ voice_hash: hash, voice_text: null });
               } catch (err) {
                 console.error("Hash creation failed:", err);
-                resolve(btoa(combined).substring(0, 64));
+                resolve({ voice_hash: btoa(combined).substring(0, 64), voice_text: null });
               }
             })();
           }
@@ -179,10 +179,10 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
     }
 
     setError("");
-    setStatus("Recording voice sample...");
+    setStatus("Recording voice sample... Use the same phrase you used when registering.");
 
-    const voiceHash = await recordVoiceSample();
-    if (!voiceHash) {
+    const voiceSample = await recordVoiceSample();
+    if (!voiceSample || !voiceSample.voice_hash) {
       return;
     }
 
@@ -195,7 +195,8 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           username: username.trim(),
-          voice_sample_hash: voiceHash,
+          voice_sample_hash: voiceSample.voice_hash,
+          voice_sample_text: voiceSample.voice_text,
           action: mode,
           ...(role ? { role } : {})
         })
@@ -232,7 +233,7 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
         
         <div className="auth-header">
           <h2>{mode === "login" ? "Voice Login" : "Voice Registration"}</h2>
-          <p>Use your voice to authenticate</p>
+          <p>Tip: speak the same short phrase for both registration and login.</p>
         </div>
 
         <div className="auth-content">
@@ -257,7 +258,9 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
             ) : (
               <div className="mic-icon">🎤</div>
             )}
-            <p>{status || (mode === "login" ? "Click to login with your voice" : "Click to register your voice")}</p>
+            <p>
+              {status || (mode === "login" ? "Click to login with your voice (use the same phrase as registration)" : "Click to register your voice (pick a short phrase and reuse it for login)")}
+            </p>
           </div>
 
           {error && <div className="auth-error">{error}</div>}

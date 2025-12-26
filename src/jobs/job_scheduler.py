@@ -65,6 +65,7 @@ class JobScheduler:
         enable_db_maintenance = os.getenv("JARVIS_ENABLE_DB_MAINTENANCE", "true").lower() in ("1", "true", "yes", "y")
         enable_web_training = os.getenv("JARVIS_ENABLE_WEB_TRAINING_JOB", "true").lower() in ("1", "true", "yes", "y")
         enable_memory_optimization = os.getenv("JARVIS_ENABLE_MEMORY_OPTIMIZATION", "false").lower() in ("1", "true", "yes", "y")
+        enable_training_data_job = os.getenv("JARVIS_ENABLE_TRAINING_DATA_JOB", "false").lower() in ("1", "true", "yes", "y")
 
         # GitHub auto-sync every 5 minutes (off by default for hosted deploys)
         if enable_git_sync:
@@ -82,12 +83,13 @@ class JobScheduler:
                 job_id="db_cleanup"
             )
 
-        # Fetch training data every 24 hours
-        self.add_job(
-            update_training_data,
-            interval_seconds=86400,
-            job_id="training_data_update"
-        )
+        # Fetch training data every 24 hours (stub; off by default)
+        if enable_training_data_job:
+            self.add_job(
+                update_training_data,
+                interval_seconds=86400,
+                job_id="training_data_update"
+            )
         
         # Fetch web training data every 12 hours
         if enable_web_training:

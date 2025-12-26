@@ -612,6 +612,7 @@ class MessageIn(BaseModel):
 class VoiceAuthRequest(BaseModel):
     username: str
     voice_sample_hash: str | None = None
+    voice_sample_text: str | None = None
     password: str | None = None
     action: str  # "register" or "login"
     role: str | None = None  # optional: 'admin' or 'user'
@@ -644,7 +645,8 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
                 uname,
                 auth_req.voice_sample_hash,
                 auth_req.password,
-                role=role
+                role=role,
+                voice_sample_text=auth_req.voice_sample_text,
             )
             # On successful registration, also create a session for UX.
             if result.get("status") in ("success", "queued"):
@@ -657,9 +659,26 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
 
                 if not result.get("session_id"):
                     # Local/dev fallback: create legacy session via voice_auth.
-                    ok, sid_or_err = voice_auth.authenticate_by_voice(uname, auth_req.voice_sample_hash, auth_req.password)
+                    ok, sid_or_err = voice_auth.authenticate_by_voice(
+                        uname,
+                        auth_req.voice_sample_hash,
+                        auth_req.password,
+                        voice_sample_text=auth_req.voice_sample_text,
+                    )
                     if ok:
                         result["session_id"] = sid_or_err
+
+            # Attach role/permissions/user payload (frontend expects it)
+            try:
+                u = voice_auth.get_user(uname) or {}
+                effective_role = (u.get("role") or role or "user").strip().lower()
+                principal = {"username": uname, "role": effective_role, "auth_type": "voice"}
+                result["username"] = uname
+                result["role"] = effective_role
+                result["user"] = _public_user_profile(uname)
+                result["permissions"] = _permissions_for(principal)
+            except Exception:
+                pass
             return result
         
         elif auth_req.action == "login":
@@ -668,7 +687,8 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
             is_valid, session_or_error = voice_auth.authenticate_by_voice(
                 auth_req.username,
                 auth_req.voice_sample_hash,
-                auth_req.password
+                auth_req.password,
+                voice_sample_text=auth_req.voice_sample_text,
             )
             if is_valid:
                 uname = auth_req.username.strip().lower()
@@ -685,7 +705,11 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
                 return {
                     "status": "success",
                     "message": "Authentication successful",
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "username": uname,
+                    "role": role,
+                    "user": _public_user_profile(uname),
+                    "permissions": _permissions_for({"username": uname, "role": role, "auth_type": "voice"}),
                 }
             return {
                 "status": "error",

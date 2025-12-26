@@ -22,6 +22,7 @@ import secrets
 import logging
 import threading
 import time
+import difflib
 from pathlib import Path
 from src.utils.db import db
 from datetime import datetime, timedelta
@@ -38,6 +39,28 @@ AUTH_USE_DB = os.getenv("AUTH_USE_DB", "true").lower() in ("1", "true", "yes")
 PENDING_QUEUE_FILE = PROJECT_ROOT / "data" / "auth_pending_queue.json"
 QUEUE_FLUSH_INTERVAL = int(os.getenv("AUTH_QUEUE_FLUSH_INTERVAL", "10"))  # seconds
 VOICE_HASH_PREFIX_MATCH = os.getenv("VOICE_HASH_PREFIX_MATCH", "false").lower() in ("1", "true", "yes")
+VOICE_TEXT_SIMILARITY_THRESHOLD = float(os.getenv("VOICE_TEXT_SIMILARITY_THRESHOLD", "0.75"))
+VOICE_MAX_SAMPLES = int(os.getenv("VOICE_MAX_SAMPLES", "5"))
+AUTH_REQUIRE_DB = os.getenv("AUTH_REQUIRE_DB", "false").lower() in ("1", "true", "yes")
+
+
+def _norm_text(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
+def _text_similarity(a: str, b: str) -> float:
+    a_n = _norm_text(a)
+    b_n = _norm_text(b)
+    if not a_n or not b_n:
+        return 0.0
+    if a_n == b_n:
+        return 1.0
+    # Combine token overlap with sequence similarity for robustness.
+    a_tokens = set(a_n.split())
+    b_tokens = set(b_n.split())
+    jacc = (len(a_tokens & b_tokens) / max(1, len(a_tokens | b_tokens)))
+    seq = difflib.SequenceMatcher(None, a_n, b_n).ratio()
+    return max(jacc, seq)
 
 def _ensure_auth_file():
     if not AUTH_FILE.parent.exists():
@@ -135,7 +158,34 @@ class VoiceAuth:
         except Exception as e:
             logger.exception("Failed to save auth data to file: %s", e)
 
-    def register_user(self, username: str, voice_sample_hash: str, password: Optional[str]=None, role: str="user") -> dict:
+    def _get_user_from_db(self, username: str) -> Optional[dict]:
+        if not AUTH_USE_DB:
+            return None
+        try:
+            db._ensure_connected()
+            if db.db is None:
+                return None
+            doc = db.db.auth_users.find_one({"username": (username or "").strip().lower()})
+            if not doc:
+                return None
+            doc.pop("_id", None)
+            return doc
+        except Exception:
+            return None
+
+    def get_user(self, username: str) -> Optional[dict]:
+        uname = (username or "").strip().lower()
+        if not uname:
+            return None
+        # DB is authoritative when enabled
+        if AUTH_USE_DB:
+            doc = self._get_user_from_db(uname)
+            if doc:
+                self.auth_data.setdefault("users", {})[uname] = doc
+                return doc
+        return self.auth_data.get("users", {}).get(uname)
+
+    def register_user(self, username: str, voice_sample_hash: str, password: Optional[str]=None, role: str="user", voice_sample_text: Optional[str]=None) -> dict:
         """
         Register a new user.
         role: 'user' or 'admin'
@@ -144,40 +194,73 @@ class VoiceAuth:
         username = username.strip().lower()
         if not username:
             return {"status":"error","message":"Username required"}
-        if username in self.auth_data.get("users", {}):
-            return {"status":"error","message":"User already exists"}
-        user = {"voice_hash": voice_sample_hash, "role": role, "created_at": datetime.utcnow().isoformat()}
+        existing = self.get_user(username)
+
+        # Build new sample payload (store multiple samples to improve match success)
+        sample = {
+            "hash": voice_sample_hash,
+            "text": _norm_text(voice_sample_text) if voice_sample_text else None,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        # Keep legacy fields for backward compatibility
+        if existing:
+            user = dict(existing)
+            user.setdefault("created_at", datetime.utcnow().isoformat())
+            user["updated_at"] = datetime.utcnow().isoformat()
+            # Upgrade old schema to new list schema
+            samples = list(user.get("voice_samples") or [])
+            if not samples and user.get("voice_hash"):
+                samples.append({"hash": user.get("voice_hash"), "text": None, "created_at": user.get("created_at")})
+            # Avoid duplicates
+            if sample.get("hash") and not any(s.get("hash") == sample.get("hash") for s in samples):
+                samples.append(sample)
+            elif sample.get("text") and not any(s.get("text") == sample.get("text") for s in samples if s.get("text")):
+                samples.append(sample)
+            # Trim to most recent N
+            user["voice_samples"] = samples[-max(1, VOICE_MAX_SAMPLES):]
+            user["voice_hash"] = sample.get("hash") or user.get("voice_hash")
+            user["role"] = user.get("role") or role
+        else:
+            user = {
+                "voice_hash": voice_sample_hash,
+                "voice_samples": [sample],
+                "role": role,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+
         if password:
             salt, hashed = _hash_password(password)
             user["password_salt"] = salt
             user["password_hash"] = hashed
-        # Add to in-memory store immediately (so auth attempts can work locally once flushed)
+        # Add/Update in-memory store immediately
         self.auth_data.setdefault("users", {})[username] = user
         # If configured to use DB as primary store, attempt to persist; if DB unavailable, queue for later
         if AUTH_USE_DB:
             try:
                 # Ensure DB connection is attempted
+                if getattr(db, "client", None) is None:
+                    # Fail fast when explicitly required
+                    db._connect(raise_on_fail=AUTH_REQUIRE_DB)
                 db._ensure_connected()
-                # Wait briefly for background connection to complete
                 if db.db is None:
-                    # Give background reconnect thread a moment to connect
-                    for attempt in range(3):
-                        time.sleep(0.5)
-                        if db.db is not None:
-                            break
-                # Check if DB is now connected
-                if db.db is None:
-                    raise RuntimeError('MongoDB not yet connected')
+                    raise RuntimeError("MongoDB not connected")
                 users_col = db.db.auth_users
                 users_col.create_index([("username", 1)], unique=True)
                 doc = dict(user)
                 doc["username"] = username
                 users_col.update_one({"username": username}, {"$set": doc}, upsert=True)
-                logger.info("Registered user '%s' persisted to MongoDB", username)
-                return {"status":"success","message":"User registered", "username": username, "role": role}
+                logger.info("User '%s' persisted to MongoDB", username)
+                return {
+                    "status": "success",
+                    "message": "User registered" if not existing else "Voice sample updated",
+                    "username": username,
+                    "role": user.get("role", role),
+                }
             except Exception as e:
                 # DB unavailable — queue the registration and continue
                 logger.warning(f"MongoDB unavailable for registration of user '{username}': {e}")
+                if AUTH_REQUIRE_DB:
+                    return {"status": "error", "message": "MongoDB unavailable; cannot register"}
                 self._enqueue_pending({"username": username, "user": user})
                 # Persist pending queue to disk
                 self._persist_pending_queue()
@@ -187,14 +270,19 @@ class VoiceAuth:
         # Fallback/local save when DB not used
         try:
             self._save()
-            logger.info("Registered user '%s' saved locally", username)
-            return {"status":"success","message":"User registered (local)", "username": username, "role": role}
+            logger.info("User '%s' saved locally", username)
+            return {
+                "status": "success",
+                "message": "User registered (local)" if not existing else "Voice sample updated (local)",
+                "username": username,
+                "role": user.get("role", role),
+            }
         except Exception as e:
             logger.exception("Failed to save user locally: %s", e)
             self.auth_data.get("users", {}).pop(username, None)
             return {"status":"error", "message": "Failed to save user locally"}
 
-    def _compare_voice_hashes(self, stored_hash: str, provided_hash: str, threshold: float = 0.9) -> bool:
+    def _compare_voice_hashes(self, stored_hash: str, provided_hash: str) -> bool:
         """
         Compare stored and provided voice hash. This is a placeholder for
         a real voice biometric comparison.
@@ -210,14 +298,39 @@ class VoiceAuth:
             return stored_hash.startswith(provided_hash) or provided_hash.startswith(stored_hash)
         return False
 
-    def authenticate_by_voice(self, username: str, voice_sample_hash: str, password: Optional[str]=None) -> Tuple[bool, str]:
+    def _voice_match(self, user: dict, voice_sample_hash: str, voice_sample_text: Optional[str] = None) -> bool:
+        if not user:
+            return False
+
+        # Prefer transcript matching when available
+        provided_text = _norm_text(voice_sample_text) if voice_sample_text else ""
+        samples = list(user.get("voice_samples") or [])
+        # Back-compat
+        if not samples and user.get("voice_hash"):
+            samples.append({"hash": user.get("voice_hash"), "text": None})
+
+        if provided_text:
+            for s in samples:
+                t = s.get("text")
+                if not t:
+                    continue
+                if _text_similarity(t, provided_text) >= VOICE_TEXT_SIMILARITY_THRESHOLD:
+                    return True
+
+        # Fallback to hash matching
+        for s in samples:
+            if self._compare_voice_hashes(s.get("hash") or "", voice_sample_hash or ""):
+                return True
+        return False
+
+    def authenticate_by_voice(self, username: str, voice_sample_hash: str, password: Optional[str]=None, voice_sample_text: Optional[str]=None) -> Tuple[bool, str]:
         """
         Authenticate by voice (and optionally password). Returns (True, session_id) or (False, error_message)
         """
         username_l = (username or "").strip().lower()
-        if username_l not in self.auth_data.get("users", {}):
+        user = self.get_user(username_l)
+        if not user:
             return False, "User not found"
-        user = self.auth_data["users"][username_l]
         # If user has password, verify if provided
         if "password_hash" in user:
             if not password:
@@ -227,13 +340,26 @@ class VoiceAuth:
             if hashed != user.get("password_hash"):
                 return False, "Password incorrect"
         # Verify voice sample
-        if not self._compare_voice_hashes(user.get("voice_hash",""), voice_sample_hash):
-            return False, "Voice sample did not match"
+        if not self._voice_match(user, voice_sample_hash, voice_sample_text=voice_sample_text):
+            return False, "Voice sample did not match (try speaking the same short phrase clearly)"
         # Create session
         session_id = self._create_session(username_l)
         # Update last login
         user["last_login"] = datetime.utcnow().isoformat()
-        self._save()
+        # Persist only this user (avoid full-scan write)
+        try:
+            self.auth_data.setdefault("users", {})[username_l] = user
+            if AUTH_USE_DB and getattr(db, "db", None) is not None:
+                col = db.db.auth_users
+                col.create_index([("username", 1)], unique=True)
+                doc = dict(user)
+                doc["username"] = username_l
+                col.update_one({"username": username_l}, {"$set": doc}, upsert=True)
+            else:
+                self._save()
+        except Exception:
+            # auth succeeded; don't fail login due to persistence
+            pass
         return True, session_id
 
     def _create_session(self, username: str) -> str:
@@ -266,9 +392,6 @@ class VoiceAuth:
             return False
         u = self.auth_data.get("users", {}).get(username.lower())
         return bool(u and u.get("role") == "admin")
-
-    def get_user(self, username: str) -> Optional[dict]:
-        return self.auth_data.get("users", {}).get((username or "").lower())
 
     def get_role(self, username: str) -> str:
         u = self.get_user(username) or {}

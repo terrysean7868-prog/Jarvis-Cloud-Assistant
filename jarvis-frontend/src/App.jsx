@@ -44,6 +44,7 @@ export default function App() {
 
   // ---------- Offload visuals to worker (OffscreenCanvas) ----------
   useEffect(() => {
+    if (!isAuthenticated) return;
     const canvas = document.getElementById("filamentCanvas");
     if (!canvas) {
       console.warn("filamentCanvas not found");
@@ -98,10 +99,11 @@ export default function App() {
     }
     // run once
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [isAuthenticated]);
 
   // ---------- Audio processing (throttled) ----------
   useEffect(() => {
+    if (!isAuthenticated) return;
     let rafId = null;
     let audioData = null;
     let lastSend = 0;
@@ -155,10 +157,11 @@ export default function App() {
       if (rafId) cancelAnimationFrame(rafId);
       try { micStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
     };
-  }, [addLog]);
+  }, [addLog, isAuthenticated]);
 
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
+    if (!isAuthenticated) return;
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
       addLog("system", "SpeechRecognition not available in this browser.");
@@ -217,19 +220,21 @@ export default function App() {
       addLog("system", `Wake listener error: ${errName}`);
       active = false;
       // restart with backoff
-      setTimeout(safeStart, errName === "aborted" ? 700 : 1500);
+      if (isAuthenticated) setTimeout(safeStart, errName === "aborted" ? 700 : 1500);
     };
 
     recognizer.onend = () => {
       active = false;
-      if (!isHandlingCommand.current) setTimeout(safeStart, 700);
+      if (!isHandlingCommand.current && isAuthenticated) setTimeout(safeStart, 700);
     };
 
-    safeStart();
+    // Start after a short delay to avoid slowing initial paint
+    const startTimer = setTimeout(safeStart, 600);
     wakeRecognizer.current = recognizer;
     addLog("system", "Wake-word listener started.");
 
     return () => {
+      clearTimeout(startTimer);
       try {
         recognizer.onresult = null;
         recognizer.onerror = null;
@@ -239,7 +244,7 @@ export default function App() {
     };
     // run once
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addLog]);
+  }, [addLog, isAuthenticated]);
 
   // ----- handleVoiceCommand (stable reference) -----
   const handleVoiceCommand = useCallback(async () => {

@@ -22,6 +22,10 @@ services:
         value: "true"
       - key: JARVIS_AUTO_GIT_SYNC
         value: "false"
+      - key: AUTH_USE_DB
+        value: "true"
+      - key: AUTH_REQUIRE_DB
+        value: "true"
       - key: JARVIS_ENABLE_SCHEDULER
         value: "true"
       - key: JARVIS_ENABLE_DB_MAINTENANCE
