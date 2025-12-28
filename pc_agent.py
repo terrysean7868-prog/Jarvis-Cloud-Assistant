@@ -34,6 +34,10 @@ ALLOW_APP_CONTROL = _env_bool("JARVIS_AGENT_ALLOW_APP_CONTROL", "false")
 ALLOW_SCREEN = _env_bool("JARVIS_AGENT_ALLOW_SCREEN", "false")
 ALLOW_SELF_UPDATE = _env_bool("JARVIS_AGENT_ALLOW_SELF_UPDATE", "false")
 
+# Allow the server (after explicit user approval in UI) to toggle the above flags at runtime.
+# This avoids manual env edits for common cases.
+ALLOW_REMOTE_PERMISSION_CHANGES = _env_bool("JARVIS_AGENT_ALLOW_REMOTE_PERMISSION_CHANGES", "true")
+
 # File ops are powerful. Keep sandboxed.
 ALLOW_FILE_OPS = _env_bool("JARVIS_AGENT_ALLOW_FILE_OPS", "false")
 PROJECT_ROOT = Path(os.getenv("JARVIS_AGENT_PROJECT_ROOT", Path(__file__).resolve().parent)).resolve()
@@ -48,6 +52,18 @@ PING_INTERVAL_S = int(os.getenv("JARVIS_AGENT_PING_INTERVAL", "20"))
 # If set, ONLY these action types will be executed.
 _ALLOWLIST_RAW = os.getenv("JARVIS_AGENT_ACTION_ALLOWLIST", "").strip()
 ACTION_ALLOWLIST = {a.strip() for a in _ALLOWLIST_RAW.split(",") if a.strip()} if _ALLOWLIST_RAW else None
+
+
+def _current_capabilities() -> dict:
+    return {
+        "allow_execute_command": bool(ALLOW_EXECUTE_COMMAND),
+        "allow_app_control": bool(ALLOW_APP_CONTROL),
+        "allow_screen": bool(ALLOW_SCREEN),
+        "allow_self_update": bool(ALLOW_SELF_UPDATE),
+        "allow_file_ops": bool(ALLOW_FILE_OPS),
+        "platform": platform.system().lower(),
+        "hostname": platform.node(),
+    }
 
 
 def _now_utc_iso() -> str:
@@ -142,6 +158,7 @@ def _cleanup_project(root: Path) -> dict:
 
 
 async def _execute_action(action: dict) -> dict:
+    global ALLOW_APP_CONTROL, ALLOW_EXECUTE_COMMAND, ALLOW_FILE_OPS, ALLOW_SCREEN, ALLOW_SELF_UPDATE
     t = (action or {}).get("type")
 
     if ACTION_ALLOWLIST is not None and t not in ACTION_ALLOWLIST:
@@ -291,6 +308,42 @@ async def _execute_action(action: dict) -> dict:
         feature_type = action.get("feature_type", "module")
         return self_add_feature(description, feature_type)
 
+    if t == "agent_set_permissions":
+        if ACTION_ALLOWLIST is not None and t not in ACTION_ALLOWLIST:
+            return {"status": "forbidden", "action_type": t, "message": "Action blocked by agent allowlist"}
+        if not ALLOW_REMOTE_PERMISSION_CHANGES:
+            return {"status": "forbidden", "action_type": t, "message": "Remote permission changes disabled on agent"}
+
+        perms = (action or {}).get("permissions") or {}
+        if not isinstance(perms, dict) or not perms:
+            return {"status": "error", "action_type": t, "message": "permissions dict is required"}
+
+        allowed_keys = {
+            "allow_app_control",
+            "allow_execute_command",
+            "allow_file_ops",
+            "allow_screen",
+            "allow_self_update",
+        }
+        applied = {}
+        for k, v in perms.items():
+            if k not in allowed_keys:
+                continue
+            applied[k] = bool(v)
+
+        if "allow_app_control" in applied:
+            ALLOW_APP_CONTROL = applied["allow_app_control"]
+        if "allow_execute_command" in applied:
+            ALLOW_EXECUTE_COMMAND = applied["allow_execute_command"]
+        if "allow_file_ops" in applied:
+            ALLOW_FILE_OPS = applied["allow_file_ops"]
+        if "allow_screen" in applied:
+            ALLOW_SCREEN = applied["allow_screen"]
+        if "allow_self_update" in applied:
+            ALLOW_SELF_UPDATE = applied["allow_self_update"]
+
+        return {"status": "success", "action_type": t, "applied": applied, "capabilities": _current_capabilities()}
+
     return {"status": "ignored", "action_type": t}
 
 
@@ -314,7 +367,13 @@ async def run_agent():
         while not stop_event.is_set():
             try:
                 async with session.ws_connect(ws_url, heartbeat=PING_INTERVAL_S) as ws:
-                    await ws.send_str(json.dumps({"type": "auth", "device_id": DEVICE_ID, "secret": SHARED_SECRET}))
+                    capabilities = _current_capabilities()
+                    await ws.send_str(json.dumps({
+                        "type": "auth",
+                        "device_id": DEVICE_ID,
+                        "secret": SHARED_SECRET,
+                        "capabilities": capabilities,
+                    }))
                     ack = await ws.receive(timeout=15)
                     if ack.type != aiohttp.WSMsgType.TEXT:
                         raise RuntimeError("No ack from server")
@@ -347,6 +406,23 @@ async def run_agent():
                                         results.append(await _execute_action(a))
                                     except Exception as e:
                                         results.append({"status": "error", "message": str(e), "action": a})
+
+                                # If permissions/capabilities changed, publish updated capabilities immediately.
+                                try:
+                                    cap = None
+                                    for r in results:
+                                        if isinstance(r, dict) and isinstance(r.get("capabilities"), dict):
+                                            cap = r.get("capabilities")
+                                            break
+                                    if cap:
+                                        await ws.send_str(json.dumps({
+                                            "type": "capabilities",
+                                            "device_id": DEVICE_ID,
+                                            "capabilities": cap,
+                                            "updated_at": _now_utc_iso(),
+                                        }))
+                                except Exception:
+                                    pass
 
                                 await ws.send_str(json.dumps({
                                     "type": "result",

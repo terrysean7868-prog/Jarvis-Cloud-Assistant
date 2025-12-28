@@ -607,8 +607,9 @@ async def agent_ws(ws: WebSocket):
 
         device_id = (msg.get("device_id") or "").strip() or None
         secret = (msg.get("secret") or "").strip()
+        capabilities = msg.get("capabilities") or {}
         try:
-            await device_hub.register(device_id=device_id or "", secret=secret, websocket=ws)
+            await device_hub.register(device_id=device_id or "", secret=secret, websocket=ws, capabilities=capabilities if isinstance(capabilities, dict) else {})
         except PermissionError:
             await ws.close(code=1008)
             return
@@ -627,6 +628,14 @@ async def agent_ws(ws: WebSocket):
             if payload.get("type") == "ping":
                 await device_hub.touch(device_id)
                 await ws.send_json({"type": "pong"})
+                continue
+
+            if payload.get("type") == "capabilities":
+                await device_hub.touch(device_id)
+                caps = payload.get("capabilities") or {}
+                if isinstance(caps, dict):
+                    await device_hub.update_capabilities(device_id, caps)
+                await ws.send_json({"type": "ok"})
                 continue
 
             if payload.get("type") == "result":
@@ -656,6 +665,11 @@ class UserDeviceGetRequest(BaseModel):
 class UserDeviceSetRequest(BaseModel):
     session_id: str
     device_id: str
+
+
+class UserDeviceConfigureRequest(BaseModel):
+    session_id: str
+    device_id: str | None = None
 
 
 class AdminDeviceAssignRequest(BaseModel):
@@ -710,6 +724,87 @@ async def user_set_device(req: UserDeviceSetRequest):
 
     _set_device_owner(did, user_id, updated_by=user_id)
     return {"status": "success", "user_id": user_id, "device_id": did}
+
+
+@app.post("/api/user/device/configure")
+async def user_configure_device(req: UserDeviceConfigureRequest):
+    """Single-call setup: bind the authenticated user to their connected PC agent.
+
+    Behavior:
+    - If device_id is provided, attempt to claim/use it (must not be owned by another user).
+    - If the user already has a device, return it.
+    - Otherwise, auto-pick from connected agents:
+      - If exactly one unowned agent is connected, claim it.
+      - If multiple candidates exist, ask the user to specify a device_id.
+    """
+    p = _require_authenticated_session(req.session_id)
+    user_id = (p.get("username") or "").strip().lower()
+
+    if req.device_id:
+        did = _validate_device_id_or_400(req.device_id)
+        current_owner = _get_device_owner(did)
+        if current_owner and current_owner != user_id:
+            raise HTTPException(status_code=403, detail="No permission: this device_id is assigned to another user")
+        prev = _get_owner_device_id(user_id)
+        if prev and prev != did:
+            _set_device_owner(prev, None, updated_by=user_id)
+        _set_device_owner(did, user_id, updated_by=user_id)
+        agent = await device_hub.get_agent(did)
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "device_id": did,
+            "connected": bool(agent),
+            "capabilities": (agent or {}).get("capabilities", {}),
+            "message": f"Configured your PC as device '{did}'.",
+        }
+
+    existing = _get_owner_device_id(user_id)
+    if existing:
+        agent = await device_hub.get_agent(existing)
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "device_id": existing,
+            "connected": bool(agent),
+            "capabilities": (agent or {}).get("capabilities", {}),
+            "message": f"Your PC is already configured as device '{existing}'.",
+        }
+
+    agents_by_id = await device_hub.list_agents()
+    if not agents_by_id:
+        raise HTTPException(status_code=409, detail="No PC agent is connected. Start pc_agent.py on your PC and try again.")
+
+    # Prefer unowned devices; allow already-owned-by-user (none in this branch).
+    candidates = []
+    for did in agents_by_id.keys():
+        owner = _get_device_owner(did)
+        if not owner:
+            candidates.append(did)
+
+    if len(candidates) == 1:
+        did = candidates[0]
+        _set_device_owner(did, user_id, updated_by=user_id)
+        agent = await device_hub.get_agent(did)
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "device_id": did,
+            "connected": True,
+            "capabilities": (agent or {}).get("capabilities", {}),
+            "message": f"Configured your PC as device '{did}'.",
+        }
+
+    if not candidates:
+        raise HTTPException(status_code=403, detail="No permission: all connected PCs are already assigned to other users")
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": "Multiple PCs are connected. Specify which one to configure.",
+            "available_device_ids": sorted(candidates)[:20],
+        },
+    )
 
 
 @app.post("/api/admin/device/assign")
@@ -785,8 +880,106 @@ async def device_dispatch(req: DeviceDispatchRequest):
     if not await device_hub.is_connected(did):
         raise HTTPException(status_code=409, detail="Device agent is not connected")
 
+    agent = await device_hub.get_agent(did)
+    caps = (agent or {}).get("capabilities") or None
+    if not caps:
+        raise HTTPException(status_code=409, detail="Agent is connected but did not report capabilities. Update pc_agent.py and restart the agent.")
+
+    def _capability_requirement(action_type: str):
+        t = (action_type or "").strip()
+        if t in ("open_app", "close_app", "switch_app"):
+            return ("allow_app_control", "JARVIS_AGENT_ALLOW_APP_CONTROL")
+        if t == "execute_command":
+            return ("allow_execute_command", "JARVIS_AGENT_ALLOW_EXECUTE_COMMAND")
+        if t in ("capture_screen", "screen_navigation"):
+            return ("allow_screen", "JARVIS_AGENT_ALLOW_SCREEN")
+        if t in ("read", "write", "edit", "delete", "move", "copy", "list", "mkdir", "cleanup"):
+            return ("allow_file_ops", "JARVIS_AGENT_ALLOW_FILE_OPS")
+        if t in ("self_update", "self_add"):
+            return ("allow_self_update", "JARVIS_AGENT_ALLOW_SELF_UPDATE")
+        return None
+
+    for a in (req.actions or []):
+        at = (a or {}).get("type") or ""
+        req_cap = _capability_requirement(at)
+        if not req_cap:
+            continue
+        key, env_name = req_cap
+        if not bool(caps.get(key)):
+            raise HTTPException(status_code=403, detail={
+                "message": f"No permission: '{at}' is disabled on your PC agent.",
+                "action_type": at,
+                "required_capability": key,
+                "env_var": env_name,
+                "suggestion": f"Enable {env_name}=true on the PC agent.",
+            })
+
     job = await _dispatch_actions_to_device(did, username=username or "user", actions=req.actions, source_text=req.source_text or "")
     return {"status": "queued", "job": job}
+
+
+class DevicePermissionsGrantRequest(BaseModel):
+    session_id: str
+    device_id: str | None = None
+    owner_username: str | None = None
+    permissions: Dict[str, bool]
+
+
+@app.post("/api/device/permissions/grant")
+async def device_permissions_grant(req: DevicePermissionsGrantRequest):
+    """Grant/deny runtime permissions on the connected PC agent.
+
+    This is used by the frontend permission popup. It only affects the running agent
+    process (no env change) and requires that the device is connected.
+    """
+    p = _require_authenticated_session(req.session_id)
+    username = (p.get("username") or "").strip().lower()
+    role = (p.get("role") or "user").strip().lower()
+
+    did = None
+    if role == "admin":
+        if req.device_id:
+            did = _validate_device_id_or_400(req.device_id)
+        elif req.owner_username:
+            did = _get_owner_device_id(req.owner_username)
+        else:
+            did = DEFAULT_DEVICE_ID
+    else:
+        if req.device_id and _normalize_device_id(req.device_id) != _normalize_device_id(_get_owner_device_id(username) or ""):
+            raise HTTPException(status_code=403, detail="Users cannot modify permissions for another device")
+        did = _get_owner_device_id(username)
+        if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
+            did = DEFAULT_DEVICE_ID
+        if not did:
+            raise HTTPException(status_code=403, detail="No device assigned to this user")
+
+    if not await device_hub.is_connected(did):
+        raise HTTPException(status_code=409, detail="Device agent is not connected")
+
+    perms = req.permissions or {}
+    if not isinstance(perms, dict) or not perms:
+        raise HTTPException(status_code=400, detail="permissions is required")
+
+    allowed_keys = {
+        "allow_app_control",
+        "allow_execute_command",
+        "allow_file_ops",
+        "allow_screen",
+        "allow_self_update",
+    }
+    normalized: Dict[str, bool] = {}
+    for k, v in perms.items():
+        if k not in allowed_keys:
+            raise HTTPException(status_code=400, detail=f"Unsupported permission key: {k}")
+        normalized[k] = bool(v)
+
+    job = await _dispatch_actions_to_device(
+        did,
+        username=username or "user",
+        actions=[{"type": "agent_set_permissions", "permissions": normalized}],
+        source_text="permission_grant",
+    )
+    return {"status": "queued", "job": job, "device_id": did, "permissions": normalized}
 
 
 @app.get("/api/device/status")
@@ -1411,6 +1604,25 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     )
     actions = response.get("actions", [])
 
+    # Persist voice command telemetry (MongoDB)
+    try:
+        if (msg.mode or "").strip().lower() == "voice" and (username or msg.user):
+            database._ensure_connected()
+            if database.db is not None:
+                database.save_voice_command(
+                    command_text=msg.text,
+                    command_type="voice",
+                    status="received",
+                    result={
+                        "user": (username or msg.user),
+                        "action_count": len(actions) if isinstance(actions, list) else 0,
+                        "mode": msg.mode,
+                    },
+                )
+    except Exception:
+        # never break chat flow on telemetry
+        pass
+
     # Enforce permissions on actions
     if actions:
         if CLOUD_MODE:
@@ -1455,14 +1667,47 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                     response["text"] = (response.get("text") or "") + "\n\n(No device assigned to this user — set it via /api/user/device/set.)"
                 
                 if await device_hub.is_connected(did):
-                    background_tasks.add_task(
-                        _dispatch_actions_to_device,
-                        did,
-                        msg.user or "user",
-                        device_actions,
-                        msg.text,
-                    )
-                    response["text"] = (response.get("text") or "") + "\n\n(Queued actions for your connected PC.)"
+                    agent = await device_hub.get_agent(did)
+                    caps = (agent or {}).get("capabilities") or None
+                    if not caps:
+                        response["text"] = (response.get("text") or "") + "\n\n(No permission: PC agent did not report capabilities. Update pc_agent.py and restart the agent.)"
+                    else:
+                        def _capability_requirement(action_type: str):
+                            t = (action_type or "").strip()
+                            if t in ("open_app", "close_app", "switch_app"):
+                                return ("allow_app_control", "JARVIS_AGENT_ALLOW_APP_CONTROL")
+                            if t == "execute_command":
+                                return ("allow_execute_command", "JARVIS_AGENT_ALLOW_EXECUTE_COMMAND")
+                            if t in ("capture_screen", "screen_navigation"):
+                                return ("allow_screen", "JARVIS_AGENT_ALLOW_SCREEN")
+                            if t in ("read", "write", "edit", "delete", "move", "copy", "list", "mkdir", "cleanup"):
+                                return ("allow_file_ops", "JARVIS_AGENT_ALLOW_FILE_OPS")
+                            if t in ("self_update", "self_add"):
+                                return ("allow_self_update", "JARVIS_AGENT_ALLOW_SELF_UPDATE")
+                            return None
+
+                        denied = None
+                        for a in (device_actions or []):
+                            at = (a or {}).get("type") or ""
+                            req_cap = _capability_requirement(at)
+                            if not req_cap:
+                                continue
+                            key, env_name = req_cap
+                            if not bool(caps.get(key)):
+                                denied = f"No permission: '{at}' is disabled on your PC agent. Enable {env_name}=true on the PC and restart the agent."
+                                break
+
+                        if denied:
+                            response["text"] = (response.get("text") or "") + f"\n\n({denied})"
+                        else:
+                            background_tasks.add_task(
+                                _dispatch_actions_to_device,
+                                did,
+                                msg.user or "user",
+                                device_actions,
+                                msg.text,
+                            )
+                            response["text"] = (response.get("text") or "") + "\n\n(Queued actions for your connected PC.)"
                 else:
                     response["text"] = (response.get("text") or "") + "\n\n(Your PC agent is offline — start pc_agent.py on your Windows PC.)"
 

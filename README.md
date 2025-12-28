@@ -57,6 +57,33 @@ For best results, speak the same short phrase during registration and login (min
 
 If you deploy this to a cloud host, treat it as “cloud mode”: avoid exposing local-PC automation features to the public internet unless you have a strong security model in place.
 
+## Remote PC agent (cloud mode)
+
+Cloud hosts (like Render) cannot open apps on your Windows PC directly. To run PC actions safely, run the included agent on your PC and let the server dispatch jobs to it.
+
+1) Configure the server (Render env or local `.env`):
+- Set `JARVIS_CLOUD_MODE=true`
+- Set `JARVIS_AGENT_SHARED_SECRET` (long random string)
+
+2) Configure and run the agent on your Windows PC:
+- Set `JARVIS_SERVER_URL` to your backend URL (Render backend or local)
+- Set `JARVIS_DEVICE_ID` (e.g. `primary`)
+- Set `JARVIS_AGENT_SHARED_SECRET` (must match the server)
+- Enable capabilities you want (otherwise you'll get a clear “No permission … enable JARVIS_AGENT_ALLOW_*” message):
+   - `JARVIS_AGENT_ALLOW_APP_CONTROL=true` (for `open_app` like Notepad)
+   - `JARVIS_AGENT_ALLOW_EXECUTE_COMMAND=true`
+   - `JARVIS_AGENT_ALLOW_FILE_OPS=true`
+
+Then run:
+
+```powershell
+python pc_agent.py
+```
+
+3) In the UI (voice): say “configure my PC”.
+- If exactly one unowned PC is connected, it will auto-bind to your user.
+- If multiple PCs are connected, say “configure my PC <device_id>”.
+
 ## Render keep-alive
 
 On the Render free plan, services can sleep when idle. If you need higher availability, use an external monitor to ping the health endpoint.

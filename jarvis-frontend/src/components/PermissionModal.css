@@ -1,0 +1,121 @@
+.perm-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(10px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  animation: fadeIn 0.25s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.perm-modal {
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  border: 2px solid rgba(0, 255, 200, 0.3);
+  border-radius: 20px;
+  padding: 34px;
+  max-width: 520px;
+  width: 92%;
+  position: relative;
+  box-shadow: 0 20px 60px rgba(0, 255, 200, 0.2);
+  animation: slideUp 0.25s ease;
+}
+
+@keyframes slideUp {
+  from { transform: translateY(18px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.perm-close {
+  position: absolute;
+  top: 15px;
+  right: 15px;
+  background: transparent;
+  border: none;
+  color: #00ffc8;
+  font-size: 28px;
+  cursor: pointer;
+  width: 35px;
+  height: 35px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+}
+
+.perm-close:hover {
+  background: rgba(0, 255, 200, 0.1);
+}
+
+.perm-header {
+  text-align: center;
+  margin-bottom: 18px;
+}
+
+.perm-header h2 {
+  color: #00ffc8;
+  margin: 0 0 10px 0;
+  font-size: 24px;
+  text-shadow: 0 0 10px rgba(0, 255, 200, 0.5);
+}
+
+.perm-header p {
+  color: #a0a0a0;
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.perm-details {
+  margin-top: 14px;
+  background: rgba(0, 255, 200, 0.05);
+  border: 1px dashed rgba(0, 255, 200, 0.3);
+  border-radius: 14px;
+  padding: 14px;
+  color: #c9d1d9;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.perm-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 20px;
+  justify-content: center;
+}
+
+.perm-button {
+  padding: 12px 18px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 255, 200, 0.25);
+  background: rgba(0, 0, 0, 0.25);
+  color: #00d4ff;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s ease;
+  min-width: 120px;
+}
+
+.perm-button:hover {
+  border-color: rgba(0, 255, 200, 0.55);
+  box-shadow: 0 0 16px rgba(0, 255, 200, 0.18);
+}
+
+.perm-deny {
+  color: #ff8a8a;
+  border-color: rgba(255, 80, 80, 0.35);
+}
+
+.perm-allow {
+  color: #00ffc8;
+}

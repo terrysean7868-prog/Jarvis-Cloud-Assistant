@@ -9,6 +9,9 @@ import {
   setUserPreferences,
   getUserDevice,
   setUserDevice,
+  configureMyPc,
+  dispatchDeviceActions,
+  grantDevicePermissions,
   API_URL
 } from "./utils/api";
 import "./styles/jarvis.css";
@@ -25,6 +28,7 @@ const scheduleIdle = (fn, timeout = 800) => {
 const ArcReactor = lazy(() => import("./components/ArcReactor"));
 const HUDLogs = lazy(() => import("./components/HUDLogs"));
 const AuthModal = lazy(() => import("./components/AuthModal"));
+const PermissionModal = lazy(() => import("./components/PermissionModal"));
 
 // Constants
 const FILAMENT_WORKER_PATH = "/filamentWorker.js"; // put this file in public/
@@ -46,6 +50,7 @@ export default function App() {
   const [role, setRole] = useState(null);
   const [permissions, setPermissions] = useState(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
+  const [permissionPrompt, setPermissionPrompt] = useState(null);
 
   // refs
   const wakeRecognizer = useRef(null);
@@ -572,6 +577,56 @@ export default function App() {
       return;
     }
 
+    // Single-command PC setup
+    // Examples:
+    // - "configure my pc"
+    // - "configure my pc primary"
+    const configureMatch = transcript.match(/^configure\s+(?:my\s+)?pc(?:\s+([a-z0-9_-]{3,32}))?$/i);
+    if (configureMatch) {
+      if (!sessionId) {
+        addLog("error", "PC configuration requires login.");
+        speak("Please login first so I can configure your PC.", () => {
+          try { wakeRecognizer.current?.start(); } catch {}
+          isHandlingCommand.current = false;
+        });
+        return;
+      }
+
+      const did = (configureMatch[1] || "").trim() || null;
+      try {
+        const resp = await configureMyPc(sessionId, did);
+        const msg = resp?.message || (resp?.device_id ? `Configured your PC as device ${resp.device_id}.` : "Configured your PC.");
+        addLog("system", msg);
+        speak(msg, () => {
+          try { wakeRecognizer.current?.start(); } catch {}
+          isHandlingCommand.current = false;
+        });
+      } catch (err) {
+        const rawMsg = err?.message || String(err);
+        let spoken = "Sorry, I couldn't configure your PC.";
+        try {
+          const parts = rawMsg.split(" - ");
+          const maybeJson = parts.length >= 2 ? parts.slice(1).join(" - ") : null;
+          const parsed = maybeJson ? JSON.parse(maybeJson) : null;
+          const detail = parsed?.detail;
+          if (typeof detail === "string") {
+            spoken = detail;
+          } else if (detail?.available_device_ids?.length) {
+            spoken = `Multiple PCs are connected. Say: configure my PC ${detail.available_device_ids[0]}.`;
+            addLog("system", `Available devices: ${detail.available_device_ids.join(", ")}`);
+          } else if (detail?.message) {
+            spoken = detail.message;
+          }
+        } catch {}
+        addLog("error", rawMsg);
+        speak(spoken, () => {
+          try { wakeRecognizer.current?.start(); } catch {}
+          isHandlingCommand.current = false;
+        });
+      }
+      return;
+    }
+
     // Voice learning shortcut:
     // "learn: when I say X, respond with Y"
     // Stores a prompt/completion example for later retrieval (RAG-lite), scoped to your account.
@@ -648,7 +703,7 @@ export default function App() {
 
     // send to backend
     try {
-      const res = await sendMessage(transcript, "chat", sessionId);
+      const res = await sendMessage(transcript, "voice", sessionId);
       addLog("response", res.text || "No text returned.");
 
       const tLower = (res.text || "").toLowerCase();
@@ -667,8 +722,70 @@ export default function App() {
 
       // run any actions returned
       if (Array.isArray(res.actions) && res.actions.length) {
-        for (const a of res.actions) {
-          addLog("action", `${a.type} ${a.value || a.url || a.file_path || ""}`);
+        const DEVICE_ACTION_TYPES = new Set([
+          "open_app", "close_app", "switch_app",
+          "execute_command",
+          "capture_screen", "screen_navigation",
+          "read", "list", "mkdir",
+          "write", "edit", "delete", "move", "copy", "cleanup",
+          "self_update", "self_add",
+        ]);
+
+        const deviceActions = res.actions.filter(a => DEVICE_ACTION_TYPES.has((a || {}).type));
+        const uiActions = res.actions.filter(a => !DEVICE_ACTION_TYPES.has((a || {}).type));
+
+        // If the backend returned device actions (e.g. open_app) and we're running hosted,
+        // dispatch them to the connected PC agent.
+        if (deviceActions.length) {
+          if (!sessionId) {
+            addLog("system", "Login required to run PC actions.");
+          } else {
+            try {
+              const dispatchRes = await dispatchDeviceActions(deviceActions, sessionId, transcript);
+              addLog("system", `PC actions queued (${deviceActions.length}).`);
+              if (dispatchRes?.status === "queued") {
+                // ok
+              }
+            } catch (e) {
+              const raw = e?.message || String(e);
+
+              // Try to parse FastAPI JSON error response embedded in the message.
+              // api.js throws: "HTTP error! status: 403 - {\"detail\":{...}}" or "... - {\"detail\":\"...\"}"
+              let parsed = null;
+              try {
+                const parts = raw.split(" - ");
+                const maybeJson = parts.length >= 2 ? parts.slice(1).join(" - ") : null;
+                parsed = maybeJson ? JSON.parse(maybeJson) : null;
+              } catch {}
+
+              const detail = parsed?.detail;
+              const permDetail = (detail && typeof detail === "object") ? detail : null;
+              const permMsg = (typeof detail === "string") ? detail : (permDetail?.message || null);
+
+              if (permDetail?.required_capability) {
+                const needed = { [permDetail.required_capability]: true };
+                setPermissionPrompt({
+                  title: "Permission required",
+                  message: permDetail.message || "This action needs permission on your PC agent.",
+                  details: permDetail.env_var ? `Allow it now? (This updates the running PC agent.)\nRequired: ${permDetail.env_var}` : "Allow it now? (This updates the running PC agent.)",
+                  neededPermissions: needed,
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                });
+                try {
+                  speak("Permission required. Please approve the popup.");
+                } catch {}
+              } else {
+                addLog("system", `PC action dispatch failed: ${permMsg || raw}`);
+                addLog("system", "Make sure pc_agent.py is running on your PC and connected.");
+              }
+            }
+          }
+        }
+
+        // Handle UI-safe actions (like open_url) locally.
+        for (const a of uiActions) {
+          addLog("action", `${a.type} ${a.value || a.url || a.file_path || a.app_name || ""}`);
           if (a.type === "open_url" && (a.value || a.url)) {
             const targetUrl = a.value || a.url;
             // Always prefer a new tab. Never navigate away from the assistant UI.
@@ -792,6 +909,31 @@ export default function App() {
                 speak("Authentication is required to use Jarvis.");
               } else {
                 setShowAuthModal(false);
+              }
+            }}
+          />
+        )}
+      </Suspense>
+
+      <Suspense fallback={<div />}>
+        {permissionPrompt && (
+          <PermissionModal
+            title={permissionPrompt.title}
+            message={permissionPrompt.message}
+            details={permissionPrompt.details}
+            allowLabel="Allow"
+            denyLabel="Deny"
+            onDeny={() => setPermissionPrompt(null)}
+            onAllow={async () => {
+              const req = permissionPrompt;
+              setPermissionPrompt(null);
+              try {
+                await grantDevicePermissions(sessionId, req.neededPermissions);
+                // retry original pending actions
+                await dispatchDeviceActions(req.pendingActions, sessionId, req.sourceText);
+                addLog("system", "Permission granted. PC action queued.");
+              } catch (err) {
+                addLog("system", `Permission grant failed: ${err?.message || err}`);
               }
             }}
           />

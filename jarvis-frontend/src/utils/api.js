@@ -138,3 +138,63 @@ export async function setUserDevice(deviceId, sessionId, timeoutMs = DEFAULT_TIM
   }
   return await res.json();
 }
+
+export async function configureMyPc(sessionId, deviceId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = { session_id: sessionId };
+  if (deviceId) body.device_id = deviceId;
+
+  const res = await timeoutFetch(`${API_URL}/api/user/device/configure`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    let errText = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+  }
+  return await res.json();
+}
+
+export async function dispatchDeviceActions(actions, sessionId, sourceText = "", deviceId = null, ownerUsername = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = {
+    session_id: sessionId,
+    actions: Array.isArray(actions) ? actions : [],
+    source_text: sourceText || "",
+  };
+  if (deviceId) body.device_id = deviceId;
+  if (ownerUsername) body.owner_username = ownerUsername;
+
+  const res = await timeoutFetch(`${API_URL}/api/device/dispatch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    let errText = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+  }
+  return await res.json();
+}
+
+export async function grantDevicePermissions(sessionId, permissions, deviceId = null, ownerUsername = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = {
+    session_id: sessionId,
+    permissions: permissions || {},
+  };
+  if (deviceId) body.device_id = deviceId;
+  if (ownerUsername) body.owner_username = ownerUsername;
+
+  const res = await timeoutFetch(`${API_URL}/api/device/permissions/grant`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    let errText = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+  }
+  return await res.json();
+}
