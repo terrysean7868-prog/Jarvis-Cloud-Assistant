@@ -9,6 +9,19 @@ from datetime import datetime, UTC
 
 import aiohttp
 
+# Load environment from .env/.env.agent if present (avoids manual env setup).
+try:
+    from dotenv import load_dotenv
+    _HERE = Path(__file__).resolve().parent
+    for _p in (_HERE / ".env.agent", _HERE / ".env"):
+        try:
+            if _p.exists():
+                load_dotenv(_p, override=False)
+        except Exception:
+            pass
+except Exception:
+    pass
+
 # NOTE: This agent is intentionally defensive.
 # We avoid importing optional/heavy modules at startup to prevent dependency issues
 # and to reduce the chance of accidental data exposure.
@@ -38,6 +51,10 @@ ALLOW_SELF_UPDATE = _env_bool("JARVIS_AGENT_ALLOW_SELF_UPDATE", "false")
 # This avoids manual env edits for common cases.
 ALLOW_REMOTE_PERMISSION_CHANGES = _env_bool("JARVIS_AGENT_ALLOW_REMOTE_PERMISSION_CHANGES", "true")
 
+# Persist approved permissions so future runs work immediately.
+_PERMISSIONS_FILE_RAW = os.getenv("JARVIS_AGENT_PERMISSIONS_FILE", "").strip()
+PERMISSIONS_FILE = Path(_PERMISSIONS_FILE_RAW).expanduser() if _PERMISSIONS_FILE_RAW else None
+
 # File ops are powerful. Keep sandboxed.
 ALLOW_FILE_OPS = _env_bool("JARVIS_AGENT_ALLOW_FILE_OPS", "false")
 PROJECT_ROOT = Path(os.getenv("JARVIS_AGENT_PROJECT_ROOT", Path(__file__).resolve().parent)).resolve()
@@ -52,6 +69,55 @@ PING_INTERVAL_S = int(os.getenv("JARVIS_AGENT_PING_INTERVAL", "20"))
 # If set, ONLY these action types will be executed.
 _ALLOWLIST_RAW = os.getenv("JARVIS_AGENT_ACTION_ALLOWLIST", "").strip()
 ACTION_ALLOWLIST = {a.strip() for a in _ALLOWLIST_RAW.split(",") if a.strip()} if _ALLOWLIST_RAW else None
+
+
+def _permissions_file_path() -> Path:
+    if PERMISSIONS_FILE:
+        return PERMISSIONS_FILE
+    return (PROJECT_ROOT / "data" / "agent_permissions.json").resolve()
+
+
+def _load_saved_permissions() -> None:
+    """Load previously approved permissions from disk and apply them."""
+    global ALLOW_APP_CONTROL, ALLOW_EXECUTE_COMMAND, ALLOW_FILE_OPS, ALLOW_SCREEN, ALLOW_SELF_UPDATE
+    try:
+        p = _permissions_file_path()
+        if not p.exists():
+            return
+        data = json.loads(p.read_text(encoding="utf-8") or "{}")
+        if not isinstance(data, dict):
+            return
+
+        if "allow_app_control" in data:
+            ALLOW_APP_CONTROL = bool(data["allow_app_control"])
+        if "allow_execute_command" in data:
+            ALLOW_EXECUTE_COMMAND = bool(data["allow_execute_command"])
+        if "allow_file_ops" in data:
+            ALLOW_FILE_OPS = bool(data["allow_file_ops"])
+        if "allow_screen" in data:
+            ALLOW_SCREEN = bool(data["allow_screen"])
+        if "allow_self_update" in data:
+            ALLOW_SELF_UPDATE = bool(data["allow_self_update"])
+    except Exception:
+        return
+
+
+def _save_permissions() -> None:
+    """Persist current permissions locally (booleans only)."""
+    try:
+        p = _permissions_file_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        safe = {
+            "allow_app_control": bool(ALLOW_APP_CONTROL),
+            "allow_execute_command": bool(ALLOW_EXECUTE_COMMAND),
+            "allow_file_ops": bool(ALLOW_FILE_OPS),
+            "allow_screen": bool(ALLOW_SCREEN),
+            "allow_self_update": bool(ALLOW_SELF_UPDATE),
+            "updated_at": _now_utc_iso(),
+        }
+        p.write_text(json.dumps(safe, indent=2), encoding="utf-8")
+    except Exception:
+        return
 
 
 def _current_capabilities() -> dict:
@@ -342,12 +408,18 @@ async def _execute_action(action: dict) -> dict:
         if "allow_self_update" in applied:
             ALLOW_SELF_UPDATE = applied["allow_self_update"]
 
+        # Persist so next run works without re-approving.
+        _save_permissions()
+
         return {"status": "success", "action_type": t, "applied": applied, "capabilities": _current_capabilities()}
 
     return {"status": "ignored", "action_type": t}
 
 
 async def run_agent():
+    # Apply any previously approved permissions before connecting.
+    _load_saved_permissions()
+
     if not SHARED_SECRET:
         raise SystemExit("Missing JARVIS_AGENT_SHARED_SECRET (must match Render env)")
 

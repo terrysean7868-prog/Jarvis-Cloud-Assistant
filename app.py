@@ -239,6 +239,69 @@ def _device_registry_collection():
     return col
 
 
+def _device_permissions_collection():
+    """Collection storing approved device permissions.
+
+    Document shape (upserted by device_id):
+    - device_id: str
+    - owner_username: str | None
+    - permissions: { allow_app_control: bool, ... }
+    - updated_at, updated_by
+    """
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return None
+    col = database.db["device_permissions"]
+    try:
+        col.create_index("device_id", unique=True)
+    except Exception:
+        pass
+    try:
+        col.create_index("owner_username")
+    except Exception:
+        pass
+    return col
+
+
+def _get_saved_device_permissions(device_id: str | None) -> dict | None:
+    col = _device_permissions_collection()
+    if col is None:
+        return None
+    did = _normalize_device_id(device_id)
+    if not did:
+        return None
+    doc = col.find_one({"device_id": did}, {"_id": 0, "permissions": 1})
+    perms = (doc or {}).get("permissions")
+    return perms if isinstance(perms, dict) else None
+
+
+def _save_device_permissions(device_id: str, owner_username: str | None, permissions: dict, updated_by: str | None):
+    col = _device_permissions_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    did = _normalize_device_id(device_id)
+    owner = (owner_username or "").strip().lower() or None
+    updater = (updated_by or "").strip().lower() or None
+    now = datetime.utcnow()
+    col.update_one(
+        {"device_id": did},
+        {
+            "$set": {
+                "device_id": did,
+                "owner_username": owner,
+                "permissions": permissions or {},
+                "updated_at": now,
+                "updated_by": updater,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
+
 def _normalize_device_id(device_id: str | None) -> str:
     return (device_id or "").strip().lower()
 
@@ -616,6 +679,19 @@ async def agent_ws(ws: WebSocket):
 
         await ws.send_json({"type": "ack", "device_id": device_id, "status": "connected"})
 
+        # If we have previously approved permissions for this device, apply them automatically.
+        try:
+            saved = _get_saved_device_permissions(device_id)
+            if saved and isinstance(saved, dict):
+                await _dispatch_actions_to_device(
+                    device_id=device_id,
+                    username="system",
+                    actions=[{"type": "agent_set_permissions", "permissions": saved}],
+                    source_text="auto_apply_permissions",
+                )
+        except Exception:
+            pass
+
         # Main loop
         while True:
             incoming = await ws.receive_text()
@@ -878,12 +954,18 @@ async def device_dispatch(req: DeviceDispatchRequest):
             raise HTTPException(status_code=403, detail="No device assigned to this user")
 
     if not await device_hub.is_connected(did):
-        raise HTTPException(status_code=409, detail="Device agent is not connected")
+        raise HTTPException(status_code=409, detail={
+            "message": "Device agent is not connected",
+            "device_id": did,
+            "hint": "Start pc_agent.py on the target PC and ensure JARVIS_SERVER_URL and JARVIS_AGENT_SHARED_SECRET match the server.",
+        })
 
     agent = await device_hub.get_agent(did)
     caps = (agent or {}).get("capabilities") or None
     if not caps:
         raise HTTPException(status_code=409, detail="Agent is connected but did not report capabilities. Update pc_agent.py and restart the agent.")
+
+    saved_perms = _get_saved_device_permissions(did) or {}
 
     def _capability_requirement(action_type: str):
         t = (action_type or "").strip()
@@ -906,6 +988,19 @@ async def device_dispatch(req: DeviceDispatchRequest):
             continue
         key, env_name = req_cap
         if not bool(caps.get(key)):
+            # If already approved previously, auto-apply on the running agent.
+            if bool(saved_perms.get(key)):
+                try:
+                    await _dispatch_actions_to_device(
+                        did,
+                        username=username or "user",
+                        actions=[{"type": "agent_set_permissions", "permissions": {key: True}}],
+                        source_text="auto_grant_preapproved",
+                    )
+                    caps[key] = True
+                    continue
+                except Exception:
+                    pass
             raise HTTPException(status_code=403, detail={
                 "message": f"No permission: '{at}' is disabled on your PC agent.",
                 "action_type": at,
@@ -979,6 +1074,12 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
         actions=[{"type": "agent_set_permissions", "permissions": normalized}],
         source_text="permission_grant",
     )
+    # Persist approvals so they apply automatically next time.
+    try:
+        owner = _get_device_owner(did)
+        _save_device_permissions(did, owner_username=owner, permissions=normalized, updated_by=username)
+    except Exception:
+        pass
     return {"status": "queued", "job": job, "device_id": did, "permissions": normalized}
 
 

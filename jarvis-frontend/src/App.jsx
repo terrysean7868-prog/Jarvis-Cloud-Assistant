@@ -775,6 +775,16 @@ export default function App() {
                 try {
                   speak("Permission required. Please approve the popup.");
                 } catch {}
+              } else if (permDetail?.message === "Device agent is not connected" || /device agent is not connected/i.test(String(permMsg || raw))) {
+                const deviceId = permDetail?.device_id;
+                setPermissionPrompt({
+                  title: "PC agent offline",
+                  message: deviceId ? `Your PC agent (${deviceId}) is offline. Start it now?` : "Your PC agent is offline. Start it now?",
+                  details: "This will try to launch the agent on this Windows PC using a local protocol handler.",
+                  kind: "start_agent",
+                  deviceId,
+                });
+                try { speak("Your PC agent is offline. Please approve the popup to start it."); } catch {}
               } else {
                 addLog("system", `PC action dispatch failed: ${permMsg || raw}`);
                 addLog("system", "Make sure pc_agent.py is running on your PC and connected.");
@@ -835,6 +845,29 @@ export default function App() {
     if (newRole) localStorage.setItem("jarvis_role", newRole);
     if (newPermissions) localStorage.setItem("jarvis_permissions", JSON.stringify(newPermissions));
     addLog("system", `Authenticated as ${newUsername}${newRole ? ` (${newRole})` : ""}`);
+
+    // If no PC agent is connected, offer to start it (one-time per browser).
+    try {
+      const alreadyAsked = localStorage.getItem("jarvis_agent_start_prompted") === "1";
+      if (!alreadyAsked) {
+        fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(newSessionId)}`)
+          .then(r => r.json())
+          .then(data => {
+            const agents = Array.isArray(data?.agents) ? data.agents : [];
+            if (!agents.length) {
+              localStorage.setItem("jarvis_agent_start_prompted", "1");
+              setPermissionPrompt({
+                kind: "start_agent",
+                title: "PC agent not running",
+                message: "To run PC tasks (like opening Notepad), Jarvis needs a small agent running on your Windows PC.",
+                details: "Start it now? (Requires a one-time protocol install on this PC.)",
+              });
+              try { speak("PC agent is not running. Please approve the popup to start it."); } catch {}
+            }
+          })
+          .catch(() => {});
+      }
+    } catch {}
 
     // Pull latest profile (assistant_name) after auth
     fetch(`${API_URL}/api/validate-session`, {
@@ -928,6 +961,13 @@ export default function App() {
               const req = permissionPrompt;
               setPermissionPrompt(null);
               try {
+                if (req.kind === "start_agent") {
+                  // Requires one-time install of the protocol handler on Windows.
+                  window.location.href = "jarvisagent://start";
+                  addLog("system", "Requested agent start (jarvisagent://start). If nothing happens, install scripts/install_jarvisagent_protocol.ps1 on this PC.");
+                  return;
+                }
+
                 await grantDevicePermissions(sessionId, req.neededPermissions);
                 // retry original pending actions
                 await dispatchDeviceActions(req.pendingActions, sessionId, req.sourceText);
