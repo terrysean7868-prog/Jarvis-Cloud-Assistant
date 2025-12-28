@@ -36,6 +36,11 @@ pip install -r requirements.txt
 python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
+Render:
+
+- Render installs from `requirements.render.txt` via `.render-build.sh`.
+- Local development installs from `requirements.txt` (includes Windows-only voice/automation dependencies).
+
 Frontend:
 
 ```powershell

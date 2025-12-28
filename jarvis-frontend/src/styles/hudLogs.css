@@ -36,3 +36,13 @@
   font-size: 0.8em;
   margin-right: 4px;
 }
+
+.hud-link {
+  color: inherit;
+  text-decoration: underline;
+  pointer-events: auto;
+}
+
+.hud-link:hover {
+  text-decoration-thickness: 2px;
+}

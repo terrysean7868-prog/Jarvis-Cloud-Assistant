@@ -1,5 +1,7 @@
 import argparse
 import os
+import json
+from pathlib import Path
 
 from pymongo import MongoClient
 
@@ -32,16 +34,38 @@ def main() -> int:
         default=os.getenv("MONGODB_DB_NAME", "jarvis_db"),
         help="Database name (defaults from env: MONGODB_DB_NAME).",
     )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Also clear local auth files (data/auth_users.json and data/auth_pending_queue.json).",
+    )
     args = parser.parse_args()
-
-    if not args.uri:
-        print("ERROR: MONGODB_URI (or MONGO_URI) is not set.")
-        return 2
 
     if not args.yes:
         print("REFUSING: This will DELETE ALL users from MongoDB collection 'auth_users'.")
         print("Re-run with --yes to confirm.")
         return 3
+
+    if args.local:
+        root = Path(__file__).resolve().parents[1]
+        auth_file = root / "data" / "auth_users.json"
+        pending_file = root / "data" / "auth_pending_queue.json"
+        try:
+            auth_file.parent.mkdir(parents=True, exist_ok=True)
+            auth_file.write_text(json.dumps({"users": {}}, indent=2), encoding="utf-8")
+            print(f"Local cleared: {auth_file}")
+        except Exception as e:
+            print(f"WARN: Could not clear local auth file: {e}")
+        try:
+            pending_file.parent.mkdir(parents=True, exist_ok=True)
+            pending_file.write_text(json.dumps({"pending": []}, indent=2), encoding="utf-8")
+            print(f"Local cleared: {pending_file}")
+        except Exception as e:
+            print(f"WARN: Could not clear local pending queue file: {e}")
+
+    if not args.uri:
+        print("NOTE: MONGODB_URI (or MONGO_URI) is not set; skipping MongoDB deletion.")
+        return 0 if args.local else 2
 
     # Do NOT print the URI (it may contain secrets)
     client = MongoClient(args.uri, serverSelectionTimeoutMS=8000)

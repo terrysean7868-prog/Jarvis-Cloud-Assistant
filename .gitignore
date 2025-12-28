@@ -3,6 +3,18 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+.vscode/
+
+# Local virtualenvs (never commit)
+.venv/
+venv/
+ENV/
+env/
 develop-eggs/
 downloads/
 eggs/
@@ -32,3 +44,6 @@ voice.wav
 *.err
 .env
 /node_modules
+
+# Frontend deps
+jarvis-frontend/node_modules/

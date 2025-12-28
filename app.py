@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 from src.core.llm_adapter import LLMAdapter
 from src.core.jarvis_brain import JarvisBrain
@@ -213,6 +213,105 @@ def _require_device_owner(username: str | None):
         )
 
 
+def _device_registry_collection():
+    """Collection mapping device_id <-> owner_username.
+
+    Security model:
+    - A device_id can be owned by at most one user.
+    - A user can own at most one device_id.
+    - Non-admin users can only assign an unowned device_id to themselves.
+    """
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return None
+    col = database.db["device_registry"]
+    try:
+        col.create_index("device_id", unique=True)
+    except Exception:
+        pass
+    try:
+        col.create_index("owner_username", unique=True, sparse=True)
+    except Exception:
+        pass
+    return col
+
+
+def _normalize_device_id(device_id: str | None) -> str:
+    return (device_id or "").strip().lower()
+
+
+def _get_owner_device_id(owner_username: str | None) -> str | None:
+    """Return the device_id owned by the given user (or None)."""
+    col = _device_registry_collection()
+    if col is None:
+        return None
+    owner = (owner_username or "").strip().lower()
+    if not owner:
+        return None
+    doc = col.find_one({"owner_username": owner}, {"_id": 0, "device_id": 1})
+    return (doc or {}).get("device_id")
+
+
+def _get_device_owner(device_id: str | None) -> str | None:
+    """Return the owner_username for a device_id (or None)."""
+    col = _device_registry_collection()
+    if col is None:
+        return None
+    did = _normalize_device_id(device_id)
+    if not did:
+        return None
+    doc = col.find_one({"device_id": did}, {"_id": 0, "owner_username": 1})
+    return (doc or {}).get("owner_username")
+
+
+def _set_device_owner(device_id: str, owner_username: str | None, updated_by: str | None = None):
+    """Assign/unassign ownership for a device_id.
+
+    If owner_username is None/empty, the device is unassigned.
+    """
+    col = _device_registry_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    did = _normalize_device_id(device_id)
+    owner = (owner_username or "").strip().lower() or None
+    updater = (updated_by or "").strip().lower() or None
+
+    now = datetime.utcnow()
+    if owner:
+        col.update_one(
+            {"device_id": did},
+            {
+                "$set": {
+                    "device_id": did,
+                    "owner_username": owner,
+                    "updated_at": now,
+                    "updated_by": updater,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+    else:
+        # Unassign ownership, keep the record for audit.
+        col.update_one(
+            {"device_id": did},
+            {
+                "$set": {
+                    "device_id": did,
+                    "owner_username": None,
+                    "updated_at": now,
+                    "updated_by": updater,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+
+
 def _can_control_device(principal: dict) -> bool:
     """Device control permission.
 
@@ -225,7 +324,10 @@ def _can_control_device(principal: dict) -> bool:
         return True
     if DEVICE_OWNER_USERNAME and username and username.lower() == DEVICE_OWNER_USERNAME.lower():
         return True
-    return False
+    try:
+        return bool(_get_owner_device_id(username))
+    except Exception:
+        return False
 
 
 def _public_user_profile(username: str | None) -> dict | None:
@@ -237,15 +339,206 @@ def _public_user_profile(username: str | None) -> dict | None:
         return None
     try:
         u = voice_auth.get_user(username) or {}
+        assistant_name = (u.get("assistant_name") or "Jarvis").strip()
+        # Keep assistant name reasonably short and safe for UI/wake-word usage.
+        assistant_name = " ".join(assistant_name.split())[:24]
+        if not assistant_name:
+            assistant_name = "Jarvis"
         return {
             "username": (u.get("username") or username).strip().lower(),
             "role": (u.get("role") or voice_auth.get_role(username) or "user").strip().lower(),
+            "assistant_name": assistant_name,
             "created_at": u.get("created_at"),
             "last_login": u.get("last_login"),
             "updated_at": u.get("updated_at"),
         }
     except Exception:
-        return {"username": (username or "").strip().lower(), "role": "user"}
+        return {"username": (username or "").strip().lower(), "role": "user", "assistant_name": "Jarvis"}
+
+
+class UserAssistantNameRequest(BaseModel):
+    session_id: str
+    assistant_name: str
+
+
+class UserPreferencesGetRequest(BaseModel):
+    session_id: str
+
+
+class UserPreferencesUpdateRequest(BaseModel):
+    session_id: str
+    preferences: Dict[str, Any]
+    mode: str = "merge"  # merge|replace
+
+
+class AdminUserPreferencesGetRequest(BaseModel):
+    session_id: str
+    user_id: str
+
+
+class AdminUserPreferencesUpdateRequest(BaseModel):
+    session_id: str
+    user_id: str
+    preferences: Dict[str, Any]
+    mode: str = "merge"  # merge|replace
+
+
+def _is_jsonable(value: Any) -> bool:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, list):
+        return all(_is_jsonable(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_jsonable(v) for k, v in value.items())
+    return False
+
+
+def _user_prefs_collection():
+    # Lazily ensure DB connection and indexes
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    col = database.db["user_preferences"]
+    try:
+        col.create_index("user_id", unique=True)
+    except Exception:
+        pass
+    return col
+
+
+def _normalize_user_id(user_id: str | None) -> str:
+    return (user_id or "").strip().lower()
+
+
+@app.post("/api/user/assistant-name")
+async def user_set_assistant_name(req: UserAssistantNameRequest):
+    """Set the per-user assistant name (used for wake-word + UI display).
+
+    Requires an authenticated session. The name is stored in the user's auth profile.
+    """
+    p = _require_authenticated_session(req.session_id)
+    raw = (req.assistant_name or "").strip()
+    # Basic validation: letters/numbers/spaces, 2..24 chars.
+    cleaned = " ".join(raw.split())
+    if len(cleaned) < 2 or len(cleaned) > 24:
+        raise HTTPException(status_code=400, detail="assistant_name must be 2..24 characters")
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9 ]+", cleaned):
+        raise HTTPException(status_code=400, detail="assistant_name may contain only letters, numbers, and spaces")
+
+    # Persist in user store
+    result = voice_auth.update_user(p.get("username"), assistant_name=cleaned)
+    if result.get("status") != "success":
+        raise HTTPException(status_code=400, detail=result.get("message") or "Failed to update")
+
+    return {"status": "success", "assistant_name": cleaned, "user": _public_user_profile(p.get("username"))}
+
+
+@app.post("/api/user/preferences/get")
+async def user_get_preferences(req: UserPreferencesGetRequest):
+    """Get the authenticated user's stored preferences/habits."""
+    p = _require_authenticated_session(req.session_id)
+    user_id = _normalize_user_id(p.get("username"))
+    col = _user_prefs_collection()
+    doc = col.find_one({"user_id": user_id}, {"_id": 0, "preferences": 1}) or {}
+    return {"status": "success", "user_id": user_id, "preferences": doc.get("preferences", {})}
+
+
+@app.post("/api/user/preferences/set")
+async def user_set_preferences(req: UserPreferencesUpdateRequest):
+    """Update the authenticated user's preferences/habits.
+
+    mode:
+    - merge: upserts only the provided top-level keys
+    - replace: replaces the entire preferences object
+    """
+    p = _require_authenticated_session(req.session_id)
+    user_id = _normalize_user_id(p.get("username"))
+    mode = (req.mode or "merge").strip().lower()
+    if mode not in ("merge", "replace"):
+        raise HTTPException(status_code=400, detail="mode must be 'merge' or 'replace'")
+    prefs = req.preferences or {}
+    if not isinstance(prefs, dict):
+        raise HTTPException(status_code=400, detail="preferences must be an object")
+    if not _is_jsonable(prefs):
+        raise HTTPException(status_code=400, detail="preferences must be JSON-serializable")
+
+    col = _user_prefs_collection()
+    now = datetime.utcnow()
+
+    if mode == "replace":
+        col.update_one(
+            {"user_id": user_id},
+            {"$set": {"preferences": prefs, "updated_at": now}, "$setOnInsert": {"user_id": user_id, "created_at": now}},
+            upsert=True,
+        )
+    else:
+        set_doc: Dict[str, Any] = {"updated_at": now}
+        for k, v in prefs.items():
+            set_doc[f"preferences.{k}"] = v
+        col.update_one(
+            {"user_id": user_id},
+            {"$set": set_doc, "$setOnInsert": {"user_id": user_id, "created_at": now}},
+            upsert=True,
+        )
+
+    doc = col.find_one({"user_id": user_id}, {"_id": 0, "preferences": 1}) or {}
+    return {"status": "success", "user_id": user_id, "preferences": doc.get("preferences", {})}
+
+
+@app.post("/api/admin/user/preferences/get")
+async def admin_get_user_preferences(req: AdminUserPreferencesGetRequest):
+    """Admin-only: read any user's preferences/habits."""
+    _require_admin_session(req.session_id)
+    target_user_id = _normalize_user_id(req.user_id)
+    if not target_user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    col = _user_prefs_collection()
+    doc = col.find_one({"user_id": target_user_id}, {"_id": 0, "preferences": 1}) or {}
+    return {"status": "success", "user_id": target_user_id, "preferences": doc.get("preferences", {})}
+
+
+@app.post("/api/admin/user/preferences/set")
+async def admin_set_user_preferences(req: AdminUserPreferencesUpdateRequest):
+    """Admin-only: write any user's preferences/habits."""
+    p = _require_admin_session(req.session_id)
+    target_user_id = _normalize_user_id(req.user_id)
+    if not target_user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    mode = (req.mode or "merge").strip().lower()
+    if mode not in ("merge", "replace"):
+        raise HTTPException(status_code=400, detail="mode must be 'merge' or 'replace'")
+    prefs = req.preferences or {}
+    if not isinstance(prefs, dict):
+        raise HTTPException(status_code=400, detail="preferences must be an object")
+    if not _is_jsonable(prefs):
+        raise HTTPException(status_code=400, detail="preferences must be JSON-serializable")
+
+    col = _user_prefs_collection()
+    now = datetime.utcnow()
+
+    if mode == "replace":
+        col.update_one(
+            {"user_id": target_user_id},
+            {"$set": {"preferences": prefs, "updated_at": now, "updated_by": _normalize_user_id(p.get("username"))},
+             "$setOnInsert": {"user_id": target_user_id, "created_at": now}},
+            upsert=True,
+        )
+    else:
+        set_doc = {"updated_at": now, "updated_by": _normalize_user_id(p.get("username"))}
+        for k, v in prefs.items():
+            set_doc[f"preferences.{k}"] = v
+        col.update_one(
+            {"user_id": target_user_id},
+            {"$set": set_doc, "$setOnInsert": {"user_id": target_user_id, "created_at": now}},
+            upsert=True,
+        )
+
+    doc = col.find_one({"user_id": target_user_id}, {"_id": 0, "preferences": 1}) or {}
+    return {"status": "success", "user_id": target_user_id, "preferences": doc.get("preferences", {})}
 
 
 def _permissions_for(principal: dict) -> dict:
@@ -356,9 +649,108 @@ async def agent_ws(ws: WebSocket):
 # =========================================================
 # Remote Device Control APIs (Cloud -> Agent)
 # =========================================================
+class UserDeviceGetRequest(BaseModel):
+    session_id: str
+
+
+class UserDeviceSetRequest(BaseModel):
+    session_id: str
+    device_id: str
+
+
+class AdminDeviceAssignRequest(BaseModel):
+    session_id: str
+    device_id: str
+    owner_username: str | None = None
+
+
+class AdminDeviceListRequest(BaseModel):
+    session_id: str
+
+
+def _validate_device_id_or_400(device_id: str) -> str:
+    did = _normalize_device_id(device_id)
+    if not did:
+        raise HTTPException(status_code=400, detail="device_id is required")
+    import re
+    if not re.fullmatch(r"[a-z0-9_-]{3,32}", did):
+        raise HTTPException(status_code=400, detail="device_id must be 3..32 chars: a-z, 0-9, '_' or '-'")
+    return did
+
+
+@app.post("/api/user/device/get")
+async def user_get_device(req: UserDeviceGetRequest):
+    p = _require_authenticated_session(req.session_id)
+    user_id = (p.get("username") or "").strip().lower()
+    did = _get_owner_device_id(user_id)
+    # legacy fallback for single-device setups
+    if not did and DEVICE_OWNER_USERNAME and user_id == DEVICE_OWNER_USERNAME.lower():
+        did = DEFAULT_DEVICE_ID
+    return {"status": "success", "user_id": user_id, "device_id": did}
+
+
+@app.post("/api/user/device/set")
+async def user_set_device(req: UserDeviceSetRequest):
+    """Bind the authenticated user to a device_id.
+
+    Users cannot claim a device owned by another user.
+    """
+    p = _require_authenticated_session(req.session_id)
+    user_id = (p.get("username") or "").strip().lower()
+    did = _validate_device_id_or_400(req.device_id)
+
+    current_owner = _get_device_owner(did)
+    if current_owner and current_owner != user_id:
+        raise HTTPException(status_code=403, detail="This device_id is already assigned to another user")
+
+    # Unassign any previous device from this user, then assign the new one.
+    prev = _get_owner_device_id(user_id)
+    if prev and prev != did:
+        _set_device_owner(prev, None, updated_by=user_id)
+
+    _set_device_owner(did, user_id, updated_by=user_id)
+    return {"status": "success", "user_id": user_id, "device_id": did}
+
+
+@app.post("/api/admin/device/assign")
+async def admin_assign_device(req: AdminDeviceAssignRequest):
+    """Admin-only: assign/unassign devices to users."""
+    p = _require_admin_session(req.session_id)
+    admin_user = (p.get("username") or "").strip().lower()
+    did = _validate_device_id_or_400(req.device_id)
+    owner = (req.owner_username or "").strip().lower() or None
+
+    # If assigning to a user, ensure uniqueness on both sides.
+    if owner:
+        existing_owner = _get_device_owner(did)
+        if existing_owner and existing_owner != owner:
+            # force reassignment by first unassigning
+            _set_device_owner(did, None, updated_by=admin_user)
+        prev = _get_owner_device_id(owner)
+        if prev and prev != did:
+            _set_device_owner(prev, None, updated_by=admin_user)
+        _set_device_owner(did, owner, updated_by=admin_user)
+        return {"status": "success", "device_id": did, "owner_username": owner}
+
+    # Unassign
+    _set_device_owner(did, None, updated_by=admin_user)
+    return {"status": "success", "device_id": did, "owner_username": None}
+
+
+@app.post("/api/admin/device/list")
+async def admin_list_devices(req: AdminDeviceListRequest):
+    _require_admin_session(req.session_id)
+    col = _device_registry_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    items = list(col.find({}, {"_id": 0}).sort("updated_at", -1).limit(200))
+    return {"status": "success", "devices": items}
+
+
 class DeviceDispatchRequest(BaseModel):
     session_id: str | None = None
     device_id: str | None = None
+    owner_username: str | None = None
     actions: List[dict]
     source_text: str | None = ""
 
@@ -369,12 +761,27 @@ async def device_dispatch(req: DeviceDispatchRequest):
 
     This is only meaningful in cloud mode.
     """
-    p = _get_principal(req.session_id)
-    username = p.get("username")
-    if not _can_control_device(p):
-        raise HTTPException(status_code=403, detail="Not permitted to control the connected device")
-    _require_device_owner(username)
-    did = req.device_id or DEFAULT_DEVICE_ID
+    p = _require_authenticated_session(req.session_id)
+    username = (p.get("username") or "").strip().lower()
+    role = (p.get("role") or "user").strip().lower()
+
+    did = None
+    if role == "admin":
+        if req.device_id:
+            did = _validate_device_id_or_400(req.device_id)
+        elif req.owner_username:
+            did = _get_owner_device_id(req.owner_username)
+        else:
+            did = DEFAULT_DEVICE_ID
+    else:
+        if req.device_id and _normalize_device_id(req.device_id) != _normalize_device_id(_get_owner_device_id(username) or ""):
+            raise HTTPException(status_code=403, detail="Users cannot dispatch to another device")
+        did = _get_owner_device_id(username)
+        if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
+            did = DEFAULT_DEVICE_ID
+        if not did:
+            raise HTTPException(status_code=403, detail="No device assigned to this user")
+
     if not await device_hub.is_connected(did):
         raise HTTPException(status_code=409, detail="Device agent is not connected")
 
@@ -384,14 +791,20 @@ async def device_dispatch(req: DeviceDispatchRequest):
 
 @app.get("/api/device/status")
 async def device_status(session_id: str):
-    p = _get_principal(session_id)
-    username = p.get("username")
-    if not _can_control_device(p):
-        raise HTTPException(status_code=403, detail="Not permitted to control the connected device")
-    _require_device_owner(username)
+    p = _require_authenticated_session(session_id)
+    username = (p.get("username") or "").strip().lower()
+    role = (p.get("role") or "user").strip().lower()
     agents_by_id = await device_hub.list_agents()
-    agents = list(agents_by_id.values())
-    return {"status": "success", "agents": agents, "default_device_id": DEFAULT_DEVICE_ID}
+    if role == "admin":
+        return {"status": "success", "agents": list(agents_by_id.values()), "default_device_id": DEFAULT_DEVICE_ID}
+
+    did = _get_owner_device_id(username)
+    if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
+        did = DEFAULT_DEVICE_ID
+    if not did:
+        return {"status": "success", "agents": [], "default_device_id": DEFAULT_DEVICE_ID}
+    agent = agents_by_id.get(did)
+    return {"status": "success", "agents": ([agent] if agent else []), "default_device_id": did}
 
 
 class AdminUserUpdateRequest(BaseModel):
@@ -477,6 +890,31 @@ async def admin_learning_add(req: AdminLearningAddRequest):
         prompt=req.prompt,
         completion=req.completion,
         meta={"source": "admin_api"},
+        tags=req.tags or [],
+    )
+    return {"status": "success"}
+
+
+class LearningAddRequest(BaseModel):
+    session_id: str
+    prompt: str
+    completion: str
+    tags: List[str] | None = None
+
+
+@app.post("/api/learning/add")
+async def learning_add(req: LearningAddRequest):
+    """Save a learning example for the current authenticated user.
+
+    This is a RAG-lite memory store (not model weight fine-tuning).
+    It is scoped to the caller's username.
+    """
+    p = _require_authenticated_session(req.session_id)
+    database.save_learning_example(
+        user_id=(p.get("username") or "default"),
+        prompt=req.prompt,
+        completion=req.completion,
+        meta={"source": "user_api"},
         tags=req.tags or [],
     )
     return {"status": "success"}
@@ -583,10 +1021,22 @@ async def admin_web_training_fetch(req: AdminWebTrainingFetchRequest):
 # =========================================================
 cors_origins = [
     "http://localhost:3000",
+    "http://127.0.0.1:3000",
     "http://localhost:5173",
+    "http://127.0.0.1:5173",
     "https://jarvis-frontend.onrender.com",
     "https://jarvis-cloud-assistant.onrender.com"
 ]
+
+# Allow extra origins via env (comma-separated), e.g. for custom domains.
+try:
+    extra = os.getenv("JARVIS_CORS_ORIGINS", "")
+    if extra:
+        for o in [x.strip() for x in extra.split(",")]:
+            if o and o not in cors_origins:
+                cors_origins.append(o)
+except Exception:
+    pass
 
 app.add_middleware(
     CORSMiddleware,
@@ -608,6 +1058,7 @@ class MessageIn(BaseModel):
     text: str
     mode: str | None = "chat"
     session_id: str | None = None  # Voice auth session
+    device_id: str | None = None  # optional: admin-only override for cloud->agent dispatch
 
 class VoiceAuthRequest(BaseModel):
     username: str
@@ -731,7 +1182,8 @@ async def health_check(check_db: int = 0):
     """
     db_uri = os.getenv("MONGODB_URI") or os.getenv("MONGO_URI")
     db_configured = bool(db_uri)
-    db_connected = bool(getattr(database, "client", None) and getattr(database, "db", None))
+    # PyMongo Database objects do not support truthiness checks.
+    db_connected = (getattr(database, "client", None) is not None) and (getattr(database, "db", None) is not None)
     db_ping_ok = None
     db_ping_error = None
 
@@ -951,7 +1403,12 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     if username:
         msg.user = username
     
-    response = await brain.handle_message(msg.text, mode=msg.mode)
+    # Bind learning/training memory to the authenticated principal when available.
+    response = await brain.handle_message(
+        msg.text,
+        mode=msg.mode,
+        user_id=((username or msg.user) if (username or msg.user) else None),
+    )
     actions = response.get("actions", [])
 
     # Enforce permissions on actions
@@ -982,8 +1439,21 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
             if not _can_control_device(principal):
                 response["text"] = (response.get("text") or "") + "\n\n(Device actions are not permitted for this account.)"
             else:
-                _require_device_owner(msg.user)
-                did = DEFAULT_DEVICE_ID
+                # Resolve target device
+                did = None
+                if role == "admin" and msg.device_id:
+                    did = _validate_device_id_or_400(msg.device_id)
+                elif role != "admin" and msg.device_id:
+                    response["text"] = (response.get("text") or "") + "\n\n(Users cannot target another device.)"
+                    did = None
+                else:
+                    did = _get_owner_device_id(msg.user)
+                    if not did and DEVICE_OWNER_USERNAME and (msg.user or "").lower() == DEVICE_OWNER_USERNAME.lower():
+                        did = DEFAULT_DEVICE_ID
+
+                if not did:
+                    response["text"] = (response.get("text") or "") + "\n\n(No device assigned to this user — set it via /api/user/device/set.)"
+                
                 if await device_hub.is_connected(did):
                     background_tasks.add_task(
                         _dispatch_actions_to_device,

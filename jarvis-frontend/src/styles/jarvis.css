@@ -52,11 +52,11 @@ html, body, #root, .jarvis-root {
 
 /* === HUD Logs + Overlays === */
 .hud-logs {
-  position: absolute;
-  right: 2vw;
-  top: 5vh;
-  width: clamp(200px, 20vw, 300px);
-  font-size: clamp(0.8rem, 1.5vw, 1rem);
+  /* App.jsx places HUDLogs inside a fixed-position wrapper.
+     Keep this class layout-neutral so it doesn't jump off-screen. */
+  position: relative;
+  z-index: 12;
+  pointer-events: auto;
 }
 
 .hud-overlay-left,
@@ -74,10 +74,6 @@ html, body, #root, .jarvis-root {
     width: min(30vw, 160px);
     height: min(30vw, 160px);
   }
-  .hud-logs {
-    right: 3vw;
-    top: 4vh;
-  }
   .hud-overlay-left {
     left: 3vw;
     bottom: 6vh;
@@ -88,11 +84,6 @@ html, body, #root, .jarvis-root {
   .arc-core {
     width: 35vw;
     height: 35vw;
-  }
-  .hud-logs {
-    right: 4vw;
-    top: 3vh;
-    width: 40vw;
   }
   .hud-overlay-left,
   .hud-overlay-right {
@@ -112,12 +103,6 @@ html, body, #root, .jarvis-root {
   .hud-text {
     font-size: 0.9rem;
     bottom: 10vh;
-  }
-  .hud-logs {
-    position: static;
-    width: 90%;
-    margin: 2vh auto;
-    text-align: center;
   }
 }
 

@@ -2,7 +2,7 @@
   "name": "jarvis-frontend",
   "version": "0.1.0",
   "private": true,
-  "proxy": "http://localhost:18001",
+  "proxy": "http://127.0.0.1:18001",
   "dependencies": {
     "@picovoice/porcupine-web": "^3.0.3",
     "@picovoice/web-voice-processor": "^4.0.9",

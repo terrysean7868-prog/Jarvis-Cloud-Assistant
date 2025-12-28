@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 import difflib
+import re
 from pathlib import Path
 from src.utils.db import db
 from datetime import datetime, timedelta
@@ -45,7 +46,10 @@ AUTH_REQUIRE_DB = os.getenv("AUTH_REQUIRE_DB", "false").lower() in ("1", "true",
 
 
 def _norm_text(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
+    raw = (s or "").strip().lower()
+    # Remove punctuation that commonly varies between recognitions (e.g., "jarvis." vs "jarvis")
+    raw = re.sub(r"[^a-z0-9\s]", " ", raw)
+    return " ".join(raw.split())
 
 
 def _text_similarity(a: str, b: str) -> float:
@@ -207,6 +211,9 @@ class VoiceAuth:
             user = dict(existing)
             user.setdefault("created_at", datetime.utcnow().isoformat())
             user["updated_at"] = datetime.utcnow().isoformat()
+            # Ensure default assistant name exists
+            if not (user.get("assistant_name") or "").strip():
+                user["assistant_name"] = "Jarvis"
             # Upgrade old schema to new list schema
             samples = list(user.get("voice_samples") or [])
             if not samples and user.get("voice_hash"):
@@ -225,6 +232,7 @@ class VoiceAuth:
                 "voice_hash": voice_sample_hash,
                 "voice_samples": [sample],
                 "role": role,
+                "assistant_name": "Jarvis",
                 "created_at": datetime.utcnow().isoformat(),
             }
 
@@ -310,12 +318,16 @@ class VoiceAuth:
             samples.append({"hash": user.get("voice_hash"), "text": None})
 
         if provided_text:
+            best = 0.0
             for s in samples:
                 t = s.get("text")
                 if not t:
                     continue
-                if _text_similarity(t, provided_text) >= VOICE_TEXT_SIMILARITY_THRESHOLD:
+                best = max(best, _text_similarity(t, provided_text))
+                if best >= VOICE_TEXT_SIMILARITY_THRESHOLD:
                     return True
+            if best > 0.0:
+                logger.info("Voice transcript similarity below threshold (best=%.3f, threshold=%.3f)", best, VOICE_TEXT_SIMILARITY_THRESHOLD)
 
         # Fallback to hash matching
         for s in samples:
@@ -398,7 +410,7 @@ class VoiceAuth:
         r = (u.get("role") or "user").strip().lower()
         return r if r in ("user", "admin") else "user"
 
-    def update_user(self, username: str, new_username: Optional[str] = None, new_role: Optional[str] = None) -> dict:
+    def update_user(self, username: str, new_username: Optional[str] = None, new_role: Optional[str] = None, assistant_name: Optional[str] = None) -> dict:
         """Update an existing user's username and/or role.
 
         Notes:
@@ -426,10 +438,19 @@ class VoiceAuth:
             if role not in ("user", "admin"):
                 return {"status": "error", "message": "Invalid role"}
 
+        new_assistant_name = None
+        if assistant_name is not None:
+            new_assistant_name = " ".join((assistant_name or "").strip().split())
+            if not new_assistant_name:
+                return {"status": "error", "message": "Invalid assistant name"}
+            new_assistant_name = new_assistant_name[:24]
+
         # Update user record in memory
         user_doc = dict(users[old_uname])
         if role is not None:
             user_doc["role"] = role
+        if new_assistant_name is not None:
+            user_doc["assistant_name"] = new_assistant_name
         user_doc["updated_at"] = datetime.utcnow().isoformat()
 
         # Rename key if needed

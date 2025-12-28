@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 REM Starts BOTH backend + frontend for local UI voice register/login.
 REM Backend:  http://127.0.0.1:18001  (default)
-REM Frontend: http://localhost:3000
+REM Frontend: http://127.0.0.1:3000
 REM Logs:     .\logs\api.log and .\logs\ui.log
 REM
 REM Usage:
@@ -31,7 +31,7 @@ if not exist "%PYTHON%" set "PYTHON=python"
 echo.
 echo === Jarvis Local (UI + API) ===
 echo API:      http://127.0.0.1:%API_PORT%
-echo Frontend: http://localhost:3000
+echo Frontend: http://127.0.0.1:3000
 echo Logs:     %CD%\logs\api.log  and  %CD%\logs\ui.log
 echo.
 
@@ -54,16 +54,16 @@ if not exist "jarvis-frontend\package.json" (
 	echo ERROR: jarvis-frontend\package.json not found. Frontend cannot start.
 ) else (
 	REM Start frontend (background) detached; capture logs
-	powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'cmd.exe' -WorkingDirectory '%CD%\\jarvis-frontend' -ArgumentList @('/d','/s','/c','set REACT_APP_API_URL=http://localhost:%API_PORT%& set PORT=3000& set BROWSER=none& call npm.cmd start') -RedirectStandardOutput '%UI_LOG%' -RedirectStandardError '%UI_ERR%' | Out-Null"
+	powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'cmd.exe' -WorkingDirectory '%CD%\\jarvis-frontend' -ArgumentList @('/d','/s','/c','set REACT_APP_API_URL=http://127.0.0.1:%API_PORT%& set HOST=127.0.0.1& set PORT=3000& set BROWSER=none& set DANGEROUSLY_DISABLE_HOST_CHECK=true& set WDS_SOCKET_HOST=127.0.0.1& call npm.cmd start') -RedirectStandardOutput '%UI_LOG%' -RedirectStandardError '%UI_ERR%' | Out-Null"
 )
 
 REM Quick health checks
 powershell -NoProfile -Command "for ($i=0; $i -lt 25; $i++) { try { $r = Invoke-RestMethod -Uri 'http://127.0.0.1:%API_PORT%/health' -TimeoutSec 2; Write-Host ('API OK: ' + ($r | ConvertTo-Json -Compress)); break } catch { Start-Sleep -Milliseconds 400 } }"
-powershell -NoProfile -Command "$ok=$false; for ($i=0; $i -lt 60; $i++) { try { $w = Invoke-WebRequest -Uri 'http://localhost:3000' -UseBasicParsing -TimeoutSec 2; Write-Host ('UI OK: status=' + $w.StatusCode); $ok=$true; break } catch { Start-Sleep -Milliseconds 500 } }; if (-not $ok) { Write-Host ('UI not ready yet (check logs\\ui.log).') }"
+powershell -NoProfile -Command "$ok=$false; for ($i=0; $i -lt 60; $i++) { try { $w = Invoke-WebRequest -Uri 'http://127.0.0.1:3000' -UseBasicParsing -TimeoutSec 2; Write-Host ('UI OK: status=' + $w.StatusCode); $ok=$true; break } catch { Start-Sleep -Milliseconds 500 } }; if (-not $ok) { Write-Host ('UI not ready yet (check logs\\ui.log).') }"
 
 echo.
 echo Started.
-echo - Open UI: http://localhost:3000
+echo - Open UI: http://127.0.0.1:3000
 echo - API health: http://127.0.0.1:%API_PORT%/health
 echo - Logs: %API_LOG% / %API_ERR%
 echo - Logs: %UI_LOG% / %UI_ERR%

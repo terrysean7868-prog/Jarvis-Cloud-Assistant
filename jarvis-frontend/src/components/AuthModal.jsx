@@ -107,11 +107,17 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
       const dataArray = new Uint8Array(bufferLength);
       
       const samples = [];
-      const duration = 3000; // 3 seconds
+      const duration = 5000; // 5 seconds (more reliable speech-to-text)
       const startTime = Date.now();
       
       // Start speech recognition (more stable across sessions than hashing raw audio)
-      const transcriptPromise = listenOnce({ timeout: 3500, interim: false, continuous: false });
+      const transcriptPromise = listenOnce({
+        timeout: 12000,
+        interim: false,
+        continuous: false,
+        language: "en-US",
+        maxAlternatives: 1
+      });
 
       // Start MediaRecorder for actual audio capture
       if (mediaRecorder && mediaRecorder.state === 'inactive') {
