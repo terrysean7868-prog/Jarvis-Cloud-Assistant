@@ -1,96 +1,33 @@
-# Digital Assistant Platform
+# AI Assistant
 
-A small, self-hostable digital assistant built with a FastAPI backend and an optional React web UI. It supports voice-based authentication (browser speech-to-text), session handling, and a growing set of assistant “tools” (internet fetch/search, memory, local automation when running on your own PC).
+A general-purpose AI assistant application designed to help users interact through natural language.
 
-This README is intentionally generic and avoids any personal assistant details.
+This README intentionally avoids implementation details (such as tech stack, internal structure, or deployment specifics). It focuses only on the product-level purpose and safe usage.
 
-## What’s included
+## What it does
 
-- Backend API (FastAPI) in `app.py`
-- Optional React frontend in `jarvis-frontend/`
-- Health endpoint for monitoring: `GET /health` (optional DB ping: `/health?check_db=1`)
-- Render deployment assets: `render.yaml`, `.render-build.sh`, `requirements.render.txt`
+- Conversational assistance for everyday questions and tasks
+- Optional voice interaction (depending on the client/device capabilities)
+- User accounts and personalization (when enabled)
+- Optional connection to a companion client for performing actions on a user-owned machine (when configured)
 
-## Quick start (Windows)
+## Safety and privacy
 
-1. Create a local environment file:
-   - Copy `.env.template` to `.env` and fill in the values you need.
+- Review your configuration before enabling features that can access external services or perform actions on a device.
+- Treat any credentials/tokens as sensitive and store them using environment variables or your hosting provider’s secret manager.
+- If you expose the assistant to the public internet, ensure authentication is enabled and restrict any high-risk capabilities.
 
-2. Start locally:
-   - `./startup.ps1` (if you use the PowerShell launcher)
-   - or `./run_local.bat`
+## Setup
 
-3. Open:
-   - Frontend (dev): http://localhost:3000
-   - Backend: http://localhost:8000
-   - API docs: http://localhost:8000/docs
+Setup steps are documented separately to keep this README generic.
 
-## Manual setup
+- Installation and configuration: see `docs/INSTALL.md`
+- Feature notes and guides: see the `docs/` folder
 
-Backend:
+## Support
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python -m uvicorn app:app --host 0.0.0.0 --port 8000
-```
+If you run into issues, capture:
 
-Render:
-
-- Render installs from `requirements.render.txt` via `.render-build.sh`.
-- Local development installs from `requirements.txt` (includes Windows-only voice/automation dependencies).
-
-Frontend:
-
-```powershell
-cd jarvis-frontend
-npm install
-npm start
-```
-
-## Voice authentication tip
-
-For best results, speak the same short phrase during registration and login (minor transcript differences can affect matching).
-
-## Cloud vs local safety
-
-If you deploy this to a cloud host, treat it as “cloud mode”: avoid exposing local-PC automation features to the public internet unless you have a strong security model in place.
-
-## Remote PC agent (cloud mode)
-
-Cloud hosts (like Render) cannot open apps on your Windows PC directly. To run PC actions safely, run the included agent on your PC and let the server dispatch jobs to it.
-
-1) Configure the server (Render env or local `.env`):
-- Set `JARVIS_CLOUD_MODE=true`
-- Set `JARVIS_AGENT_SHARED_SECRET` (long random string)
-
-2) Configure and run the agent on your Windows PC:
-- Set `JARVIS_SERVER_URL` to your backend URL (Render backend or local)
-- Set `JARVIS_DEVICE_ID` (e.g. `primary`)
-- Set `JARVIS_AGENT_SHARED_SECRET` (must match the server)
-- Enable capabilities you want (otherwise you'll get a clear “No permission … enable JARVIS_AGENT_ALLOW_*” message):
-   - `JARVIS_AGENT_ALLOW_APP_CONTROL=true` (for `open_app` like Notepad)
-   - `JARVIS_AGENT_ALLOW_EXECUTE_COMMAND=true`
-   - `JARVIS_AGENT_ALLOW_FILE_OPS=true`
-
-Then run:
-
-```powershell
-python pc_agent.py
-```
-
-3) In the UI (voice): say “configure my PC”.
-- If exactly one unowned PC is connected, it will auto-bind to your user.
-- If multiple PCs are connected, say “configure my PC <device_id>”.
-
-## Render keep-alive
-
-On the Render free plan, services can sleep when idle. If you need higher availability, use an external monitor to ping the health endpoint.
-
-- docs/RENDER_SLEEP_KEEPALIVE.md
-
-## Notes on secrets
-
-- Keeping `.env` locally is fine for running on your PC.
-- For cloud deployments, prefer host environment variables instead of committing secrets.
+- What you were trying to do
+- The exact error message
+- Relevant logs (with secrets removed)

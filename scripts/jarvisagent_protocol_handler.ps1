@@ -13,12 +13,29 @@ function Start-Agent {
   }
 
   # Start minimized, detached
-  Start-Process -FilePath $bat -WorkingDirectory $repo -WindowStyle Minimized | Out-Null
+  Start-Process -FilePath $bat -ArgumentList @('--loop','--no-pause') -WorkingDirectory $repo -WindowStyle Minimized | Out-Null
+}
+
+function Stop-Agent {
+  $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+  $stopper = Join-Path $repo 'scripts\stop_pc_agent.ps1'
+  if (-not (Test-Path $stopper)) {
+    Write-Host "Stop script not found: $stopper"
+    exit 1
+  }
+
+  # Run stopper in a separate PowerShell instance (detached)
+  Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', $stopper, '-RepoPath', $repo) -WindowStyle Hidden | Out-Null
 }
 
 # Very simple routing: jarvisagent://start
 if ($Url -match '^jarvisagent://start') {
   Start-Agent
+  exit 0
+}
+
+if ($Url -match '^jarvisagent://stop') {
+  Stop-Agent
   exit 0
 }
 

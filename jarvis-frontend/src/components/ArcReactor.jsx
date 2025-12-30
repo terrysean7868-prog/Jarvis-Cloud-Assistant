@@ -29,6 +29,14 @@ export default function ArcReactor({
 
   const color = colorMap[emotion] || colorMap.calm;
 
+  const isSmallScreen = (() => {
+    try {
+      return typeof window !== "undefined" && window.matchMedia && window.matchMedia("(max-width: 520px)").matches;
+    } catch {
+      return false;
+    }
+  })();
+
   // Setup microphone -> analyser when component mounts and active
   useEffect(() => {
     let started = false;
@@ -205,7 +213,7 @@ export default function ArcReactor({
   }
 
   // Filaments: generate N filaments connecting core -> ring points
-  const filamentCount = 200;
+  const filamentCount = isSmallScreen ? 120 : 220;
   function filamentPoints(index, radius, rotation) {
     const angle = (index / filamentCount) * 360 + rotation;
 
@@ -259,6 +267,29 @@ export default function ArcReactor({
             <stop offset="100%" stopColor="#000000" stopOpacity="0.0" />
           </radialGradient>
 
+          <linearGradient id="ringStrokeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor="#ffffff" stopOpacity="0.15" />
+            <stop offset="35%" stopColor={color.ring} stopOpacity="0.95" />
+            <stop offset="70%" stopColor={color.ring} stopOpacity="0.45" />
+            <stop offset="100%" stopColor="#000000" stopOpacity="0.10" />
+          </linearGradient>
+
+          {/* subtle texture to make rings feel less "flat" */}
+          <filter id="grain" x="-40%" y="-40%" width="180%" height="180%">
+            <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" stitchTiles="stitch" result="noise" />
+            <feColorMatrix
+              in="noise"
+              type="matrix"
+              values="0 0 0 0 0.55  0 0 0 0 0.75  0 0 0 0 0.75  0 0 0 0.10 0"
+              result="coloredNoise"
+            />
+            <feComposite in="coloredNoise" in2="SourceGraphic" operator="in" result="noiseMask" />
+            <feMerge>
+              <feMergeNode in="SourceGraphic" />
+              <feMergeNode in="noiseMask" />
+            </feMerge>
+          </filter>
+
           <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
             <feGaussianBlur stdDeviation={10 + amp * 18} result="coloredBlur" />
             <feMerge>
@@ -266,9 +297,17 @@ export default function ArcReactor({
               <feMergeNode in="SourceGraphic" />
             </feMerge>
           </filter>
+
+          <filter id="glowTight" x="-40%" y="-40%" width="180%" height="180%">
+            <feGaussianBlur stdDeviation={4 + amp * 8} result="blur" />
+            <feMerge>
+              <feMergeNode in="blur" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
         </defs>
 
-        {/* outer ambient rings (soft) */}
+        {/* outer ambient rings (soft + textured) */}
         {baseRadii.map((r, idx) => (
           <circle
             key={`soft-${idx}`}
@@ -276,15 +315,16 @@ export default function ArcReactor({
             cy={cy}
             r={r * reactiveScale}
             fill="none"
-            stroke={color.ring}
-            strokeOpacity={0.03 + idx * 0.02}
-            strokeWidth={1}
+            stroke="url(#ringStrokeGrad)"
+            strokeOpacity={0.035 + idx * 0.02}
+            strokeWidth={1.1}
             className="ambient-ring"
+            style={{ filter: "url(#grain)" }}
           />
         ))}
 
         {/* shield segments (curved, segmented strokes) */}
-        <g className="shield-group" filter="url(#glow)">
+        <g className="shield-group" filter="url(#glowTight)">
           {baseRadii.map((r, sIdx) => {
             // multiple arcs per radius for variety
             const arcsPerRadius = 2;
@@ -294,24 +334,39 @@ export default function ArcReactor({
               const pathD = generateSegmentPath(r + arcIdx * 6, sIdx + arcIdx, rot);
               const dash = `${6 + Math.sin((time + sIdx) * 2) * 4}, ${20 + sIdx * 6}`;
               return (
-                <path
-                  key={segId}
-                  d={pathD}
-                  stroke={color.ring}
-                  strokeWidth={1.8 - sIdx * 0.12}
-                  fill="none"
-                  strokeLinecap="round"
-                  strokeOpacity={0.85 - sIdx * 0.08}
-                  style={{
-                    transformOrigin: `${cx}px ${cy}px`,
-                    // independent rotation animation using inline style for smooth GPU transforms
-                    transform: `rotate(${rot * (0.2 + (sIdx / 8))}deg)`,
-                    transition: "transform 0.6s linear",
-                    strokeDasharray: dash,
-                    mixBlendMode: "screen",
-                    filter: `url(#glow)`,
-                  }}
-                />
+                <g key={segId} style={{ mixBlendMode: "screen" }}>
+                  {/* base ring */}
+                  <path
+                    d={pathD}
+                    stroke="url(#ringStrokeGrad)"
+                    strokeWidth={2.1 - sIdx * 0.12}
+                    fill="none"
+                    strokeLinecap="round"
+                    strokeOpacity={0.78 - sIdx * 0.06}
+                    style={{
+                      transformOrigin: `${cx}px ${cy}px`,
+                      transform: `rotate(${rot * (0.2 + (sIdx / 8))}deg)`,
+                      transition: "transform 0.6s linear",
+                      strokeDasharray: dash,
+                      filter: "url(#grain)",
+                    }}
+                  />
+                  {/* highlight edge for more "metal" feel */}
+                  <path
+                    d={pathD}
+                    stroke="#ffffff"
+                    strokeWidth={0.9}
+                    fill="none"
+                    strokeLinecap="round"
+                    strokeOpacity={0.10 + amp * 0.22}
+                    style={{
+                      transformOrigin: `${cx}px ${cy}px`,
+                      transform: `rotate(${rot * (0.2 + (sIdx / 8))}deg)`,
+                      strokeDasharray: dash,
+                      filter: "url(#glowTight)",
+                    }}
+                  />
+                </g>
               );
             });
           })}

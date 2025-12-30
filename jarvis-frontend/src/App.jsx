@@ -1,6 +1,6 @@
 // src/App.jsx
-import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from "react";
-import { listenOnce, speak, initAudioProcessing } from "./utils/speech";
+import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, lazy } from "react";
+import { listenOnce, speak, initAudioProcessing, primeSpeechRecognition, recordPcm16Once } from "./utils/speech";
 import {
   sendMessage,
   addLearningExample,
@@ -12,6 +12,7 @@ import {
   configureMyPc,
   dispatchDeviceActions,
   grantDevicePermissions,
+  googleSpeechToText,
   API_URL
 } from "./utils/api";
 import "./styles/jarvis.css";
@@ -51,6 +52,7 @@ export default function App() {
   const [permissions, setPermissions] = useState(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
 
   // refs
   const wakeRecognizer = useRef(null);
@@ -60,6 +62,47 @@ export default function App() {
   const filamentCanvasRef = useRef(null);
   const filamentWorkerRef = useRef(null);
   const audioWorkerRef = useRef(null);
+
+  const isMobile = useMemo(() => {
+    try {
+      const ua = (navigator.userAgent || "").toLowerCase();
+      return /android|iphone|ipad|ipod/.test(ua);
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const isIOS = useMemo(() => {
+    try {
+      const ua = (navigator.userAgent || "").toLowerCase();
+      return /iphone|ipad|ipod/.test(ua);
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const voiceLang = useMemo(() => {
+    try {
+      return (navigator.language || "en-US").toString();
+    } catch {
+      return "en-US";
+    }
+  }, []);
+
+  useEffect(() => {
+    // Mobile Chrome often requires an explicit user gesture before SpeechRecognition works reliably.
+    // Default: enabled on desktop, disabled on mobile until the user taps.
+    try {
+      if (!isMobile) {
+        setVoiceEnabled(true);
+        return;
+      }
+      const stored = localStorage.getItem("jarvis_voice_enabled");
+      setVoiceEnabled(stored === "1");
+    } catch {
+      if (isMobile) setVoiceEnabled(false);
+    }
+  }, [isMobile]);
 
   useEffect(() => {
     assistantNameRef.current = assistantName || "Jarvis";
@@ -253,11 +296,12 @@ export default function App() {
         else if (idleHandle) clearTimeout(idleHandle);
       } catch {}
     };
-  }, [addLog, isAuthenticated]);
+  }, [addLog, isAuthenticated, voiceEnabled]);
 
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
     if (!isAuthenticated) return;
+    if (!voiceEnabled) return;
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
       addLog("system", "SpeechRecognition not available in this browser.");
@@ -357,16 +401,44 @@ export default function App() {
     // stop wake recognizer to avoid overlap
     try { wakeRecognizer.current?.stop(); } catch {}
 
+    const webSpeechSupported =
+      typeof window !== "undefined" &&
+      ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
+
+    const tryGoogleFallback = async () => {
+      try {
+        addLog("system", "Using Google Speech-to-Text...");
+        const { audio_b64, sample_rate_hz } = await recordPcm16Once({
+          sampleRateHz: 16000,
+          maxMs: isIOS ? 9000 : 7500,
+          silenceStopMs: isIOS ? 1400 : 1100,
+        });
+        if (!audio_b64) return null;
+        const resp = await googleSpeechToText(sessionId, audio_b64, voiceLang, sample_rate_hz);
+        return (resp?.text || "").toString().trim() || null;
+      } catch (e) {
+        console.warn("Google STT fallback failed:", e);
+        return null;
+      }
+    };
+
     let transcript = null;
-    try {
-      transcript = await listenOnce({
-        timeout: 10000,
-        interim: false,
-        language: "en-US",
-        maxAlternatives: 1
-      });
-    } catch (err) {
-      console.warn("listenOnce failed:", err);
+    if (webSpeechSupported) {
+      try {
+        transcript = await listenOnce({
+          timeout: isMobile ? 16000 : 10000,
+          silenceTimeoutMs: isIOS ? 1500 : 1100,
+          interim: false,
+          language: voiceLang,
+          maxAlternatives: 1
+        });
+      } catch (err) {
+        console.warn("listenOnce failed:", err);
+      }
+    }
+
+    if (!transcript) {
+      transcript = await tryGoogleFallback();
     }
 
     setListening(false);
@@ -818,7 +890,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog]);
+  }, [sessionId, addLog, isMobile, isIOS, voiceLang]);
 
   // If filament worker exists, update it when relevant props change
   useEffect(() => {
@@ -846,29 +918,6 @@ export default function App() {
     if (newPermissions) localStorage.setItem("jarvis_permissions", JSON.stringify(newPermissions));
     addLog("system", `Authenticated as ${newUsername}${newRole ? ` (${newRole})` : ""}`);
 
-    // If no PC agent is connected, offer to start it (one-time per browser).
-    try {
-      const alreadyAsked = localStorage.getItem("jarvis_agent_start_prompted") === "1";
-      if (!alreadyAsked) {
-        fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(newSessionId)}`)
-          .then(r => r.json())
-          .then(data => {
-            const agents = Array.isArray(data?.agents) ? data.agents : [];
-            if (!agents.length) {
-              localStorage.setItem("jarvis_agent_start_prompted", "1");
-              setPermissionPrompt({
-                kind: "start_agent",
-                title: "PC agent not running",
-                message: "To run PC tasks (like opening Notepad), Jarvis needs a small agent running on your Windows PC.",
-                details: "Start it now? (Requires a one-time protocol install on this PC.)",
-              });
-              try { speak("PC agent is not running. Please approve the popup to start it."); } catch {}
-            }
-          })
-          .catch(() => {});
-      }
-    } catch {}
-
     // Pull latest profile (assistant_name) after auth
     fetch(`${API_URL}/api/validate-session`, {
       method: "POST",
@@ -886,6 +935,37 @@ export default function App() {
       })
       .catch(() => {});
   }, [addLog]);
+
+  // On every login (including auto-session restore), if no PC agent is connected, ask the user to start it.
+  useEffect(() => {
+    if (!isAuthenticated || !sessionId) return;
+
+    let cancelled = false;
+    fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(sessionId)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (cancelled) return;
+        const agents = Array.isArray(data?.agents) ? data.agents : [];
+        if (agents.length) return;
+
+        // Avoid overwriting an existing permission prompt (e.g., a missing-capability prompt).
+        setPermissionPrompt(prev => {
+          if (prev) return prev;
+          try { speak("PC agent is not running. Please approve the popup to start it."); } catch {}
+          return {
+            kind: "start_agent",
+            title: "PC agent not running",
+            message: "To run PC tasks (like opening Notepad), Jarvis needs a small agent running on your Windows PC.",
+            details: "Start it now? (Requires a one-time protocol install on this PC.)",
+          };
+        });
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, sessionId]);
 
   useEffect(() => {
     const storedSession = localStorage.getItem("jarvis_session");
@@ -962,14 +1042,12 @@ export default function App() {
               setPermissionPrompt(null);
               try {
                 if (req.kind === "start_agent") {
-                  // Requires one-time install of the protocol handler on Windows.
                   window.location.href = "jarvisagent://start";
                   addLog("system", "Requested agent start (jarvisagent://start). If nothing happens, install scripts/install_jarvisagent_protocol.ps1 on this PC.");
                   return;
                 }
 
                 await grantDevicePermissions(sessionId, req.neededPermissions);
-                // retry original pending actions
                 await dispatchDeviceActions(req.pendingActions, sessionId, req.sourceText);
                 addLog("system", "Permission granted. PC action queued.");
               } catch (err) {
@@ -990,7 +1068,52 @@ export default function App() {
             <span style={{ color: "#00ffc8", fontSize: 14, opacity: 0.9 }}>
               Assistant: {assistantName || "Jarvis"}
             </span>
+
+            {isMobile && (
+              <button
+                onClick={async () => {
+                  if (voiceEnabled) return;
+                  try {
+                    addLog("system", "Enabling voice…");
+                    // Prompt mic permission (user gesture) and warm up recognition.
+                    await initAudioProcessing();
+                    await primeSpeechRecognition(voiceLang);
+                    setVoiceEnabled(true);
+                    try { localStorage.setItem("jarvis_voice_enabled", "1"); } catch {}
+                    speak("Voice enabled.");
+                  } catch {
+                    addLog("system", "Could not enable voice. Please allow microphone permission.");
+                    try { speak("Please allow microphone permission to enable voice."); } catch {}
+                  }
+                }}
+                style={{
+                  background: voiceEnabled ? "rgba(0,255,200,0.15)" : "rgba(255,210,77,0.15)",
+                  border: "1px solid rgba(0,255,200,0.35)",
+                  color: "#00ffc8",
+                  cursor: voiceEnabled ? "default" : "pointer",
+                  borderRadius: 10,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  opacity: voiceEnabled ? 0.75 : 1,
+                }}
+              >
+                {voiceEnabled ? "Voice On" : "Enable Voice"}
+              </button>
+            )}
+
             <button onClick={() => {
+              // Best-effort: stop the local PC agent when the user logs out.
+              // This requires the jarvisagent:// protocol handler to be installed on this PC.
+              try {
+                const iframe = document.createElement("iframe");
+                iframe.style.display = "none";
+                iframe.src = "jarvisagent://stop";
+                document.body.appendChild(iframe);
+                setTimeout(() => {
+                  try { document.body.removeChild(iframe); } catch {}
+                }, 1500);
+              } catch {}
+
               localStorage.removeItem("jarvis_session");
               localStorage.removeItem("jarvis_username");
               localStorage.removeItem("jarvis_role");
@@ -1002,6 +1125,13 @@ export default function App() {
               setAssistantName("Jarvis");
               setRole(null);
               setPermissions(null);
+              setPermissionPrompt(null);
+              try {
+                if (isMobile) {
+                  localStorage.removeItem("jarvis_voice_enabled");
+                  setVoiceEnabled(false);
+                }
+              } catch {}
               setShowAuthModal(true);
               speak("Logged out successfully.");
             }} style={{ background: "transparent", border: "none", color: "#ff5050", cursor: "pointer" }}>Logout</button>

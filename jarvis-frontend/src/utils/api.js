@@ -198,3 +198,24 @@ export async function grantDevicePermissions(sessionId, permissions, deviceId = 
   }
   return await res.json();
 }
+
+export async function googleSpeechToText(sessionId, audioBase64, language = null, sampleRateHz = 16000, timeoutMs = 45000) {
+  const body = {
+    session_id: sessionId,
+    audio_b64: audioBase64,
+    sample_rate_hz: sampleRateHz,
+  };
+  if (language) body.language = language;
+
+  const res = await timeoutFetch(`${API_URL}/api/stt/google`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    let errText = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+  }
+  return await res.json();
+}

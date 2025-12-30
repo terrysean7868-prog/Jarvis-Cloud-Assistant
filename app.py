@@ -3,6 +3,7 @@ import asyncio
 from pathlib import Path
 import time
 from datetime import datetime
+import base64
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
@@ -729,6 +730,112 @@ async def agent_ws(ws: WebSocket):
     finally:
         if device_id:
             await device_hub.unregister(device_id)
+
+
+# =========================================================
+# Speech-to-Text (Mobile fallback)
+# =========================================================
+
+GOOGLE_SPEECH_ENABLED = os.getenv("GOOGLE_SPEECH_ENABLED", "false").lower() in ("1", "true", "yes")
+GOOGLE_SPEECH_LANGUAGE_DEFAULT = os.getenv("GOOGLE_SPEECH_LANGUAGE_DEFAULT", "en-US")
+GOOGLE_SPEECH_CREDENTIALS_JSON = os.getenv("GOOGLE_SPEECH_CREDENTIALS_JSON", "").strip()
+GOOGLE_SPEECH_CREDENTIALS_B64 = os.getenv("GOOGLE_SPEECH_CREDENTIALS_B64", "").strip()
+
+
+def _get_google_speech_client_and_creds():
+    if not GOOGLE_SPEECH_ENABLED:
+        raise HTTPException(status_code=501, detail="Google Speech-to-Text is disabled (set GOOGLE_SPEECH_ENABLED=true)")
+
+    try:
+        from google.cloud import speech
+    except Exception:
+        raise HTTPException(status_code=501, detail="google-cloud-speech is not installed")
+
+    credentials = None
+
+    raw_json = None
+    if GOOGLE_SPEECH_CREDENTIALS_JSON:
+        raw_json = GOOGLE_SPEECH_CREDENTIALS_JSON
+    elif GOOGLE_SPEECH_CREDENTIALS_B64:
+        try:
+            raw_json = base64.b64decode(GOOGLE_SPEECH_CREDENTIALS_B64).decode("utf-8")
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid GOOGLE_SPEECH_CREDENTIALS_B64")
+
+    if raw_json:
+        try:
+            import json
+            from google.oauth2 import service_account
+
+            info = json.loads(raw_json)
+            credentials = service_account.Credentials.from_service_account_info(info)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid Google service account JSON in env")
+
+    try:
+        client = speech.SpeechClient(credentials=credentials) if credentials else speech.SpeechClient()
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to initialize Google Speech client")
+
+    return speech, client
+
+
+class GoogleSTTRequest(BaseModel):
+    session_id: str
+    audio_b64: str
+    sample_rate_hz: int = 16000
+    language: str | None = None
+
+
+@app.post("/api/stt/google")
+async def stt_google(req: GoogleSTTRequest):
+    _require_authenticated_session(req.session_id)
+
+    if not req.audio_b64 or len(req.audio_b64) > 6_000_000:
+        raise HTTPException(status_code=413, detail="Audio payload too large")
+
+    try:
+        audio_bytes = base64.b64decode(req.audio_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid audio_b64")
+
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio")
+
+    if req.sample_rate_hz < 8000 or req.sample_rate_hz > 48000:
+        raise HTTPException(status_code=400, detail="sample_rate_hz must be between 8000 and 48000")
+
+    speech, client = _get_google_speech_client_and_creds()
+
+    language_code = (req.language or GOOGLE_SPEECH_LANGUAGE_DEFAULT or "en-US").strip() or "en-US"
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=int(req.sample_rate_hz),
+        language_code=language_code,
+        enable_automatic_punctuation=True,
+        model="latest_short",
+    )
+    audio = speech.RecognitionAudio(content=audio_bytes)
+
+    try:
+        response = client.recognize(config=config, audio=audio)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Google STT failed: {e}")
+
+    text = ""
+    try:
+        for result in response.results:
+            if result.alternatives:
+                text += (result.alternatives[0].transcript or "")
+    except Exception:
+        text = ""
+
+    return {
+        "status": "success",
+        "text": (text or "").strip(),
+        "language": language_code,
+        "sample_rate_hz": int(req.sample_rate_hz),
+    }
 
 
 # =========================================================
