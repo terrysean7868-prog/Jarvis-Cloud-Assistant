@@ -47,3 +47,6 @@ voice.wav
 
 # Frontend deps
 jarvis-frontend/node_modules/
+
+# Frontend build output (generated on deploy)
+jarvis-frontend/build/

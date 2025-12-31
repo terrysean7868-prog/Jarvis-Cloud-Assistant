@@ -16,6 +16,7 @@ import {
   API_URL
 } from "./utils/api";
 import "./styles/jarvis.css";
+import AuthModal from "./components/AuthModal";
 
 const scheduleIdle = (fn, timeout = 800) => {
   if (typeof window === "undefined") return setTimeout(fn, 0);
@@ -28,7 +29,6 @@ const scheduleIdle = (fn, timeout = 800) => {
 // Lazy-load heavy UI pieces
 const ArcReactor = lazy(() => import("./components/ArcReactor"));
 const HUDLogs = lazy(() => import("./components/HUDLogs"));
-const AuthModal = lazy(() => import("./components/AuthModal"));
 const PermissionModal = lazy(() => import("./components/PermissionModal"));
 
 // Constants
@@ -1079,20 +1079,18 @@ export default function App() {
   // ----------------- RENDER -----------------
   return (
     <div className="jarvis-root">
-      <Suspense fallback={<div />}>
-        {showAuthModal && (
-          <AuthModal
-            onAuthSuccess={handleAuthSuccess}
-            onClose={() => {
-              if (!isAuthenticated) {
-                speak("Authentication is required to use Jarvis.");
-              } else {
-                setShowAuthModal(false);
-              }
-            }}
-          />
-        )}
-      </Suspense>
+      {showAuthModal && (
+        <AuthModal
+          onAuthSuccess={handleAuthSuccess}
+          onClose={() => {
+            if (!isAuthenticated) {
+              speak("Authentication is required to use Jarvis.");
+            } else {
+              setShowAuthModal(false);
+            }
+          }}
+        />
+      )}
 
       <Suspense fallback={<div />}>
         {permissionPrompt && (
