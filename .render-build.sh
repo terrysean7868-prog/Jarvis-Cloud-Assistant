@@ -19,7 +19,10 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
 	rm -rf build
 	# Prefer reproducible installs on Render
 	if [ -f package-lock.json ]; then
-		npm ci
+		if ! npm ci; then
+			echo "⚠️  npm ci failed (lockfile out of sync). Falling back to npm install."
+			npm install
+		fi
 	else
 		npm install
 	fi
