@@ -1,455 +1,439 @@
 // src/components/ArcReactor.jsx
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import "../styles/arcReactor.css";
 
 export default function ArcReactor({
   active = false,
   emotion = "calm",
   size = 340,
+  volume = 0,
 }) {
-  const svgRef = useRef(null);
-  const audioCtxRef = useRef(null);
-  const analyserRef = useRef(null);
-  const dataArrayRef = useRef(null);
-  const rafRef = useRef(null);
-  const micStreamRef = useRef(null);
+  const canvasRef = useRef(null);
+  const rafRef = useRef(0);
+  const timeRef = useRef(0);
+  const ampRef = useRef(0);
+  const lastFrameTsRef = useRef(0);
+  const fpsWindowStartRef = useRef(0);
+  const fpsFramesRef = useRef(0);
+  const dynamicFilamentCountRef = useRef(0);
+  const qualityRef = useRef(1);
+  const noiseCanvasRef = useRef(null);
+  const scratchesRef = useRef(null);
 
-  const [amp, setAmp] = useState(0); // 0..1 amplitude
-  const [time, setTime] = useState(0); // animation time
-  const [rotations, setRotations] = useState(
-    Array.from({ length: 15 }, () => Math.random() * 360)
-  );
+  const color = useMemo(() => {
+    const colorMap = {
+      calm: { core: "#00ffc8", ring: "#00d4ff", accent: "#00ffc8" },
+      analyzing: { core: "#ffd24d", ring: "#ff9f43", accent: "#ffd24d" },
+      critical: { core: "#ff4d4f", ring: "#ff6b6b", accent: "#ff4d4f" },
+    };
+    return colorMap[emotion] || colorMap.calm;
+  }, [emotion]);
 
-  // Color palette (can expand)
-  const colorMap = {
-    calm: { core: "#00ffc8", ring: "#00d4ff", accent: "#00ffc8" },
-    analyzing: { core: "#ffd24d", ring: "#ff9f43", accent: "#ffd24d" },
-    critical: { core: "#ff4d4f", ring: "#ff6b6b", accent: "#ff4d4f" },
-  };
-
-  const color = colorMap[emotion] || colorMap.calm;
-
-  const isSmallScreen = (() => {
+  const baseFilamentCount = useMemo(() => {
     try {
-      return typeof window !== "undefined" && window.matchMedia && window.matchMedia("(max-width: 520px)").matches;
+      const small = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(max-width: 520px)").matches;
+      return small ? 120 : 180;
     } catch {
-      return false;
+      return 160;
     }
-  })();
-
-  // Setup microphone -> analyser when component mounts and active
-  useEffect(() => {
-    let started = false;
-
-    async function initMic() {
-      try {
-        // Mobile-friendly audio constraints
-        const audioConstraints = {
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            sampleRate: { ideal: 16000 }
-          },
-          video: false
-        };
-        
-        const stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
-        micStreamRef.current = stream;
-        
-        // Use webkitAudioContext for Safari compatibility
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        audioCtxRef.current = new AudioContext();
-        
-        const source = audioCtxRef.current.createMediaStreamSource(stream);
-        const analyser = audioCtxRef.current.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
-        analyserRef.current = analyser;
-        const bufferLen = analyser.frequencyBinCount;
-        dataArrayRef.current = new Uint8Array(bufferLen);
-        runAnalyser();
-      } catch (e) {
-        console.warn("ArcReactor: microphone init failed:", e?.message || e);
-      }
-    }
-
-
-    function runAnalyser() {
-      const analyser = analyserRef.current;
-      const data = dataArrayRef.current;
-      if (!analyser || !data) return;
-      analyser.getByteTimeDomainData(data);
-      // compute normalized RMS-like amplitude
-      let sum = 0;
-      for (let i = 0; i < data.length; i++) {
-        const v = (data[i] - 128) / 128;
-        sum += v * v;
-      }
-      const rms = Math.sqrt(sum / data.length);
-      // clamp and smooth
-      setAmp((prev) => Math.min(1, prev * 0.85 + rms * 0.5));
-    }
-
-    // Poll the analyser at animation frame
-    function frame() {
-      setTime((t) => t + 0.016);
-      if (analyserRef.current) runAnalyser();
-      // slowly change rotations for life
-      setRotations((r) => r.map((v, idx) => (v + (0.2 + idx * 0.04)) % 360));
-      rafRef.current = requestAnimationFrame(frame);
-    }
-
-    // Start if active
-    if (active) {
-      if (!audioCtxRef.current) {
-        initMic();
-      }
-      if (!rafRef.current) {
-        rafRef.current = requestAnimationFrame(frame);
-      }
-    } else {
-      // if not active, create a gentle idle animation and stop mic polling
-      if (!rafRef.current) {
-        rafRef.current = requestAnimationFrame(frame);
-      }
-      // reduce amplitude gradually
-      setAmp((p) => Math.max(0, p * 0.9));
-    }
-
-    return () => {
-      // cleanup if component unmounts or active toggles
-      if (rafRef.current) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      }
-      // do not immediately stop mic — keep it running while mounted; user can decide.
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active]); // re-run when active toggles
-
-  // Handle complete unmount cleanup (stop mic)
-  useEffect(() => {
-    return () => {
-      if (micStreamRef.current) {
-        micStreamRef.current.getTracks().forEach((t) => t.stop());
-        micStreamRef.current = null;
-      }
-      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
-        try {
-          audioCtxRef.current.close();
-        } catch { }
-        audioCtxRef.current = null;
-      }
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    };
   }, []);
 
-  // Utility: describe an arc path (circular arc)
-  function arcPath(cx, cy, r, startAngle, endAngle) {
-    const start = polarToCartesian(cx, cy, r, endAngle);
-    const end = polarToCartesian(cx, cy, r, startAngle);
-    const largeArcFlag = endAngle - startAngle <= 180 ? "0" : "1";
-    return [
-      "M", start.x, start.y,
-      "A", r, r, 0, largeArcFlag, 0, end.x, end.y
-    ].join(" ");
-  }
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-  function polarToCartesian(cx, cy, r, angleDeg) {
-    const a = ((angleDeg - 90) * Math.PI) / 180.0;
-    return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
-  }
+    const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+    if (!ctx) return;
 
-  // Shield/arc config
-  const shieldCount = 15;
-  const baseRadii = [72, 98, 128, 156, 186, 220]; // pixels
-  const width = size;
-  const height = size;
-  const cx = width / 2;
-  const cy = height / 2;
-
-  // compute reactive scale from amplitude (0..1) -> 1..1.25
-  const reactiveScale = 1 + amp * (active ? 0.28 : 0.06);
-
-  // generate segments with slight noise to make them curved / snake-like
-  function generateSegmentPath(r, segIndex, rotation) {
-    // We'll make an arc spanning 260..320 degrees with a wobble path
-    const segSpan = 260 + (segIndex * 4);
-    const start = (rotation + segIndex * 10) % 360;
-    const end = (start + segSpan) % 360;
-    // build a slightly perturbed poly-arc by sampling many points and using a smooth path
-    const samples = 64;
-    const points = [];
-    for (let i = 0; i <= samples; i++) {
-      const t = i / samples;
-      // angle from start -> end (wrap handled)
-      let ang = start + (end - start) * t;
-      // add perlin-like simple noise (sin + cos)
-      const wobble = Math.sin((t + time * 0.6) * Math.PI * 4 + segIndex) * (2 + amp * 6);
-      ang += wobble;
-      const p = polarToCartesian(cx, cy, r * reactiveScale, ang);
-      points.push(p);
-    }
-    // convert points into a smooth SVG path (Catmull-Rom -> Bezier approximation)
-    return pointsToSmoothPath(points);
-  }
-
-  // Convert points array into smooth path string
-  function pointsToSmoothPath(pts) {
-    if (pts.length === 0) return "";
-    // Move to first
-    let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
-    // Use simple quadratic smoothing between points
-    for (let i = 1; i < pts.length - 1; i++) {
-      const xc = (pts[i].x + pts[i + 1].x) / 2;
-      const yc = (pts[i].y + pts[i + 1].y) / 2;
-      d += ` Q ${pts[i].x.toFixed(2)} ${pts[i].y.toFixed(2)} ${xc.toFixed(2)} ${yc.toFixed(2)}`;
-    }
-    // last segment
-    const last = pts[pts.length - 1];
-    d += ` T ${last.x.toFixed(2)} ${last.y.toFixed(2)}`;
-    return d;
-  }
-
-  // Filaments: generate N filaments connecting core -> ring points
-  const filamentCount = isSmallScreen ? 120 : 220;
-  function filamentPoints(index, radius, rotation) {
-    const angle = (index / filamentCount) * 360 + rotation;
-
-    // Inner anchor (near core)
-    const inner = polarToCartesian(
-      cx,
-      cy,
-      radius * 0.35 * reactiveScale,
-      angle + Math.sin(time + index * 0.7) * 3
-    );
-
-    // Outer endpoint — keep slightly inside shield radius
-    const maxOuter = radius * 0.95 * reactiveScale;
-    const outer = polarToCartesian(
-      cx,
-      cy,
-      maxOuter,
-      angle + Math.cos(time * 0.8 + index * 0.5) * 4
-    );
-
-    // Mid control point with subtle curved motion (no large deviation)
-    const mid = {
-      x: inner.x + (outer.x - inner.x) * 0.5 + Math.sin(index * 0.7 + time * 1.8) * 4,
-      y: inner.y + (outer.y - inner.y) * 0.5 + Math.cos(index * 0.9 + time * 1.6) * 4,
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const resize = () => {
+      const cssSize = Math.max(120, Number(size) || 340);
+      canvas.style.width = `${cssSize}px`;
+      canvas.style.height = `${cssSize}px`;
+      canvas.width = Math.floor(cssSize * dpr);
+      canvas.height = Math.floor(cssSize * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
 
-    return { inner, mid, outer };
-  }
+    resize();
+    window.addEventListener("resize", resize);
 
+    const baseRadii = [72, 98, 128, 156, 186, 220];
 
-  // core gradient & glow radii
-  const coreRadius = 25 * reactiveScale;
+    // Adaptive load shedding for low-end devices.
+    // We track FPS over ~1s and reduce filament count if FPS drops.
+    const minFilaments = 60;
+    const maxFilaments = Math.max(minFilaments, baseFilamentCount);
+    dynamicFilamentCountRef.current = Math.max(minFilaments, Math.min(maxFilaments, dynamicFilamentCountRef.current || baseFilamentCount));
+    qualityRef.current = Math.max(0.35, Math.min(1, dynamicFilamentCountRef.current / maxFilaments));
+    lastFrameTsRef.current = 0;
+    fpsWindowStartRef.current = 0;
+    fpsFramesRef.current = 0;
 
-  // render
+    // Precompute a tiny noise texture (drawn as a subtle overlay) for realism.
+    if (!noiseCanvasRef.current) {
+      const n = document.createElement("canvas");
+      n.width = 128;
+      n.height = 128;
+      const nctx = n.getContext("2d");
+      if (nctx) {
+        const img = nctx.createImageData(n.width, n.height);
+        for (let i = 0; i < img.data.length; i += 4) {
+          const v = (Math.random() * 255) | 0;
+          img.data[i] = v;
+          img.data[i + 1] = v;
+          img.data[i + 2] = v;
+          img.data[i + 3] = (Math.random() * 55) | 0; // low alpha
+        }
+        nctx.putImageData(img, 0, 0);
+      }
+      noiseCanvasRef.current = n;
+    }
+
+    // Precompute micro-scratch segments (very cheap to render).
+    if (!scratchesRef.current) {
+      const scratches = [];
+      const count = 22;
+      for (let i = 0; i < count; i++) {
+        // angle around center
+        const a = Math.random() * Math.PI * 2;
+        // radius band (near outer mid rings)
+        const r0 = 0.34 + Math.random() * 0.22;
+        const len = 0.04 + Math.random() * 0.10;
+        const width = 0.5 + Math.random() * 1.1;
+        const alpha = 0.04 + Math.random() * 0.08;
+        scratches.push({ a, r0, len, width, alpha });
+      }
+      scratchesRef.current = scratches;
+    }
+
+    const draw = (ts) => {
+      const cssSize = Math.max(120, Number(size) || 340);
+      const cx = cssSize / 2;
+      const cy = cssSize / 2;
+
+      // FPS tracking + adaptive filament count
+      if (!fpsWindowStartRef.current) fpsWindowStartRef.current = ts;
+      fpsFramesRef.current += 1;
+      const windowElapsed = ts - fpsWindowStartRef.current;
+      if (windowElapsed >= 1000) {
+        const fps = (fpsFramesRef.current * 1000) / windowElapsed;
+        fpsFramesRef.current = 0;
+        fpsWindowStartRef.current = ts;
+
+        const current = dynamicFilamentCountRef.current;
+        // Hysteresis to avoid oscillation.
+        if (fps < 45 && current > minFilaments) {
+          dynamicFilamentCountRef.current = Math.max(minFilaments, Math.floor(current * 0.8));
+        } else if (fps > 55 && current < maxFilaments) {
+          dynamicFilamentCountRef.current = Math.min(maxFilaments, Math.ceil(current * 1.1));
+        }
+
+        // Derive a quality scalar from current load level.
+        // Lower quality means fewer filaments AND less expensive glow/shadow.
+        qualityRef.current = Math.max(0.35, Math.min(1, dynamicFilamentCountRef.current / maxFilaments));
+      }
+
+      // Smooth amp from provided volume.
+      const target = Math.max(0, Math.min(1, Number(volume) || 0));
+      const smooth = ampRef.current * 0.82 + target * 0.18;
+      ampRef.current = smooth;
+
+      // Gentle motion even when idle.
+      timeRef.current += 0.016;
+      const t = timeRef.current;
+      const amp = smooth;
+      const reactiveScale = 1 + amp * (active ? 0.24 : 0.06);
+      const q = qualityRef.current;
+
+      ctx.clearRect(0, 0, cssSize, cssSize);
+
+      // Background vignette
+      const bg = ctx.createRadialGradient(cx, cy, 6, cx, cy, cssSize * 0.55);
+      bg.addColorStop(0, "rgba(0,0,0,0.00)");
+      bg.addColorStop(0.65, "rgba(0,0,0,0.30)");
+      bg.addColorStop(1, "rgba(0,0,0,0.72)");
+      ctx.fillStyle = bg;
+      ctx.beginPath();
+      ctx.arc(cx, cy, cssSize * 0.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Subtle glassy rim highlight (adds depth)
+      ctx.save();
+      ctx.globalCompositeOperation = "screen";
+      const rimR = baseRadii[baseRadii.length - 1] * reactiveScale;
+      const rimGrad = ctx.createRadialGradient(cx, cy, rimR * 0.85, cx, cy, rimR * 1.03);
+      rimGrad.addColorStop(0, "rgba(255,255,255,0.00)");
+      rimGrad.addColorStop(0.55, "rgba(255,255,255,0.05)");
+      rimGrad.addColorStop(0.78, "rgba(255,255,255,0.12)");
+      rimGrad.addColorStop(1, "rgba(255,255,255,0.00)");
+      ctx.strokeStyle = rimGrad;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 10;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rimR, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+
+      // Ambient rings
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      for (let i = 0; i < baseRadii.length; i++) {
+        const r = baseRadii[i] * reactiveScale;
+        ctx.strokeStyle = `rgba(255,255,255,${0.015 + i * 0.01})`;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.strokeStyle = `rgba(0,212,255,${0.02 + i * 0.012})`;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Shield arcs (cheaper than full SVG paths)
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineCap = "round";
+      for (let i = 0; i < baseRadii.length; i++) {
+        const r = baseRadii[i] * reactiveScale;
+        const rot = (t * (0.25 + i * 0.06)) % (Math.PI * 2);
+        const a0 = rot;
+        const a1 = rot + (Math.PI * 1.55);
+
+        ctx.shadowColor = color.ring;
+        ctx.shadowBlur = (4 + amp * 12) * (0.45 + 0.55 * q);
+        ctx.strokeStyle = color.ring;
+        ctx.globalAlpha = (0.20 + (0.10 * (1 - i / baseRadii.length)) + amp * 0.18) * (0.75 + 0.25 * q);
+        ctx.lineWidth = 2 - i * 0.12;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, a0, a1);
+        ctx.stroke();
+
+        // highlight edge
+        ctx.shadowBlur = 0;
+        ctx.globalAlpha = 0.05 + amp * 0.18;
+        ctx.strokeStyle = "rgba(255,255,255,1)";
+        ctx.lineWidth = 0.8;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, a0 + 0.12, a1 - 0.12);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Mechanical tick marks (adds realism with low cost)
+      ctx.save();
+      ctx.globalCompositeOperation = "screen";
+      const ticks = 48;
+      const tickR = baseRadii[baseRadii.length - 2] * reactiveScale;
+      const tickLen = 8;
+      ctx.translate(cx, cy);
+      ctx.rotate(t * 0.08);
+      ctx.lineCap = "round";
+      ctx.strokeStyle = "rgba(255,255,255,0.22)";
+      ctx.lineWidth = 1;
+      for (let i = 0; i < ticks; i++) {
+        const a = (i / ticks) * Math.PI * 2;
+        const x0 = Math.cos(a) * (tickR - tickLen);
+        const y0 = Math.sin(a) * (tickR - tickLen);
+        const x1 = Math.cos(a) * tickR;
+        const y1 = Math.sin(a) * tickR;
+        ctx.globalAlpha = (i % 6 === 0 ? 0.36 : 0.18) * (0.7 + 0.3 * q);
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Filaments (cheap canvas curves)
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineCap = "round";
+      const baseR = baseRadii[2] * reactiveScale;
+      const filamentCount = dynamicFilamentCountRef.current || baseFilamentCount;
+      for (let i = 0; i < filamentCount; i++) {
+        const ang = (i / filamentCount) * Math.PI * 2 + t * 0.35;
+        const wob = Math.sin(t * 1.6 + i * 0.25) * (2 + amp * 7);
+        const innerR = baseR * 0.35;
+        const outerR = baseR * 0.95;
+
+        const ix = cx + innerR * Math.cos(ang + wob * 0.01);
+        const iy = cy + innerR * Math.sin(ang + wob * 0.01);
+        const ox = cx + outerR * Math.cos(ang + wob * 0.02);
+        const oy = cy + outerR * Math.sin(ang + wob * 0.02);
+        const mx = ix + (ox - ix) * 0.5 + Math.sin(t * 1.8 + i * 0.6) * (2.2 + amp * 4.5);
+        const my = iy + (oy - iy) * 0.5 + Math.cos(t * 1.7 + i * 0.5) * (2.2 + amp * 4.5);
+
+        const alpha = 0.06 + amp * 0.22 + (i % 3) * 0.015;
+        ctx.strokeStyle = color.accent;
+        ctx.globalAlpha = alpha;
+        ctx.lineWidth = 0.6 + amp * 1.6;
+        ctx.shadowColor = color.accent;
+        ctx.shadowBlur = (5 + amp * 14) * (0.35 + 0.65 * q);
+        ctx.beginPath();
+        ctx.moveTo(ix, iy);
+        ctx.quadraticCurveTo(mx, my, ox, oy);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Core
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      const coreR = (22 + amp * 10) * reactiveScale;
+      ctx.shadowColor = color.core;
+      ctx.shadowBlur = (14 + amp * 26) * (0.55 + 0.45 * q);
+
+      // Lens reflection sweep (cheap premium look)
+      // Single moving arc with a soft gradient; scaled down on low quality.
+      ctx.save();
+      ctx.globalCompositeOperation = "screen";
+      ctx.globalAlpha = (0.10 + amp * 0.10) * (0.45 + 0.55 * q);
+      const sweepR = coreR * 2.05;
+      const sweepA = (t * 0.55) % (Math.PI * 2);
+      const sweepSpan = 0.55 + amp * 0.25; // radians
+      const sx = cx + Math.cos(sweepA) * (sweepR * 0.15);
+      const sy = cy + Math.sin(sweepA) * (sweepR * 0.15);
+      const sweepGrad = ctx.createRadialGradient(sx, sy, 1, cx, cy, sweepR);
+      sweepGrad.addColorStop(0, "rgba(255,255,255,0.22)");
+      sweepGrad.addColorStop(0.45, "rgba(255,255,255,0.06)");
+      sweepGrad.addColorStop(1, "rgba(255,255,255,0.00)");
+      ctx.strokeStyle = sweepGrad;
+      ctx.lineWidth = (6 + amp * 6) * (0.55 + 0.45 * q);
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.arc(cx, cy, sweepR, sweepA - sweepSpan, sweepA + sweepSpan);
+      ctx.stroke();
+      ctx.restore();
+
+      // Iris shutter pattern (faint rotating blades)
+      // Cheap: a small number of clipped arc wedges with subtle shading.
+      const irisR = coreR * 1.9;
+      const bladeCount = 9;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, irisR, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.translate(cx, cy);
+      ctx.rotate(t * 0.35);
+      for (let i = 0; i < bladeCount; i++) {
+        const a0 = (i / bladeCount) * Math.PI * 2;
+        const a1 = a0 + (Math.PI * 2) / bladeCount;
+        const mid = (a0 + a1) / 2;
+
+        const gx = Math.cos(mid) * (irisR * 0.35);
+        const gy = Math.sin(mid) * (irisR * 0.35);
+        const grad = ctx.createLinearGradient(gx, gy, gx * 0.15, gy * 0.15);
+        grad.addColorStop(0, `rgba(255,255,255,${0.10 * q})`);
+        grad.addColorStop(0.45, `rgba(255,255,255,${0.04 * q})`);
+        grad.addColorStop(1, `rgba(0,0,0,${0.10 * (1 - 0.5 * q)})`);
+
+        ctx.fillStyle = grad;
+        ctx.globalAlpha = (0.22 + amp * 0.10) * (0.6 + 0.4 * q);
+        ctx.beginPath();
+        const rOuter = irisR;
+        const rInner = irisR * (0.18 + 0.06 * Math.sin(t * 0.9 + i));
+        ctx.arc(0, 0, rOuter, a0 + 0.06, a1 - 0.06);
+        ctx.arc(0, 0, rInner, a1 - 0.08, a0 + 0.08, true);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.strokeStyle = `rgba(255,255,255,${0.16 * q})`;
+        ctx.lineWidth = 1;
+        ctx.globalAlpha = (0.10 + amp * 0.10) * (0.5 + 0.5 * q);
+        ctx.beginPath();
+        ctx.arc(0, 0, irisR * 0.96, a0 + 0.085, a0 + 0.16);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      const cg = ctx.createRadialGradient(cx, cy, 1, cx, cy, coreR * 2.2);
+      cg.addColorStop(0, "rgba(255,255,255,0.65)");
+      cg.addColorStop(0.25, color.core);
+      cg.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = cg;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.arc(cx, cy, coreR * 2.0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = color.core;
+      ctx.beginPath();
+      ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = "rgba(255,255,255,1)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, 2 + amp * 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      // Film grain overlay (cheap: precomputed texture)
+      const noiseCanvas = noiseCanvasRef.current;
+      if (noiseCanvas) {
+        ctx.save();
+        ctx.globalCompositeOperation = "overlay";
+        ctx.globalAlpha = (0.035 + amp * 0.02) * q;
+        const off = ((t * 60) | 0) % noiseCanvas.width;
+        ctx.drawImage(noiseCanvas, -off, -off, cssSize + noiseCanvas.width, cssSize + noiseCanvas.height);
+        ctx.restore();
+      }
+
+      // Micro-scratch sweep overlay (adds realism, extremely low cost)
+      const scratches = scratchesRef.current;
+      if (scratches && scratches.length) {
+        ctx.save();
+        ctx.globalCompositeOperation = "screen";
+        // Clip to a donut region so scratches sit on the "glass" ring.
+        const outerR = baseRadii[baseRadii.length - 1] * reactiveScale;
+        const innerR = baseRadii[2] * reactiveScale;
+        ctx.beginPath();
+        ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
+        ctx.arc(cx, cy, innerR, 0, Math.PI * 2, true);
+        ctx.closePath();
+        ctx.clip();
+
+        ctx.translate(cx, cy);
+        ctx.rotate(t * 0.18);
+        // Subtle tint; avoid hard-coded new palette beyond whites.
+        ctx.strokeStyle = "rgba(255,255,255,1)";
+        for (let i = 0; i < scratches.length; i++) {
+          const s = scratches[i];
+          const rr = outerR * s.r0;
+          const a0 = s.a + Math.sin(t * 0.6 + i) * 0.02;
+          const x0 = Math.cos(a0) * rr;
+          const y0 = Math.sin(a0) * rr;
+          const x1 = Math.cos(a0) * (rr + outerR * s.len);
+          const y1 = Math.sin(a0) * (rr + outerR * s.len);
+          ctx.globalAlpha = s.alpha * (0.35 + 0.65 * q) * (0.55 + 0.45 * (0.6 + amp * 0.4));
+          ctx.lineWidth = s.width;
+          ctx.beginPath();
+          ctx.moveTo(x0, y0);
+          ctx.lineTo(x1, y1);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      rafRef.current = requestAnimationFrame(draw);
+    };
+
+    rafRef.current = requestAnimationFrame(draw);
+    return () => {
+      try { cancelAnimationFrame(rafRef.current); } catch {}
+      window.removeEventListener("resize", resize);
+    };
+  }, [active, baseFilamentCount, color, size, volume]);
+
   return (
-    <div
-      className={`arc-reactor-root ${active ? "active" : "idle"} emotion-${emotion}`}
-      style={{ width: `${size}px`, height: `${size}px` }}
-    >
-      <svg
-        ref={svgRef}
-        viewBox={`0 0 ${width} ${height}`}
-        preserveAspectRatio="xMidYMid meet"
-        className="arc-reactor-svg"
-      >
-        {/* background radial vignette */}
-        <defs>
-          <radialGradient id="coreGrad" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor={color.core} stopOpacity="1" />
-            <stop offset="40%" stopColor={color.core} stopOpacity="0.85" />
-            <stop offset="100%" stopColor="#000000" stopOpacity="0.0" />
-          </radialGradient>
+    <div className={`arc-reactor-root ${active ? "active" : "idle"} emotion-${emotion}`} style={{ width: `${size}px`, height: `${size}px` }}>
+      <canvas ref={canvasRef} className="arc-reactor-canvas" />
 
-          <linearGradient id="ringStrokeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="#ffffff" stopOpacity="0.15" />
-            <stop offset="35%" stopColor={color.ring} stopOpacity="0.95" />
-            <stop offset="70%" stopColor={color.ring} stopOpacity="0.45" />
-            <stop offset="100%" stopColor="#000000" stopOpacity="0.10" />
-          </linearGradient>
-
-          {/* subtle texture to make rings feel less "flat" */}
-          <filter id="grain" x="-40%" y="-40%" width="180%" height="180%">
-            <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" stitchTiles="stitch" result="noise" />
-            <feColorMatrix
-              in="noise"
-              type="matrix"
-              values="0 0 0 0 0.55  0 0 0 0 0.75  0 0 0 0 0.75  0 0 0 0.10 0"
-              result="coloredNoise"
-            />
-            <feComposite in="coloredNoise" in2="SourceGraphic" operator="in" result="noiseMask" />
-            <feMerge>
-              <feMergeNode in="SourceGraphic" />
-              <feMergeNode in="noiseMask" />
-            </feMerge>
-          </filter>
-
-          <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
-            <feGaussianBlur stdDeviation={10 + amp * 18} result="coloredBlur" />
-            <feMerge>
-              <feMergeNode in="coloredBlur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-
-          <filter id="glowTight" x="-40%" y="-40%" width="180%" height="180%">
-            <feGaussianBlur stdDeviation={4 + amp * 8} result="blur" />
-            <feMerge>
-              <feMergeNode in="blur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-        </defs>
-
-        {/* outer ambient rings (soft + textured) */}
-        {baseRadii.map((r, idx) => (
-          <circle
-            key={`soft-${idx}`}
-            cx={cx}
-            cy={cy}
-            r={r * reactiveScale}
-            fill="none"
-            stroke="url(#ringStrokeGrad)"
-            strokeOpacity={0.035 + idx * 0.02}
-            strokeWidth={1.1}
-            className="ambient-ring"
-            style={{ filter: "url(#grain)" }}
-          />
-        ))}
-
-        {/* shield segments (curved, segmented strokes) */}
-        <g className="shield-group" filter="url(#glowTight)">
-          {baseRadii.map((r, sIdx) => {
-            // multiple arcs per radius for variety
-            const arcsPerRadius = 2;
-            return Array.from({ length: arcsPerRadius }).map((_, arcIdx) => {
-              const segId = `shield-${sIdx}-${arcIdx}`;
-              const rot = rotations[(sIdx + arcIdx) % rotations.length];
-              const pathD = generateSegmentPath(r + arcIdx * 6, sIdx + arcIdx, rot);
-              const dash = `${6 + Math.sin((time + sIdx) * 2) * 4}, ${20 + sIdx * 6}`;
-              return (
-                <g key={segId} style={{ mixBlendMode: "screen" }}>
-                  {/* base ring */}
-                  <path
-                    d={pathD}
-                    stroke="url(#ringStrokeGrad)"
-                    strokeWidth={2.1 - sIdx * 0.12}
-                    fill="none"
-                    strokeLinecap="round"
-                    strokeOpacity={0.78 - sIdx * 0.06}
-                    style={{
-                      transformOrigin: `${cx}px ${cy}px`,
-                      transform: `rotate(${rot * (0.2 + (sIdx / 8))}deg)`,
-                      transition: "transform 0.6s linear",
-                      strokeDasharray: dash,
-                      filter: "url(#grain)",
-                    }}
-                  />
-                  {/* highlight edge for more "metal" feel */}
-                  <path
-                    d={pathD}
-                    stroke="#ffffff"
-                    strokeWidth={0.9}
-                    fill="none"
-                    strokeLinecap="round"
-                    strokeOpacity={0.10 + amp * 0.22}
-                    style={{
-                      transformOrigin: `${cx}px ${cy}px`,
-                      transform: `rotate(${rot * (0.2 + (sIdx / 8))}deg)`,
-                      strokeDasharray: dash,
-                      filter: "url(#glowTight)",
-                    }}
-                  />
-                </g>
-              );
-            });
-          })}
-        </g>
-
-        {/* filaments */}
-        <g className="filament-group">
-          {Array.from({ length: filamentCount }).map((_, i) => {
-            const baseR = baseRadii[2];
-            const rot = rotations[i % rotations.length];
-            const { inner, mid, outer } = filamentPoints(i, baseR, rot);
-            const opacity = 0.15 + amp * 0.9 * (0.6 + (i % 3) * 0.15);
-            const strokeW = 0.6 + amp * 2.2 * (0.6 + ((i + 2) % 4) * 0.25);
-            return (
-              <path
-                key={`fil-${i}`}
-                d={`M ${inner.x.toFixed(2)} ${inner.y.toFixed(2)} Q ${mid.x.toFixed(
-                  2
-                )} ${mid.y.toFixed(2)} ${outer.x.toFixed(2)} ${outer.y.toFixed(2)}`}
-                stroke={color.accent}
-                strokeWidth={strokeW}
-                strokeOpacity={opacity}
-                fill="none"
-                strokeLinecap="round"
-                style={{ mixBlendMode: "screen", filter: `url(#glow)` }}
-              />
-            );
-          })}
-        </g>
-
-        {/* inner concentric rings */}
-        <g className="inner-rings">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <circle
-              key={`inner-${i}`}
-              cx={cx}
-              cy={cy}
-              r={(coreRadius * 1.2 + i * 8) * (1 + Math.sin(time * (0.6 + i * 0.15)) * 0.02)}
-              fill="none"
-              stroke={color.core}
-              strokeOpacity={0.12 + i * 0.06}
-              strokeWidth={1}
-              style={{
-                transformOrigin: `${cx}px ${cy}px`,
-                transform: `rotate(${time * (6 + i * 12)}deg)`,
-              }}
-            />
-          ))}
-        </g>
-
-        {/* core (gradient + center glow) */}
-        <g className="core" transform={`translate(0,0)`}>
-          <circle
-            cx={cx}
-            cy={cy}
-            r={coreRadius * 1.8}
-            fill="url(#coreGrad)"
-            opacity={0.85}
-            style={{
-              filter: `url(#glow)`,
-              transition: "r 0.24s linear",
-            }}
-          />
-          <circle
-            cx={cx}
-            cy={cy}
-            r={coreRadius}
-            fill={color.core}
-            style={{ mixBlendMode: "screen", filter: `url(#glow)` }}
-          />
-          {/* tiny center spark */}
-          <circle
-            cx={cx}
-            cy={cy}
-            r={2 + amp * 6}
-            fill="#ffffff"
-            opacity={0.9}
-            style={{ transition: "r 0.08s linear" }}
-          />
-        </g>
-      </svg>
-
-      {/* subtle HUD caption */}
       <div className="reactor-caption">
         <div className="status-dot" style={{ background: color.core }} />
         <div className="status-text">

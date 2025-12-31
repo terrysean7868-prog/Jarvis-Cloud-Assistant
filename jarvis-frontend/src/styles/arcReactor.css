@@ -14,11 +14,17 @@
   background: radial-gradient(circle at 50% 50%, rgba(0,0,0,0.04), rgba(0,0,0,0.5) 70%, rgba(0,0,0,0.85));
   border-radius: 999px;
   overflow: visible;
+.arc-reactor-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
-/* caption bottom */
-.reactor-caption {
-  position: absolute;
+.arc-reactor-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
   right: 12px;
   bottom: 6px;
   display: flex;

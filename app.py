@@ -85,6 +85,7 @@ DEVICE_OWNER_USERNAME = os.getenv("JARVIS_DEVICE_OWNER_USERNAME", "")
 ADMIN_USERNAME = (os.getenv("JARVIS_ADMIN_USERNAME", "admin") or "admin").strip().lower()
 ADMIN_BOOTSTRAP_SECRET = os.getenv("JARVIS_ADMIN_BOOTSTRAP_SECRET", "")
 
+
 device_hub = DeviceHub(shared_secret=AGENT_SHARED_SECRET)
 auth_tokens = AuthTokens()
 
@@ -205,6 +206,8 @@ def _cloud_feature_disabled(feature: str):
         status_code=status.HTTP_403_FORBIDDEN,
         detail=f"{feature} is disabled in cloud deployments.",
     )
+
+
 
 def _require_device_owner(username: str | None):
     if DEVICE_OWNER_USERNAME and (username or "").lower() != DEVICE_OWNER_USERNAME.lower():

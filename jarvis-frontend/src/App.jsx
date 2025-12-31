@@ -33,36 +33,8 @@ const PermissionModal = lazy(() => import("./components/PermissionModal"));
 
 // Constants
 const FILAMENT_WORKER_PATH = "/filamentWorker.js"; // put this file in public/
-const AUDIO_WORKER_PATH = "/audioWorker.js"; // optional, put in public/
 
 export default function App() {
-  // Light state only — avoid large objects in state
-  const [listening, setListening] = useState(false);
-  const [speaking, setSpeaking] = useState(false);
-  const [wakePulse, setWakePulse] = useState(false);
-  const [logs, setLogs] = useState([]);
-  const [emotion, setEmotion] = useState("calm"); // calm|action|analyzing|critical
-  const [volume, setVolume] = useState(0); // 0..1
-  const [transformState, setTransformState] = useState("normal");
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [sessionId, setSessionId] = useState(null);
-  const [username, setUsername] = useState(null);
-  const [assistantName, setAssistantName] = useState("Jarvis");
-  const [role, setRole] = useState(null);
-  const [permissions, setPermissions] = useState(null);
-  const [showAuthModal, setShowAuthModal] = useState(false);
-  const [permissionPrompt, setPermissionPrompt] = useState(null);
-  const [voiceEnabled, setVoiceEnabled] = useState(true);
-
-  // refs
-  const wakeRecognizer = useRef(null);
-  const isHandlingCommand = useRef(false);
-  const assistantNameRef = useRef("Jarvis");
-  const micStreamRef = useRef(null);
-  const filamentCanvasRef = useRef(null);
-  const filamentWorkerRef = useRef(null);
-  const audioWorkerRef = useRef(null);
-
   const isMobile = useMemo(() => {
     try {
       const ua = (navigator.userAgent || "").toLowerCase();
@@ -89,20 +61,33 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    // Mobile Chrome often requires an explicit user gesture before SpeechRecognition works reliably.
-    // Default: enabled on desktop, disabled on mobile until the user taps.
-    try {
-      if (!isMobile) {
-        setVoiceEnabled(true);
-        return;
-      }
-      const stored = localStorage.getItem("jarvis_voice_enabled");
-      setVoiceEnabled(stored === "1");
-    } catch {
-      if (isMobile) setVoiceEnabled(false);
-    }
-  }, [isMobile]);
+  // Light state only — avoid large objects in state
+  const [listening, setListening] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+  const [wakePulse, setWakePulse] = useState(false);
+  const [logs, setLogs] = useState([]);
+  const [emotion, setEmotion] = useState("calm"); // calm|action|analyzing|critical
+  const [volume, setVolume] = useState(0); // 0..1
+  const [transformState, setTransformState] = useState("normal");
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [sessionId, setSessionId] = useState(null);
+  const [username, setUsername] = useState(null);
+  const [assistantName, setAssistantName] = useState("Jarvis");
+  const [role, setRole] = useState(null);
+  const [, setPermissions] = useState(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [permissionPrompt, setPermissionPrompt] = useState(null);
+  const [voiceUnlocked, setVoiceUnlocked] = useState(() => !isMobile);
+
+  // refs
+  const wakeRecognizer = useRef(null);
+  const isHandlingCommand = useRef(false);
+  const assistantNameRef = useRef("Jarvis");
+  const micStreamRef = useRef(null);
+  const filamentWorkerRef = useRef(null);
+
+  // No "Enable Voice" button: voice is always on.
+  // On mobile we unlock mic/STT on first user gesture.
 
   useEffect(() => {
     assistantNameRef.current = assistantName || "Jarvis";
@@ -119,6 +104,94 @@ export default function App() {
   const addLog = useCallback((type, message) => {
     setLogs(prev => [{ type, message, time: new Date().toLocaleTimeString() }, ...prev.slice(0, 12)]);
   }, []);
+
+  // Unlock voice on mobile with a first user gesture (no explicit button).
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (!isMobile) {
+      if (!voiceUnlocked) setVoiceUnlocked(true);
+      return;
+    }
+    if (voiceUnlocked) return;
+
+    let done = false;
+    const onFirstTap = async () => {
+      if (done) return;
+      done = true;
+      try {
+        // User gesture: request mic permission + warm up STT.
+        await initAudioProcessing();
+        await primeSpeechRecognition(voiceLang);
+        setVoiceUnlocked(true);
+        addLog("system", "Voice ready.");
+      } catch {
+        done = false;
+        addLog("system", "Microphone permission is required for voice.");
+        try { speak("Please allow microphone permission."); } catch {}
+      }
+    };
+
+    addLog("system", "Tap anywhere once to enable voice.");
+    window.addEventListener("pointerdown", onFirstTap, { once: true });
+    return () => {
+      try { window.removeEventListener("pointerdown", onFirstTap); } catch {}
+    };
+  }, [addLog, isAuthenticated, isMobile, voiceLang, voiceUnlocked]);
+
+  const agentStartAttemptedRef = useRef(false);
+  const agentStartInFlightRef = useRef(false);
+
+  useEffect(() => {
+    agentStartAttemptedRef.current = false;
+    agentStartInFlightRef.current = false;
+  }, [sessionId]);
+
+  const _launchJarvisAgentProtocol = useCallback((action) => {
+    // Avoid navigating away from the page; use an iframe.
+    try {
+      const iframe = document.createElement("iframe");
+      iframe.style.display = "none";
+      iframe.src = `jarvisagent://${action}`;
+      document.body.appendChild(iframe);
+      setTimeout(() => {
+        try { document.body.removeChild(iframe); } catch {}
+      }, 1200);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const _pollAgentOnline = useCallback(async (sid, timeoutMs = 20000) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      try {
+        const r = await fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(sid)}`);
+        const data = await r.json().catch(() => null);
+        const agents = Array.isArray(data?.agents) ? data.agents : [];
+        if (agents.length) return true;
+      } catch {}
+      await new Promise(res => setTimeout(res, 900));
+    }
+    return false;
+  }, []);
+
+  const requestAgentStart = useCallback(async ({ silent = false } = {}) => {
+    if (!sessionId) return false;
+    if (agentStartInFlightRef.current) return false;
+    agentStartInFlightRef.current = true;
+    agentStartAttemptedRef.current = true;
+
+    try {
+      if (!silent) addLog("system", "Starting PC agent…");
+      _launchJarvisAgentProtocol("start");
+      const ok = await _pollAgentOnline(sessionId, 20000);
+      if (ok && !silent) addLog("system", "PC agent is online.");
+      return ok;
+    } finally {
+      agentStartInFlightRef.current = false;
+    }
+  }, [addLog, _launchJarvisAgentProtocol, _pollAgentOnline, sessionId]);
 
   // ---------- Offload visuals to worker (OffscreenCanvas) ----------
   useEffect(() => {
@@ -296,100 +369,7 @@ export default function App() {
         else if (idleHandle) clearTimeout(idleHandle);
       } catch {}
     };
-  }, [addLog, isAuthenticated, voiceEnabled]);
-
-  // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!voiceEnabled) return;
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      addLog("system", "SpeechRecognition not available in this browser.");
-      return;
-    }
-
-    const recognizer = new SpeechRecognition();
-    recognizer.continuous = true;
-    recognizer.interimResults = false;
-    recognizer.lang = "en-US";
-
-    let active = false;
-    let startAttempts = 0;
-
-    const safeStart = () => {
-      if (active) return;
-      try {
-        recognizer.start();
-        active = true;
-        startAttempts = 0;
-      } catch (err) {
-        startAttempts++;
-        if (startAttempts < 6) setTimeout(safeStart, 400 + startAttempts * 200);
-      }
-    };
-
-    recognizer.onresult = (e) => {
-      try {
-        const result = e.results[e.resultIndex];
-        const transcript = normalizeWake(result[0].transcript || "");
-        if (!transcript) return;
-        if (isHandlingCommand.current) return;
-
-        const nm = normalizeWake(assistantNameRef.current || "Jarvis");
-        const wakeHit =
-          (nm && (transcript.includes(`hey ${nm}`) || transcript.includes(`ok ${nm}`) || transcript.includes(`okay ${nm}`) || transcript === nm)) ||
-          transcript.includes("wake up") ||
-          transcript.includes("wakeup");
-
-        if (wakeHit) {
-
-          // vibrate UI briefly (visual) and pause auto recognition
-          setWakePulse(true);
-          setTimeout(() => setWakePulse(false), 900);
-
-          // stop recognizer safely so we can do single-shot capture
-          try { recognizer.stop(); } catch {}
-          active = false;
-
-          speak("Yes sir, I'm listening.", () => {
-            setTimeout(async () => await handleVoiceCommand(), 150);
-          });
-        }
-      } catch (err) {
-        console.warn("Wake onresult parse err:", err);
-      }
-    };
-
-    recognizer.onerror = (ev) => {
-      const errName = ev?.error || "unknown";
-      addLog("system", `Wake listener error: ${errName}`);
-      active = false;
-      // restart with backoff
-      if (isAuthenticated) setTimeout(safeStart, errName === "aborted" ? 700 : 1500);
-    };
-
-    recognizer.onend = () => {
-      active = false;
-      if (!isHandlingCommand.current && isAuthenticated) setTimeout(safeStart, 700);
-    };
-
-    // Start after a short delay to avoid slowing initial paint
-    const startTimer = setTimeout(safeStart, 600);
-    wakeRecognizer.current = recognizer;
-    addLog("system", "Wake-word listener started.");
-
-    return () => {
-      clearTimeout(startTimer);
-      try {
-        recognizer.onresult = null;
-        recognizer.onerror = null;
-        recognizer.onend = null;
-        recognizer.stop();
-      } catch {}
-    };
-    // run once
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addLog, isAuthenticated]);
+  }, [addLog, isAuthenticated, isMobile, voiceUnlocked]);
 
   // ----- handleVoiceCommand (stable reference) -----
   const handleVoiceCommand = useCallback(async () => {
@@ -410,8 +390,10 @@ export default function App() {
         addLog("system", "Using Google Speech-to-Text...");
         const { audio_b64, sample_rate_hz } = await recordPcm16Once({
           sampleRateHz: 16000,
-          maxMs: isIOS ? 9000 : 7500,
-          silenceStopMs: isIOS ? 1400 : 1100,
+          maxMs: isIOS ? 7500 : 6000,
+          silenceStopMs: isIOS ? 1100 : 900,
+          startRms: 0.012,
+          silenceRms: 0.009,
         });
         if (!audio_b64) return null;
         const resp = await googleSpeechToText(sessionId, audio_b64, voiceLang, sample_rate_hz);
@@ -426,7 +408,7 @@ export default function App() {
     if (webSpeechSupported) {
       try {
         transcript = await listenOnce({
-          timeout: isMobile ? 16000 : 10000,
+          timeout: isMobile ? 12000 : 9000,
           silenceTimeoutMs: isIOS ? 1500 : 1100,
           interim: false,
           language: voiceLang,
@@ -892,6 +874,95 @@ export default function App() {
     }
   }, [sessionId, addLog, isMobile, isIOS, voiceLang]);
 
+  // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (isMobile && !voiceUnlocked) return;
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      addLog("system", "SpeechRecognition not available in this browser.");
+      return;
+    }
+
+    const recognizer = new SpeechRecognition();
+    recognizer.continuous = true;
+    recognizer.interimResults = false;
+    recognizer.lang = "en-US";
+
+    let active = false;
+    let startAttempts = 0;
+
+    const safeStart = () => {
+      if (active) return;
+      try {
+        recognizer.start();
+        active = true;
+        startAttempts = 0;
+      } catch (err) {
+        startAttempts++;
+        if (startAttempts < 6) setTimeout(safeStart, 400 + startAttempts * 200);
+      }
+    };
+
+    recognizer.onresult = (e) => {
+      try {
+        const result = e.results[e.resultIndex];
+        const transcript = normalizeWake(result[0].transcript || "");
+        if (!transcript) return;
+        if (isHandlingCommand.current) return;
+
+        const nm = normalizeWake(assistantNameRef.current || "Jarvis");
+        const wakeHit =
+          (nm && (transcript.includes(`hey ${nm}`) || transcript.includes(`ok ${nm}`) || transcript.includes(`okay ${nm}`) || transcript === nm)) ||
+          transcript.includes("wake up") ||
+          transcript.includes("wakeup");
+
+        if (wakeHit) {
+
+          // vibrate UI briefly (visual) and pause auto recognition
+          setWakePulse(true);
+          setTimeout(() => setWakePulse(false), 900);
+
+          // stop recognizer safely so we can do single-shot capture
+          try { recognizer.stop(); } catch {}
+          active = false;
+
+          setTimeout(async () => await handleVoiceCommand(), 60);
+        }
+      } catch (err) {
+        console.warn("Wake onresult parse err:", err);
+      }
+    };
+
+    recognizer.onerror = (ev) => {
+      const errName = ev?.error || "unknown";
+      addLog("system", `Wake listener error: ${errName}`);
+      active = false;
+      // restart with backoff
+      if (isAuthenticated) setTimeout(safeStart, errName === "aborted" ? 700 : 1500);
+    };
+
+    recognizer.onend = () => {
+      active = false;
+      if (!isHandlingCommand.current && isAuthenticated) setTimeout(safeStart, 700);
+    };
+
+    // Start after a short delay to avoid slowing initial paint
+    const startTimer = setTimeout(safeStart, 600);
+    wakeRecognizer.current = recognizer;
+    addLog("system", "Wake-word listener started.");
+
+    return () => {
+      clearTimeout(startTimer);
+      try {
+        recognizer.onresult = null;
+        recognizer.onerror = null;
+        recognizer.onend = null;
+        recognizer.stop();
+      } catch {}
+    };
+  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceUnlocked]);
+
   // If filament worker exists, update it when relevant props change
   useEffect(() => {
     if (!filamentWorkerRef.current) return;
@@ -936,36 +1007,32 @@ export default function App() {
       .catch(() => {});
   }, [addLog]);
 
-  // On every login (including auto-session restore), if no PC agent is connected, ask the user to start it.
+  // On every login (including auto-session restore), auto-start the PC agent.
   useEffect(() => {
     if (!isAuthenticated || !sessionId) return;
 
     let cancelled = false;
-    fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(sessionId)}`)
-      .then(r => r.json())
-      .then(data => {
+    (async () => {
+      try {
+        const r = await fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(sessionId)}`);
+        const data = await r.json().catch(() => null);
         if (cancelled) return;
         const agents = Array.isArray(data?.agents) ? data.agents : [];
         if (agents.length) return;
 
-        // Avoid overwriting an existing permission prompt (e.g., a missing-capability prompt).
-        setPermissionPrompt(prev => {
-          if (prev) return prev;
-          try { speak("PC agent is not running. Please approve the popup to start it."); } catch {}
-          return {
-            kind: "start_agent",
-            title: "PC agent not running",
-            message: "To run PC tasks (like opening Notepad), Jarvis needs a small agent running on your Windows PC.",
-            details: "Start it now? (Requires a one-time protocol install on this PC.)",
-          };
-        });
-      })
-      .catch(() => {});
+        // Attempt auto-start once per session.
+        if (!agentStartAttemptedRef.current) {
+          await requestAgentStart({ silent: true });
+        }
+      } catch {
+        // ignore
+      }
+    })();
 
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, sessionId]);
+  }, [isAuthenticated, sessionId, requestAgentStart]);
 
   useEffect(() => {
     const storedSession = localStorage.getItem("jarvis_session");
@@ -973,15 +1040,17 @@ export default function App() {
     const storedRole = localStorage.getItem("jarvis_role");
     const storedPermissionsRaw = localStorage.getItem("jarvis_permissions");
     const storedAssistantName = localStorage.getItem("jarvis_assistant_name");
-    if (storedSession && storedUsername) {
-      fetch(`${API_URL}/api/validate-session`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: storedSession })
-      })
-        .then(res => res.json())
-        .then(data => {
-          if (data.valid) {
+
+    (async () => {
+      if (storedSession && storedUsername) {
+        try {
+          const r = await fetch(`${API_URL}/api/validate-session`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: storedSession })
+          });
+          const data = await r.json().catch(() => null);
+          if (data?.valid) {
             setSessionId(storedSession);
             setUsername(storedUsername);
             setRole(data.role || storedRole || null);
@@ -995,19 +1064,16 @@ export default function App() {
             setAssistantName(nextName || "Jarvis");
             localStorage.setItem("jarvis_assistant_name", nextName || "Jarvis");
             setIsAuthenticated(true);
-          } else {
-            localStorage.removeItem("jarvis_session");
-            localStorage.removeItem("jarvis_username");
-            localStorage.removeItem("jarvis_role");
-            localStorage.removeItem("jarvis_permissions");
-            localStorage.removeItem("jarvis_assistant_name");
-            setShowAuthModal(true);
+            return;
           }
-        })
-        .catch(() => setShowAuthModal(true));
-    } else {
+        } catch {
+          // fallthrough
+        }
+      }
+
+      // Default: show auth modal
       setShowAuthModal(true);
-    }
+    })();
   }, []);
 
   // ----------------- RENDER -----------------
@@ -1042,8 +1108,10 @@ export default function App() {
               setPermissionPrompt(null);
               try {
                 if (req.kind === "start_agent") {
-                  window.location.href = "jarvisagent://start";
-                  addLog("system", "Requested agent start (jarvisagent://start). If nothing happens, install scripts/install_jarvisagent_protocol.ps1 on this PC.");
+                  const ok = await requestAgentStart({ silent: false });
+                  if (!ok) {
+                    addLog("system", "Agent start requested, but it is still offline. If nothing opened, install scripts/install_jarvisagent_protocol.ps1 on this PC, or start the agent manually.");
+                  }
                   return;
                 }
 
@@ -1068,38 +1136,6 @@ export default function App() {
             <span style={{ color: "#00ffc8", fontSize: 14, opacity: 0.9 }}>
               Assistant: {assistantName || "Jarvis"}
             </span>
-
-            {isMobile && (
-              <button
-                onClick={async () => {
-                  if (voiceEnabled) return;
-                  try {
-                    addLog("system", "Enabling voice…");
-                    // Prompt mic permission (user gesture) and warm up recognition.
-                    await initAudioProcessing();
-                    await primeSpeechRecognition(voiceLang);
-                    setVoiceEnabled(true);
-                    try { localStorage.setItem("jarvis_voice_enabled", "1"); } catch {}
-                    speak("Voice enabled.");
-                  } catch {
-                    addLog("system", "Could not enable voice. Please allow microphone permission.");
-                    try { speak("Please allow microphone permission to enable voice."); } catch {}
-                  }
-                }}
-                style={{
-                  background: voiceEnabled ? "rgba(0,255,200,0.15)" : "rgba(255,210,77,0.15)",
-                  border: "1px solid rgba(0,255,200,0.35)",
-                  color: "#00ffc8",
-                  cursor: voiceEnabled ? "default" : "pointer",
-                  borderRadius: 10,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  opacity: voiceEnabled ? 0.75 : 1,
-                }}
-              >
-                {voiceEnabled ? "Voice On" : "Enable Voice"}
-              </button>
-            )}
 
             <button onClick={() => {
               // Best-effort: stop the local PC agent when the user logs out.
@@ -1127,10 +1163,7 @@ export default function App() {
               setPermissions(null);
               setPermissionPrompt(null);
               try {
-                if (isMobile) {
-                  localStorage.removeItem("jarvis_voice_enabled");
-                  setVoiceEnabled(false);
-                }
+                if (isMobile) setVoiceUnlocked(false);
               } catch {}
               setShowAuthModal(true);
               speak("Logged out successfully.");
