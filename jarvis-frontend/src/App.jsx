@@ -81,7 +81,11 @@ export default function App() {
 
   const pendingAgentAutoStartRef = useRef(false);
   const autoStartListenerAttachedRef = useRef(false);
+  const deviceAutoConfiguredRef = useRef(false);
+  const googleSttDisabledUntilRef = useRef(0);
+  const lastWakeNoSpeechLogRef = useRef(0);
   const [voiceUnlocked, setVoiceUnlocked] = useState(() => !isMobile);
+  const [vizAudioUnlocked, setVizAudioUnlocked] = useState(false);
 
   // refs
   const wakeRecognizer = useRef(null);
@@ -96,6 +100,32 @@ export default function App() {
   useEffect(() => {
     assistantNameRef.current = assistantName || "Jarvis";
   }, [assistantName]);
+
+  // After auth (including session restore), auto-bind this user to a connected agent if possible.
+  // This prevents "No device assigned" errors for PC actions.
+  useEffect(() => {
+    if (!isAuthenticated || !sessionId) return;
+    if (deviceAutoConfiguredRef.current) return;
+    deviceAutoConfiguredRef.current = true;
+
+    let cancelled = false;
+    const h = scheduleIdle(async () => {
+      if (cancelled) return;
+      try {
+        await configureMyPc(sessionId);
+      } catch {
+        // best-effort; if no agent is connected, user can still start it via modal/OS autostart
+      }
+    }, 900);
+
+    return () => {
+      cancelled = true;
+      try {
+        if (h && typeof window.cancelIdleCallback === "function") window.cancelIdleCallback(h);
+        else if (h) clearTimeout(h);
+      } catch {}
+    };
+  }, [isAuthenticated, sessionId]);
 
   const normalizeWake = useCallback((s) => {
     return String(s || "")
@@ -127,6 +157,7 @@ export default function App() {
         await initAudioProcessing();
         await primeSpeechRecognition(voiceLang);
         setVoiceUnlocked(true);
+        setVizAudioUnlocked(true);
         addLog("system", "Voice ready.");
       } catch {
         done = false;
@@ -141,6 +172,26 @@ export default function App() {
       try { window.removeEventListener("pointerdown", onFirstTap); } catch {}
     };
   }, [addLog, isAuthenticated, isMobile, voiceLang, voiceUnlocked]);
+
+  // Desktop: delay mic/analyser init until a real user gesture to reduce post-login jank
+  // and avoid conflicts with SpeechRecognition startup.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (isMobile) return;
+    if (vizAudioUnlocked) return;
+
+    let done = false;
+    const onFirstGesture = () => {
+      if (done) return;
+      done = true;
+      setVizAudioUnlocked(true);
+    };
+
+    window.addEventListener("pointerdown", onFirstGesture, { once: true });
+    return () => {
+      try { window.removeEventListener("pointerdown", onFirstGesture); } catch {}
+    };
+  }, [isAuthenticated, isMobile, vizAudioUnlocked]);
 
   const agentStartAttemptedRef = useRef(false);
   const agentStartInFlightRef = useRef(false);
@@ -334,6 +385,7 @@ export default function App() {
   // ---------- Audio processing (throttled) ----------
   useEffect(() => {
     if (!isAuthenticated) return;
+    if (!vizAudioUnlocked) return;
     let rafId = null;
     let audioData = null;
     let lastWorkerSend = 0;
@@ -396,7 +448,7 @@ export default function App() {
     // This reduces post-auth jank and keeps initial interactions snappy.
     idleHandle = scheduleIdle(() => {
       if (!cancelled && document.visibilityState === "visible") init();
-    }, 1500);
+    }, 450);
 
     return () => {
       cancelled = true;
@@ -408,7 +460,28 @@ export default function App() {
         else if (idleHandle) clearTimeout(idleHandle);
       } catch {}
     };
-  }, [addLog, isAuthenticated, isMobile, voiceUnlocked]);
+  }, [addLog, isAuthenticated, isMobile, voiceUnlocked, vizAudioUnlocked]);
+
+  // Prime SpeechRecognition after auth so first command starts faster.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (isMobile && !voiceUnlocked) return;
+    let cancelled = false;
+    const h = scheduleIdle(async () => {
+      if (cancelled) return;
+      try {
+        await primeSpeechRecognition(voiceLang);
+      } catch {}
+    }, 650);
+
+    return () => {
+      cancelled = true;
+      try {
+        if (h && typeof window.cancelIdleCallback === "function") window.cancelIdleCallback(h);
+        else if (h) clearTimeout(h);
+      } catch {}
+    };
+  }, [isAuthenticated, isMobile, voiceLang, voiceUnlocked]);
 
   // ----- handleVoiceCommand (stable reference) -----
   const handleVoiceCommand = useCallback(async () => {
@@ -426,7 +499,10 @@ export default function App() {
 
     const tryGoogleFallback = async () => {
       try {
-        addLog("system", "Using Google Speech-to-Text...");
+        const now = Date.now();
+        if (googleSttDisabledUntilRef.current && now < googleSttDisabledUntilRef.current) {
+          return null;
+        }
         const { audio_b64, sample_rate_hz } = await recordPcm16Once({
           sampleRateHz: 16000,
           maxMs: isIOS ? 7500 : 6000,
@@ -438,7 +514,14 @@ export default function App() {
         const resp = await googleSpeechToText(sessionId, audio_b64, voiceLang, sample_rate_hz);
         return (resp?.text || "").toString().trim() || null;
       } catch (e) {
-        console.warn("Google STT fallback failed:", e);
+        const msg = (e?.message || String(e) || "").toLowerCase();
+        // If backend returns 501 (not configured/unsupported), disable Google STT for a while.
+        if (msg.includes("status: 501") || msg.includes("http 501") || msg.includes("not implemented")) {
+          googleSttDisabledUntilRef.current = Date.now() + 5 * 60 * 1000;
+        } else if (msg.includes("status: 502") || msg.includes("http 502")) {
+          // Temporary upstream issue; cool down briefly to avoid repeated slow fallbacks.
+          googleSttDisabledUntilRef.current = Date.now() + 60 * 1000;
+        }
         return null;
       }
     };
@@ -878,6 +961,16 @@ export default function App() {
                   deviceId,
                 });
                 try { speak("Your PC agent is offline. Please approve the popup to start it."); } catch {}
+              } else if (/no device assigned to this user/i.test(String(permMsg || raw))) {
+                setPermissionPrompt({
+                  title: "PC not configured",
+                  message: "Your account is not linked to a PC device yet. Configure this PC now?",
+                  details: "This links your user to the connected PC agent so PC actions can run.",
+                  kind: "configure_pc",
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                });
+                try { speak("Your PC is not configured yet. Please approve the popup."); } catch {}
               } else {
                 addLog("system", `PC action dispatch failed: ${permMsg || raw}`);
                 addLog("system", "Make sure pc_agent.py is running on your PC and connected.");
@@ -975,7 +1068,17 @@ export default function App() {
 
     recognizer.onerror = (ev) => {
       const errName = ev?.error || "unknown";
-      addLog("system", `Wake listener error: ${errName}`);
+      // Reduce disruptive log spam; "no-speech" is common and not actionable.
+      if (errName !== "no-speech") {
+        addLog("system", `Wake listener error: ${errName}`);
+      } else {
+        const now = Date.now();
+        // "no-speech" is extremely common; keep it very quiet.
+        if (now - lastWakeNoSpeechLogRef.current > 10 * 60 * 1000) {
+          lastWakeNoSpeechLogRef.current = now;
+          addLog("system", "Wake listener: no speech detected");
+        }
+      }
       active = false;
       // restart with backoff
       if (isAuthenticated) setTimeout(safeStart, errName === "aborted" ? 700 : 1500);
@@ -1171,6 +1274,29 @@ export default function App() {
                   const ok = await requestAgentStart({ silent: false });
                   if (!ok) {
                     addLog("system", "Agent start requested, but it is still offline. If nothing opened, install scripts/install_jarvisagent_protocol.ps1 on this PC, or start the agent manually.");
+                  }
+                  return;
+                }
+
+                if (req.kind === "configure_pc") {
+                  addLog("system", "Configuring your PC device…");
+                  try {
+                    await configureMyPc(sessionId);
+                  } catch {
+                    // If the agent isn't online yet, attempt to start it (best-effort) then retry.
+                    const ok = await requestAgentStart({ silent: false });
+                    if (!ok) {
+                      addLog("system", "PC agent is still offline. Start it on this PC and retry.");
+                      return;
+                    }
+                    await configureMyPc(sessionId);
+                  }
+
+                  if (Array.isArray(req.pendingActions) && req.pendingActions.length) {
+                    await dispatchDeviceActions(req.pendingActions, sessionId, req.sourceText || "");
+                    addLog("system", "PC configured. Action queued.");
+                  } else {
+                    addLog("system", "PC configured.");
                   }
                   return;
                 }

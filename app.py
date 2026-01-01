@@ -1061,7 +1061,14 @@ async def device_dispatch(req: DeviceDispatchRequest):
         if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
             did = DEFAULT_DEVICE_ID
         if not did:
-            raise HTTPException(status_code=403, detail="No device assigned to this user")
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "No device assigned to this user",
+                    "action": "configure_pc",
+                    "hint": "Configure a device via /api/user/device/configure (auto-pick) or /api/user/device/set (explicit device_id).",
+                },
+            )
 
     if not await device_hub.is_connected(did):
         raise HTTPException(status_code=409, detail={
@@ -1156,7 +1163,14 @@ async def device_permissions_get(session_id: str, device_id: str | None = None, 
         if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
             did = DEFAULT_DEVICE_ID
         if not did:
-            raise HTTPException(status_code=403, detail="No device assigned to this user")
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "No device assigned to this user",
+                    "action": "configure_pc",
+                    "hint": "Configure a device via /api/user/device/configure (auto-pick) or /api/user/device/set (explicit device_id).",
+                },
+            )
 
     saved = _get_saved_device_permissions(did) or {}
     connected = False
@@ -1194,7 +1208,14 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
         if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
             did = DEFAULT_DEVICE_ID
         if not did:
-            raise HTTPException(status_code=403, detail="No device assigned to this user")
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "No device assigned to this user",
+                    "action": "configure_pc",
+                    "hint": "Configure a device via /api/user/device/configure (auto-pick) or /api/user/device/set (explicit device_id).",
+                },
+            )
 
     perms = req.permissions or {}
     if not isinstance(perms, dict) or not perms:
@@ -1924,75 +1945,11 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                     response["text"] = (response.get("text") or "") + "\n\n(Some actions require admin privileges and were skipped.)"
 
     # In cloud mode, forward any PC/device actions to the connected local agent.
-    if CLOUD_MODE and actions:
-        device_actions = [a for a in actions if _is_remote_device_action(a)]
-        safe_actions = [a for a in actions if not _is_remote_device_action(a)]
-
-        if device_actions:
-            if not _can_control_device(principal):
-                response["text"] = (response.get("text") or "") + "\n\n(Device actions are not permitted for this account.)"
-            else:
-                # Resolve target device
-                did = None
-                if role == "admin" and msg.device_id:
-                    did = _validate_device_id_or_400(msg.device_id)
-                elif role != "admin" and msg.device_id:
-                    response["text"] = (response.get("text") or "") + "\n\n(Users cannot target another device.)"
-                    did = None
-                else:
-                    did = _get_owner_device_id(msg.user)
-                    if not did and DEVICE_OWNER_USERNAME and (msg.user or "").lower() == DEVICE_OWNER_USERNAME.lower():
-                        did = DEFAULT_DEVICE_ID
-
-                if not did:
-                    response["text"] = (response.get("text") or "") + "\n\n(No device assigned to this user — set it via /api/user/device/set.)"
-                
-                if await device_hub.is_connected(did):
-                    agent = await device_hub.get_agent(did)
-                    caps = (agent or {}).get("capabilities") or None
-                    if not caps:
-                        response["text"] = (response.get("text") or "") + "\n\n(No permission: PC agent did not report capabilities. Update pc_agent.py and restart the agent.)"
-                    else:
-                        def _capability_requirement(action_type: str):
-                            t = (action_type or "").strip()
-                            if t in ("open_app", "close_app", "switch_app"):
-                                return ("allow_app_control", "JARVIS_AGENT_ALLOW_APP_CONTROL")
-                            if t == "execute_command":
-                                return ("allow_execute_command", "JARVIS_AGENT_ALLOW_EXECUTE_COMMAND")
-                            if t in ("capture_screen", "screen_navigation"):
-                                return ("allow_screen", "JARVIS_AGENT_ALLOW_SCREEN")
-                            if t in ("read", "write", "edit", "delete", "move", "copy", "list", "mkdir", "cleanup"):
-                                return ("allow_file_ops", "JARVIS_AGENT_ALLOW_FILE_OPS")
-                            if t in ("self_update", "self_add"):
-                                return ("allow_self_update", "JARVIS_AGENT_ALLOW_SELF_UPDATE")
-                            return None
-
-                        denied = None
-                        for a in (device_actions or []):
-                            at = (a or {}).get("type") or ""
-                            req_cap = _capability_requirement(at)
-                            if not req_cap:
-                                continue
-                            key, env_name = req_cap
-                            if not bool(caps.get(key)):
-                                denied = f"No permission: '{at}' is disabled on your PC agent. Enable {env_name}=true on the PC and restart the agent."
-                                break
-
-                        if denied:
-                            response["text"] = (response.get("text") or "") + f"\n\n({denied})"
-                        else:
-                            background_tasks.add_task(
-                                _dispatch_actions_to_device,
-                                did,
-                                msg.user or "user",
-                                device_actions,
-                                msg.text,
-                            )
-                            response["text"] = (response.get("text") or "") + "\n\n(Queued actions for your connected PC.)"
-                else:
-                    response["text"] = (response.get("text") or "") + "\n\n(Your PC agent is offline — start pc_agent.py on your Windows PC.)"
-
-        response["actions"] = safe_actions
+    if CLOUD_MODE:
+        # In cloud mode we DO NOT execute or dispatch device actions from here.
+        # The frontend is responsible for dispatching device actions via /api/device/dispatch
+        # so it can show permission/start-agent UX.
+        response["actions"] = actions or []
         return response
 
     # Local mode: execute actions directly on this machine.

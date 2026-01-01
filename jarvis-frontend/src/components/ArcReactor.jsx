@@ -32,9 +32,10 @@ export default function ArcReactor({
   const baseFilamentCount = useMemo(() => {
     try {
       const small = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(max-width: 520px)").matches;
-      return small ? 120 : 180;
+      // Keep this lightweight; adaptive quality will raise/lower further.
+      return small ? 90 : 130;
     } catch {
-      return 160;
+      return 110;
     }
   }, []);
 
@@ -58,7 +59,8 @@ export default function ArcReactor({
     resize();
     window.addEventListener("resize", resize);
 
-    const baseRadii = [72, 98, 128, 156, 186, 220];
+    // Fewer rings = less overdraw and a cleaner, more realistic look.
+    const baseRadii = [74, 106, 142, 184, 222];
 
     // Adaptive load shedding for low-end devices.
     // We track FPS over ~1s and reduce filament count if FPS drops.
@@ -158,6 +160,24 @@ export default function ArcReactor({
       ctx.arc(cx, cy, cssSize * 0.5, 0, Math.PI * 2);
       ctx.fill();
 
+      // Metal bezel (adds realism with a single stroke)
+      const outerR = baseRadii[baseRadii.length - 1] * reactiveScale;
+      ctx.save();
+      ctx.globalCompositeOperation = "source-over";
+      const bezel = ctx.createRadialGradient(cx, cy, outerR * 0.72, cx, cy, outerR * 1.06);
+      bezel.addColorStop(0, "rgba(0,0,0,0.00)");
+      bezel.addColorStop(0.55, "rgba(255,255,255,0.08)");
+      bezel.addColorStop(0.72, "rgba(255,255,255,0.14)");
+      bezel.addColorStop(0.90, "rgba(0,0,0,0.28)");
+      bezel.addColorStop(1, "rgba(0,0,0,0.00)");
+      ctx.strokeStyle = bezel;
+      ctx.globalAlpha = 0.95;
+      ctx.lineWidth = 16;
+      ctx.beginPath();
+      ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+
       // Subtle glassy rim highlight (adds depth)
       ctx.save();
       ctx.globalCompositeOperation = "screen";
@@ -204,7 +224,7 @@ export default function ArcReactor({
         const a1 = rot + (Math.PI * 1.55);
 
         ctx.shadowColor = color.ring;
-        ctx.shadowBlur = (4 + amp * 12) * (0.45 + 0.55 * q);
+        ctx.shadowBlur = (3 + amp * 10) * (0.40 + 0.60 * q);
         ctx.strokeStyle = color.ring;
         ctx.globalAlpha = (0.20 + (0.10 * (1 - i / baseRadii.length)) + amp * 0.18) * (0.75 + 0.25 * q);
         ctx.lineWidth = 2 - i * 0.12;
@@ -226,11 +246,12 @@ export default function ArcReactor({
       // Mechanical tick marks (adds realism with low cost)
       ctx.save();
       ctx.globalCompositeOperation = "screen";
-      const ticks = 48;
+      const ticks = 36;
       const tickR = baseRadii[baseRadii.length - 2] * reactiveScale;
-      const tickLen = 8;
+      const tickLen = 7;
       ctx.translate(cx, cy);
-      ctx.rotate(t * 0.08);
+      // Keep ticks mostly static for a more grounded, mechanical feel.
+      ctx.rotate(Math.PI / 48);
       ctx.lineCap = "round";
       ctx.strokeStyle = "rgba(255,255,255,0.22)";
       ctx.lineWidth = 1;
@@ -257,8 +278,8 @@ export default function ArcReactor({
       for (let i = 0; i < filamentCount; i++) {
         const ang = (i / filamentCount) * Math.PI * 2 + t * 0.35;
         const wob = Math.sin(t * 1.6 + i * 0.25) * (2 + amp * 7);
-        const innerR = baseR * 0.35;
-        const outerR = baseR * 0.95;
+        const innerR = baseR * 0.28;
+        const outerR = baseR * 1.02;
 
         const ix = cx + innerR * Math.cos(ang + wob * 0.01);
         const iy = cy + innerR * Math.sin(ang + wob * 0.01);
@@ -267,12 +288,12 @@ export default function ArcReactor({
         const mx = ix + (ox - ix) * 0.5 + Math.sin(t * 1.8 + i * 0.6) * (2.2 + amp * 4.5);
         const my = iy + (oy - iy) * 0.5 + Math.cos(t * 1.7 + i * 0.5) * (2.2 + amp * 4.5);
 
-        const alpha = 0.06 + amp * 0.22 + (i % 3) * 0.015;
+        const alpha = 0.045 + amp * 0.18 + (i % 3) * 0.010;
         ctx.strokeStyle = color.accent;
         ctx.globalAlpha = alpha;
-        ctx.lineWidth = 0.6 + amp * 1.6;
+        ctx.lineWidth = 0.55 + amp * 1.25;
         ctx.shadowColor = color.accent;
-        ctx.shadowBlur = (5 + amp * 14) * (0.35 + 0.65 * q);
+        ctx.shadowBlur = (4 + amp * 11) * (0.30 + 0.70 * q);
         ctx.beginPath();
         ctx.moveTo(ix, iy);
         ctx.quadraticCurveTo(mx, my, ox, oy);
@@ -285,7 +306,7 @@ export default function ArcReactor({
       ctx.globalCompositeOperation = "lighter";
       const coreR = (22 + amp * 10) * reactiveScale;
       ctx.shadowColor = color.core;
-      ctx.shadowBlur = (14 + amp * 26) * (0.55 + 0.45 * q);
+      ctx.shadowBlur = (12 + amp * 22) * (0.55 + 0.45 * q);
 
       // Lens reflection sweep (cheap premium look)
       // Single moving arc with a soft gradient; scaled down on low quality.
