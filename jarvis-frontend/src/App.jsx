@@ -12,6 +12,7 @@ import {
   configureMyPc,
   dispatchDeviceActions,
   grantDevicePermissions,
+  getSavedDevicePermissions,
   googleSpeechToText,
   API_URL
 } from "./utils/api";
@@ -77,6 +78,9 @@ export default function App() {
   const [, setPermissions] = useState(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
+
+  const pendingAgentAutoStartRef = useRef(false);
+  const autoStartListenerAttachedRef = useRef(false);
   const [voiceUnlocked, setVoiceUnlocked] = useState(() => !isMobile);
 
   // refs
@@ -192,6 +196,41 @@ export default function App() {
       agentStartInFlightRef.current = false;
     }
   }, [addLog, _launchJarvisAgentProtocol, _pollAgentOnline, sessionId]);
+
+  const _hasAnySavedDevicePermission = useCallback((perms) => {
+    if (!perms || typeof perms !== "object") return false;
+    return Object.values(perms).some(v => v === true);
+  }, []);
+
+  // If the user already granted device permissions, we can "auto-start" the agent on the
+  // next user gesture after login (browser-safe way to trigger jarvisagent://).
+  useEffect(() => {
+    if (!isAuthenticated || !sessionId) return;
+    if (!pendingAgentAutoStartRef.current) return;
+    if (isMobile) return;
+    if (autoStartListenerAttachedRef.current) return;
+
+    autoStartListenerAttachedRef.current = true;
+
+    let cancelled = false;
+    const handler = async () => {
+      if (cancelled) return;
+      pendingAgentAutoStartRef.current = false;
+      try {
+        await requestAgentStart({ silent: true });
+      } catch {}
+    };
+
+    window.addEventListener("pointerdown", handler, true);
+    window.addEventListener("keydown", handler, true);
+
+    return () => {
+      cancelled = true;
+      autoStartListenerAttachedRef.current = false;
+      try { window.removeEventListener("pointerdown", handler, true); } catch {}
+      try { window.removeEventListener("keydown", handler, true); } catch {}
+    };
+  }, [isAuthenticated, sessionId, isMobile, requestAgentStart]);
 
   // ---------- Offload visuals to worker (OffscreenCanvas) ----------
   useEffect(() => {
@@ -1020,9 +1059,32 @@ export default function App() {
         const agents = Array.isArray(data?.agents) ? data.agents : [];
         if (agents.length) return;
 
-        // Attempt auto-start once per session.
-        if (!agentStartAttemptedRef.current) {
-          await requestAgentStart({ silent: true });
+        // Only attempt auto-start behavior if the user already granted device permissions.
+        // We arm the start on next user gesture (required by browsers for custom protocols).
+        if (!agentStartAttemptedRef.current && !isMobile) {
+          let savedPerms = null;
+          try {
+            const res = await getSavedDevicePermissions(sessionId);
+            savedPerms = res?.permissions || null;
+          } catch {
+            savedPerms = null;
+          }
+
+          if (_hasAnySavedDevicePermission(savedPerms)) {
+            agentStartAttemptedRef.current = true;
+            // Show a prompt right after login/session restore so it feels like the same flow.
+            setPermissionPrompt({
+              title: "Start PC agent",
+              message: "You already granted PC permissions. Start your PC agent now?",
+              details: "This will try to launch the agent on this Windows PC using the local jarvisagent:// protocol. For true zero-click startup, install the Scheduled Task autostart script on the PC.",
+              kind: "start_agent",
+              allowLabel: "Start",
+              denyLabel: "Not now",
+            });
+
+            // Also arm the next-gesture start as a fallback if the modal is dismissed.
+            pendingAgentAutoStartRef.current = true;
+          }
         }
       } catch {
         // ignore
@@ -1032,7 +1094,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, sessionId, requestAgentStart]);
+  }, [isAuthenticated, sessionId, isMobile, addLog, _hasAnySavedDevicePermission]);
 
   useEffect(() => {
     const storedSession = localStorage.getItem("jarvis_session");
@@ -1098,8 +1160,8 @@ export default function App() {
             title={permissionPrompt.title}
             message={permissionPrompt.message}
             details={permissionPrompt.details}
-            allowLabel="Allow"
-            denyLabel="Deny"
+            allowLabel={permissionPrompt.allowLabel || "Allow"}
+            denyLabel={permissionPrompt.denyLabel || "Deny"}
             onDeny={() => setPermissionPrompt(null)}
             onAllow={async () => {
               const req = permissionPrompt;
@@ -1113,7 +1175,16 @@ export default function App() {
                   return;
                 }
 
-                await grantDevicePermissions(sessionId, req.neededPermissions);
+                const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
+                if (grantRes?.offline) {
+                  addLog("system", "Permission saved. Starting your PC agent…");
+                  const ok = await requestAgentStart({ silent: false });
+                  if (!ok) {
+                    addLog("system", "PC agent is still offline. Start it manually on this PC and retry the action.");
+                    return;
+                  }
+                }
+
                 await dispatchDeviceActions(req.pendingActions, sessionId, req.sourceText);
                 addLog("system", "Permission granted. PC action queued.");
               } catch (err) {
@@ -1135,9 +1206,21 @@ export default function App() {
               Assistant: {assistantName || "Jarvis"}
             </span>
 
-            <button onClick={() => {
-              // Best-effort: stop the local PC agent when the user logs out.
-              // This requires the jarvisagent:// protocol handler to be installed on this PC.
+            <button onClick={async () => {
+              const sid = sessionId;
+
+              // Ask server to logout AND request agent stop (server-side).
+              try {
+                if (sid) {
+                  await fetch(`${API_URL}/api/logout`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ session_id: sid })
+                  });
+                }
+              } catch {}
+
+              // Local fallback (requires protocol handler installed on this PC).
               try {
                 const iframe = document.createElement("iframe");
                 iframe.style.display = "none";

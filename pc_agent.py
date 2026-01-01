@@ -70,6 +70,9 @@ PING_INTERVAL_S = int(os.getenv("JARVIS_AGENT_PING_INTERVAL", "20"))
 _ALLOWLIST_RAW = os.getenv("JARVIS_AGENT_ACTION_ALLOWLIST", "").strip()
 ACTION_ALLOWLIST = {a.strip() for a in _ALLOWLIST_RAW.split(",") if a.strip()} if _ALLOWLIST_RAW else None
 
+# Allows the server to request agent shutdown (e.g., on user logout).
+_STOP_EVENT = None
+
 
 def _permissions_file_path() -> Path:
     if PERMISSIONS_FILE:
@@ -413,6 +416,17 @@ async def _execute_action(action: dict) -> dict:
 
         return {"status": "success", "action_type": t, "applied": applied, "capabilities": _current_capabilities()}
 
+    if t in ("agent_shutdown", "agent_stop"):
+        if ACTION_ALLOWLIST is not None and t not in ACTION_ALLOWLIST:
+            return {"status": "forbidden", "action_type": t, "message": "Action blocked by agent allowlist"}
+        ev = globals().get("_STOP_EVENT")
+        try:
+            if ev is not None:
+                ev.set()
+        except Exception:
+            pass
+        return {"status": "success", "action_type": t, "message": "Agent stopping"}
+
     return {"status": "ignored", "action_type": t}
 
 
@@ -427,6 +441,7 @@ async def run_agent():
     print(f"[AGENT] Connecting to {ws_url} as device_id={DEVICE_ID}")
 
     stop_event = asyncio.Event()
+    globals()["_STOP_EVENT"] = stop_event
 
     def _stop(*_):
         stop_event.set()

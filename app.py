@@ -1130,6 +1130,44 @@ class DevicePermissionsGrantRequest(BaseModel):
     permissions: Dict[str, bool]
 
 
+@app.get("/api/device/permissions")
+async def device_permissions_get(session_id: str, device_id: str | None = None, owner_username: str | None = None):
+    """Get saved device permissions for a device.
+
+    Used by the frontend to determine whether the user has already granted permissions
+    (so the UI can prompt/attempt agent start appropriately).
+    """
+    p = _require_authenticated_session(session_id)
+    username = (p.get("username") or "").strip().lower()
+    role = (p.get("role") or "user").strip().lower()
+
+    did = None
+    if role == "admin":
+        if device_id:
+            did = _validate_device_id_or_400(device_id)
+        elif owner_username:
+            did = _get_owner_device_id(owner_username)
+        else:
+            did = DEFAULT_DEVICE_ID
+    else:
+        if device_id and _normalize_device_id(device_id) != _normalize_device_id(_get_owner_device_id(username) or ""):
+            raise HTTPException(status_code=403, detail="Users cannot view permissions for another device")
+        did = _get_owner_device_id(username)
+        if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
+            did = DEFAULT_DEVICE_ID
+        if not did:
+            raise HTTPException(status_code=403, detail="No device assigned to this user")
+
+    saved = _get_saved_device_permissions(did) or {}
+    connected = False
+    try:
+        connected = bool(await device_hub.is_connected(did))
+    except Exception:
+        connected = False
+
+    return {"status": "success", "device_id": did, "permissions": saved, "connected": connected}
+
+
 @app.post("/api/device/permissions/grant")
 async def device_permissions_grant(req: DevicePermissionsGrantRequest):
     """Grant/deny runtime permissions on the connected PC agent.
@@ -1158,9 +1196,6 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
         if not did:
             raise HTTPException(status_code=403, detail="No device assigned to this user")
 
-    if not await device_hub.is_connected(did):
-        raise HTTPException(status_code=409, detail="Device agent is not connected")
-
     perms = req.permissions or {}
     if not isinstance(perms, dict) or not perms:
         raise HTTPException(status_code=400, detail="permissions is required")
@@ -1178,18 +1213,24 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
             raise HTTPException(status_code=400, detail=f"Unsupported permission key: {k}")
         normalized[k] = bool(v)
 
+    # Persist approvals so they apply automatically next time, even if the agent is offline.
+    try:
+        owner = _get_device_owner(did)
+        _save_device_permissions(did, owner_username=owner, permissions=normalized, updated_by=username)
+    except Exception:
+        pass
+
+    # If the agent is offline, we cannot apply runtime permissions now, but the saved permissions
+    # will be auto-applied when the agent connects.
+    if not await device_hub.is_connected(did):
+        return {"status": "saved", "offline": True, "device_id": did, "permissions": normalized}
+
     job = await _dispatch_actions_to_device(
         did,
         username=username or "user",
         actions=[{"type": "agent_set_permissions", "permissions": normalized}],
         source_text="permission_grant",
     )
-    # Persist approvals so they apply automatically next time.
-    try:
-        owner = _get_device_owner(did)
-        _save_device_permissions(did, owner_username=owner, permissions=normalized, updated_by=username)
-    except Exception:
-        pass
     return {"status": "queued", "job": job, "device_id": did, "permissions": normalized}
 
 
@@ -1649,12 +1690,41 @@ async def validate_session_endpoint(session_id: dict):
         return {"valid": False, "username": None, "role": None, "user": None, "permissions": None}
 
 @app.post("/api/logout")
-async def logout(session_id: str):
-    """Logout and invalidate session"""
+async def logout(session_id: str | dict):
+    """Logout and invalidate session.
+
+    Also requests the connected PC agent (if any) to stop, so logout doesn't depend on
+    browser protocol handlers.
+    """
+    sid = session_id
+    if isinstance(session_id, dict):
+        sid = session_id.get("session_id")
+
+    if not isinstance(sid, str) or not sid.strip():
+        raise HTTPException(status_code=400, detail="session_id required")
+    sid = sid.strip()
+
+    # Best-effort: stop the agent for this user/device (if connected).
+    try:
+        p = _get_principal(sid)
+        username = (p.get("username") or "").strip().lower()
+        did = _get_owner_device_id(username)
+        if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
+            did = DEFAULT_DEVICE_ID
+        if did and await device_hub.is_connected(did):
+            await _dispatch_actions_to_device(
+                did,
+                username=username or "user",
+                actions=[{"type": "agent_stop"}],
+                source_text="logout",
+            )
+    except Exception:
+        pass
+
     if auth_tokens.secret:
-        success = auth_tokens.revoke(session_id)
+        success = auth_tokens.revoke(sid)
     else:
-        success = voice_auth.logout(session_id)
+        success = voice_auth.logout(sid)
     return {"status": "success" if success else "error"}
 
 # =========================================================

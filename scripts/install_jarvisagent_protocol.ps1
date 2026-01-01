@@ -28,8 +28,8 @@ New-ItemProperty -Path $iconKey -Name '(Default)' -Value "$RepoPath\jarvis-front
 $cmdKey = Join-Path $protoKey 'shell\open\command'
 New-Item -Path $cmdKey -Force | Out-Null
 
-# Use powershell to run handler with the URL argument (%1)
-$cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$handler`" `"%1`""
+# Use powershell to run handler with the URL argument (%1) (hidden window)
+$cmd = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$handler`" `"%1`""
 New-ItemProperty -Path $cmdKey -Name '(Default)' -Value $cmd -PropertyType String -Force | Out-Null
 
 Write-Host "Installed jarvisagent:// protocol handler in $root"

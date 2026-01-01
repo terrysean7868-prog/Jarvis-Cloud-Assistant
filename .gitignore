@@ -43,6 +43,8 @@ voice.wav
 *.log
 *.err
 .env
+.env.agent
+.env.agent.*
 /node_modules
 
 # Frontend deps

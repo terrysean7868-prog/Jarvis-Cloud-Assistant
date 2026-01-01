@@ -199,6 +199,24 @@ export async function grantDevicePermissions(sessionId, permissions, deviceId = 
   return await res.json();
 }
 
+export async function getSavedDevicePermissions(sessionId, deviceId = null, ownerUsername = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  qs.set("session_id", sessionId);
+  if (deviceId) qs.set("device_id", deviceId);
+  if (ownerUsername) qs.set("owner_username", ownerUsername);
+
+  const res = await timeoutFetch(`${API_URL}/api/device/permissions?${qs.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    let errText = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+  }
+  return await res.json();
+}
+
 export async function googleSpeechToText(sessionId, audioBase64, language = null, sampleRateHz = 16000, timeoutMs = 45000) {
   const body = {
     session_id: sessionId,
