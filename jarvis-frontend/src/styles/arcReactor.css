@@ -5,19 +5,8 @@
   user-select: none;
   touch-action: none;
   -webkit-tap-highlight-color: rgba(0,0,0,0);
-}
-
-.arc-reactor-svg {
-  width: 100%;
-  height: 100%;
-  display: block;
-  background: radial-gradient(circle at 50% 50%, rgba(0,0,0,0.04), rgba(0,0,0,0.5) 70%, rgba(0,0,0,0.85));
   border-radius: 999px;
-  overflow: visible;
-.arc-reactor-svg {
-  width: 100%;
-  height: 100%;
-  display: block;
+  overflow: hidden;
 }
 
 .arc-reactor-canvas {
@@ -25,6 +14,9 @@
   height: 100%;
   display: block;
 }
+
+.reactor-caption {
+  position: absolute;
   right: 12px;
   bottom: 6px;
   display: flex;
@@ -54,9 +46,7 @@
 }
 
 /* Emotion-specific subtle backgrounds (optional) */
-.emotion-calm .arc-reactor-svg { background: radial-gradient(circle at 50% 50%, rgba(0,255,200,0.02), rgba(0,0,0,0.6)); }
-.emotion-analyzing .arc-reactor-svg { background: radial-gradient(circle at 50% 50%, rgba(255,210,80,0.02), rgba(0,0,0,0.6)); }
-.emotion-critical .arc-reactor-svg { background: radial-gradient(circle at 50% 50%, rgba(255,80,80,0.02), rgba(0,0,0,0.6)); }
+/* (Canvas-based reactor: emotion styling is handled in JS by color palette.) */
 
 /* ensure it scales nicely on small screens */
 @media (max-width: 520px) {

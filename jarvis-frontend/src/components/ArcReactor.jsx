@@ -7,6 +7,7 @@ export default function ArcReactor({
   emotion = "calm",
   size = 340,
   volume = 0,
+  showCaption = true,
 }) {
   const canvasRef = useRef(null);
   const rafRef = useRef(0);
@@ -59,8 +60,9 @@ export default function ArcReactor({
     resize();
     window.addEventListener("resize", resize);
 
-    // Fewer rings = less overdraw and a cleaner, more realistic look.
-    const baseRadii = [74, 106, 142, 184, 222];
+    // Scale all geometry from a baseline design size so rings never get clipped
+    // by the square canvas bounds on smaller reactor sizes.
+    const DESIGN_SIZE = 480;
 
     // Adaptive load shedding for low-end devices.
     // We track FPS over ~1s and reduce filament count if FPS drops.
@@ -113,6 +115,11 @@ export default function ArcReactor({
       const cssSize = Math.max(120, Number(size) || 340);
       const cx = cssSize / 2;
       const cy = cssSize / 2;
+      const scale = cssSize / DESIGN_SIZE;
+
+      // Ring radii expressed as fractions of the canvas size.
+      // Derived from the original absolute radii assuming a ~480px design canvas.
+      const baseRadii = [0.154, 0.221, 0.296, 0.384, 0.462].map((f) => f * cssSize);
 
       // FPS tracking + adaptive filament count
       if (!fpsWindowStartRef.current) fpsWindowStartRef.current = ts;
@@ -172,7 +179,7 @@ export default function ArcReactor({
       bezel.addColorStop(1, "rgba(0,0,0,0.00)");
       ctx.strokeStyle = bezel;
       ctx.globalAlpha = 0.95;
-      ctx.lineWidth = 16;
+      ctx.lineWidth = Math.max(6, 16 * scale);
       ctx.beginPath();
       ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
       ctx.stroke();
@@ -189,7 +196,7 @@ export default function ArcReactor({
       rimGrad.addColorStop(1, "rgba(255,255,255,0.00)");
       ctx.strokeStyle = rimGrad;
       ctx.globalAlpha = 0.55;
-      ctx.lineWidth = 10;
+      ctx.lineWidth = Math.max(4, 10 * scale);
       ctx.beginPath();
       ctx.arc(cx, cy, rimR, 0, Math.PI * 2);
       ctx.stroke();
@@ -201,7 +208,7 @@ export default function ArcReactor({
       for (let i = 0; i < baseRadii.length; i++) {
         const r = baseRadii[i] * reactiveScale;
         ctx.strokeStyle = `rgba(255,255,255,${0.015 + i * 0.01})`;
-        ctx.lineWidth = 1;
+        ctx.lineWidth = Math.max(1, 1 * scale);
         ctx.beginPath();
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
         ctx.stroke();
@@ -227,7 +234,7 @@ export default function ArcReactor({
         ctx.shadowBlur = (3 + amp * 10) * (0.40 + 0.60 * q);
         ctx.strokeStyle = color.ring;
         ctx.globalAlpha = (0.20 + (0.10 * (1 - i / baseRadii.length)) + amp * 0.18) * (0.75 + 0.25 * q);
-        ctx.lineWidth = 2 - i * 0.12;
+        ctx.lineWidth = Math.max(0.75, (2 - i * 0.12) * scale);
         ctx.beginPath();
         ctx.arc(cx, cy, r, a0, a1);
         ctx.stroke();
@@ -236,7 +243,7 @@ export default function ArcReactor({
         ctx.shadowBlur = 0;
         ctx.globalAlpha = 0.05 + amp * 0.18;
         ctx.strokeStyle = "rgba(255,255,255,1)";
-        ctx.lineWidth = 0.8;
+        ctx.lineWidth = Math.max(0.6, 0.8 * scale);
         ctx.beginPath();
         ctx.arc(cx, cy, r, a0 + 0.12, a1 - 0.12);
         ctx.stroke();
@@ -248,13 +255,13 @@ export default function ArcReactor({
       ctx.globalCompositeOperation = "screen";
       const ticks = 36;
       const tickR = baseRadii[baseRadii.length - 2] * reactiveScale;
-      const tickLen = 7;
+      const tickLen = Math.max(4, 7 * scale);
       ctx.translate(cx, cy);
       // Keep ticks mostly static for a more grounded, mechanical feel.
       ctx.rotate(Math.PI / 48);
       ctx.lineCap = "round";
       ctx.strokeStyle = "rgba(255,255,255,0.22)";
-      ctx.lineWidth = 1;
+      ctx.lineWidth = Math.max(1, 1 * scale);
       for (let i = 0; i < ticks; i++) {
         const a = (i / ticks) * Math.PI * 2;
         const x0 = Math.cos(a) * (tickR - tickLen);
@@ -291,7 +298,7 @@ export default function ArcReactor({
         const alpha = 0.045 + amp * 0.18 + (i % 3) * 0.010;
         ctx.strokeStyle = color.accent;
         ctx.globalAlpha = alpha;
-        ctx.lineWidth = 0.55 + amp * 1.25;
+        ctx.lineWidth = Math.max(0.6, (0.55 + amp * 1.25) * scale);
         ctx.shadowColor = color.accent;
         ctx.shadowBlur = (4 + amp * 11) * (0.30 + 0.70 * q);
         ctx.beginPath();
@@ -323,7 +330,7 @@ export default function ArcReactor({
       sweepGrad.addColorStop(0.45, "rgba(255,255,255,0.06)");
       sweepGrad.addColorStop(1, "rgba(255,255,255,0.00)");
       ctx.strokeStyle = sweepGrad;
-      ctx.lineWidth = (6 + amp * 6) * (0.55 + 0.45 * q);
+      ctx.lineWidth = Math.max(2, ((6 + amp * 6) * (0.55 + 0.45 * q)) * scale);
       ctx.lineCap = "round";
       ctx.beginPath();
       ctx.arc(cx, cy, sweepR, sweepA - sweepSpan, sweepA + sweepSpan);
@@ -363,7 +370,7 @@ export default function ArcReactor({
         ctx.fill();
 
         ctx.strokeStyle = `rgba(255,255,255,${0.16 * q})`;
-        ctx.lineWidth = 1;
+        ctx.lineWidth = Math.max(1, 1 * scale);
         ctx.globalAlpha = (0.10 + amp * 0.10) * (0.5 + 0.5 * q);
         ctx.beginPath();
         ctx.arc(0, 0, irisR * 0.96, a0 + 0.085, a0 + 0.16);
@@ -432,7 +439,7 @@ export default function ArcReactor({
           const x1 = Math.cos(a0) * (rr + outerR * s.len);
           const y1 = Math.sin(a0) * (rr + outerR * s.len);
           ctx.globalAlpha = s.alpha * (0.35 + 0.65 * q) * (0.55 + 0.45 * (0.6 + amp * 0.4));
-          ctx.lineWidth = s.width;
+          ctx.lineWidth = Math.max(0.6, s.width * scale);
           ctx.beginPath();
           ctx.moveTo(x0, y0);
           ctx.lineTo(x1, y1);
@@ -455,14 +462,16 @@ export default function ArcReactor({
     <div className={`arc-reactor-root ${active ? "active" : "idle"} emotion-${emotion}`} style={{ width: `${size}px`, height: `${size}px` }}>
       <canvas ref={canvasRef} className="arc-reactor-canvas" />
 
-      <div className="reactor-caption">
-        <div className="status-dot" style={{ background: color.core }} />
-        <div className="status-text">
-          {emotion === "calm" && (active ? "Listening (always-on)" : "Idle")}
-          {emotion === "analyzing" && "Analyzing"}
-          {emotion === "critical" && "Critical"}
+      {showCaption && (
+        <div className="reactor-caption">
+          <div className="status-dot" style={{ background: color.core }} />
+          <div className="status-text">
+            {emotion === "calm" && (active ? "Listening (always-on)" : "Idle")}
+            {emotion === "analyzing" && "Analyzing"}
+            {emotion === "critical" && "Critical"}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -253,9 +253,16 @@ class ScreenAccess:
             print(f"Mouse move error: {e}")
             return False
     
-    def take_screenshot_info(self) -> Dict:
-        """Get screenshot with metadata"""
-        screenshot = self.capture_screen()
+    def take_screenshot_info(
+        self,
+        region: Optional[Tuple[int, int, int, int]] = None,
+        include_base64: bool = False,
+    ) -> Dict:
+        """Get screenshot metadata (optionally include base64 image).
+
+        region: (x, y, width, height) or None for full screen
+        """
+        screenshot = self.capture_screen(region)
         if not screenshot:
             return {"error": "Failed to capture screen"}
         
@@ -264,7 +271,7 @@ class ScreenAccess:
             "height": screenshot.height,
             "size": self.screen_size,
             "mouse_position": self.get_mouse_position(),
-            "base64": self.capture_screen_base64()
+            **({"base64": self.capture_screen_base64()} if include_base64 else {})
         }
 
 

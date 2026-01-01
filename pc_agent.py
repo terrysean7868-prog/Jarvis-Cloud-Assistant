@@ -342,10 +342,17 @@ async def _execute_action(action: dict) -> dict:
         if not sa:
             return {"status": "error", "action_type": t, "message": "Screen features not available on this agent"}
         if t == "capture_screen":
+            reg = action.get("region")
+            region = None
+            if isinstance(reg, dict):
+                try:
+                    region = (int(reg.get("x", 0)), int(reg.get("y", 0)), int(reg.get("width", 0)), int(reg.get("height", 0)))
+                except Exception:
+                    region = None
             return {
                 "status": "success",
                 "action_type": "capture_screen",
-                "screenshot": sa.take_screenshot_info(),
+                "screenshot": sa.take_screenshot_info(region=region, include_base64=False),
             }
         # screen_navigation currently implemented in ActionExecutor; we keep agent minimal.
         return {"status": "error", "action_type": "screen_navigation", "message": "screen_navigation not implemented in agent"}

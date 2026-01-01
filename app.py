@@ -208,6 +208,29 @@ def _cloud_feature_disabled(feature: str):
     )
 
 
+def _user_explicitly_requested_screen_capture(text: str) -> bool:
+    """Best-effort guard to prevent accidental screen capture actions.
+
+    The LLM may sometimes propose capture_screen even when not asked.
+    We only allow capture unless user text clearly indicates it.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    keywords = (
+        "screenshot",
+        "screen shot",
+        "capture screen",
+        "take a screenshot",
+        "what's on my screen",
+        "whats on my screen",
+        "read my screen",
+        "read screen",
+        "ocr",
+    )
+    return any(k in t for k in keywords)
+
+
 
 def _require_device_owner(username: str | None):
     if DEVICE_OWNER_USERNAME and (username or "").lower() != DEVICE_OWNER_USERNAME.lower():
@@ -1053,7 +1076,8 @@ async def device_dispatch(req: DeviceDispatchRequest):
         elif req.owner_username:
             did = _get_owner_device_id(req.owner_username)
         else:
-            did = DEFAULT_DEVICE_ID
+            # Default admin behavior: target the admin's own assigned device when present.
+            did = _get_owner_device_id(username) or DEFAULT_DEVICE_ID
     else:
         if req.device_id and _normalize_device_id(req.device_id) != _normalize_device_id(_get_owner_device_id(username) or ""):
             raise HTTPException(status_code=403, detail="Users cannot dispatch to another device")
@@ -1155,7 +1179,7 @@ async def device_permissions_get(session_id: str, device_id: str | None = None, 
         elif owner_username:
             did = _get_owner_device_id(owner_username)
         else:
-            did = DEFAULT_DEVICE_ID
+            did = _get_owner_device_id(username) or DEFAULT_DEVICE_ID
     else:
         if device_id and _normalize_device_id(device_id) != _normalize_device_id(_get_owner_device_id(username) or ""):
             raise HTTPException(status_code=403, detail="Users cannot view permissions for another device")
@@ -1200,7 +1224,7 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
         elif req.owner_username:
             did = _get_owner_device_id(req.owner_username)
         else:
-            did = DEFAULT_DEVICE_ID
+            did = _get_owner_device_id(username) or DEFAULT_DEVICE_ID
     else:
         if req.device_id and _normalize_device_id(req.device_id) != _normalize_device_id(_get_owner_device_id(username) or ""):
             raise HTTPException(status_code=403, detail="Users cannot modify permissions for another device")
@@ -1518,6 +1542,96 @@ app.add_middleware(
 llm = LLMAdapter()
 brain = JarvisBrain(llm=llm)
 executor = ActionExecutor(brain=brain)
+
+
+def _build_web_context_from_action_results(action_results: list[dict], max_chars: int = 380) -> str:
+    """Build a compact context string (for the LLM) from web_search/fetch_url results.
+
+    Keep it short because the LLM adapter currently truncates context.
+    """
+    blocks: list[str] = []
+
+    for r in action_results or []:
+        if not isinstance(r, dict):
+            continue
+        status = (r.get("status") or "").lower()
+        action = (r.get("action") or r.get("action_type") or "").lower()
+        if status != "success":
+            continue
+
+        if action in {"web_search", "search"}:
+            query = (r.get("query") or "").strip()
+            results = r.get("results") or []
+            lines: list[str] = []
+            if query:
+                lines.append(f"Web results for: {query}")
+            for idx, item in enumerate(results[:3], start=1):
+                if not isinstance(item, dict):
+                    continue
+                title = (item.get("title") or "").strip()
+                url = (item.get("url") or "").strip()
+                snippet = (item.get("snippet") or "").strip()
+                parts = []
+                if title:
+                    parts.append(title)
+                if snippet:
+                    parts.append(snippet)
+                if url:
+                    parts.append(url)
+                if parts:
+                    lines.append(f"{idx}) " + " | ".join(parts))
+            if len(lines) > 1:
+                blocks.append("\n".join(lines))
+            continue
+
+        if action == "fetch_url":
+            url = (r.get("url") or "").strip()
+            title = (r.get("title") or "").strip()
+            summary = (r.get("summary") or "").strip()
+            line = "Fetched page:"
+            if title:
+                line += f" {title}."
+            if summary:
+                line += f" Summary: {summary}"
+            if url:
+                line += f" Source: {url}"
+            if line != "Fetched page:" and (title or summary or url):
+                blocks.append(line)
+            continue
+
+    ctx = "\n\n".join([b for b in blocks if b]).strip()
+    if not ctx:
+        return ""
+    ctx = ctx[-max_chars:]
+    return ctx
+
+
+async def _answer_user_using_web_context(user_text: str, web_context: str, mode: str = "chat") -> str | None:
+    """Ask the LLM for a final answer using provided web context.
+
+    Returns assistant text or None on failure.
+    """
+    try:
+        if not web_context:
+            return None
+        # Ask for an answer (not a list of results) and forbid more web actions.
+        # Be explicit: the answer must be specific to THIS question.
+        prompt = (
+            "You are answering the user's specific question using the provided web context.\n"
+            "Rules:\n"
+            "- Answer the question directly and specifically.\n"
+            "- Do NOT output a list of search results or raw snippets.\n"
+            "- If the context is insufficient or unclear, say what is missing instead of guessing.\n"
+            "- Return JSON with actions: [] (no further actions).\n\n"
+            f"User question: {user_text.strip()}"
+        )
+        out = await brain.llm.generate_response(prompt, context=web_context, mode=mode)
+        if isinstance(out, dict):
+            txt = (out.get("text") or "").strip()
+            return txt or None
+        return None
+    except Exception:
+        return None
 
 class MessageIn(BaseModel):
     user: str | None = "user"
@@ -1862,6 +1976,15 @@ async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
     response = await brain.handle_message(text, mode="chat")
     actions = response.get("actions", [])
 
+    # Avoid accidental screen capture which can degrade UX.
+    if actions and not _user_explicitly_requested_screen_capture(text):
+        actions = [
+            a
+            for a in actions
+            if (a or {}).get("type") not in ("capture_screen",)
+        ]
+        response["actions"] = actions
+
     # Enforce role-based permissions (Telegram sessions store role in user_info)
     role = ((telegram_bot.get_user_info(user_id) or {}).get("role") or "user").strip().lower()
     if role not in ("user", "admin"):
@@ -1874,6 +1997,30 @@ async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
             response["actions"] = actions
             if blocked:
                 response["text"] = (response.get("text") or "") + "\n\n(Some actions require admin privileges and were skipped.)"
+
+        # Execute web lookups inline so Telegram responses include results.
+        immediate_types = {"web_search", "fetch_url", "search"}
+        immediate_actions = [a for a in actions if (a or {}).get("type") in immediate_types]
+        deferred_actions = [a for a in actions if (a or {}).get("type") not in immediate_types]
+        if immediate_actions:
+            try:
+                tool_results = await executor.process_actions(immediate_actions, (username or "user"))
+                if os.getenv("JARVIS_RETURN_ACTION_RESULTS", "false").lower() in ("1", "true", "yes", "y"):
+                    response["action_results"] = tool_results
+                mode = (response.get("mode") or "chat")
+                web_ctx = _build_web_context_from_action_results(tool_results)
+                if os.getenv("JARVIS_WEB_RESULTS_MODE", "answer").lower() in ("append", "both"):
+                    # Legacy/debug mode: append raw results.
+                    response["text"] = (response.get("text") or "")
+                else:
+                    ans = await _answer_user_using_web_context(text, web_ctx, mode=mode)
+                    if ans:
+                        response["text"] = ans
+            except Exception as e:
+                response["text"] = (response.get("text") or "") + f"\n\n(Web lookup failed: {e})"
+            actions = deferred_actions
+            response["actions"] = actions
+
         if actions:
             background_tasks.add_task(executor.process_actions, actions, username)
     
@@ -1905,6 +2052,15 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         user_id=((username or msg.user) if (username or msg.user) else None),
     )
     actions = response.get("actions", [])
+
+    # Avoid accidental screen capture which can degrade UX.
+    if actions and not _user_explicitly_requested_screen_capture(msg.text):
+        actions = [
+            a
+            for a in actions
+            if (a or {}).get("type") not in ("capture_screen",)
+        ]
+        response["actions"] = actions
 
     # Persist voice command telemetry (MongoDB)
     try:
@@ -1943,6 +2099,33 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                 response["actions"] = actions
                 if blocked:
                     response["text"] = (response.get("text") or "") + "\n\n(Some actions require admin privileges and were skipped.)"
+
+    # If the model requested web lookups, execute them inline so the user actually sees results.
+    # (Otherwise they would run in a background task and never be reflected in the response.)
+    if actions:
+        immediate_types = {"web_search", "fetch_url", "search"}
+        immediate_actions = [a for a in actions if (a or {}).get("type") in immediate_types]
+        deferred_actions = [a for a in actions if (a or {}).get("type") not in immediate_types]
+        if immediate_actions:
+            try:
+                tool_results = await executor.process_actions(immediate_actions, (msg.user or username or "user"))
+                if os.getenv("JARVIS_RETURN_ACTION_RESULTS", "false").lower() in ("1", "true", "yes", "y"):
+                    response["action_results"] = tool_results
+                web_ctx = _build_web_context_from_action_results(tool_results)
+                mode = (msg.mode or response.get("mode") or "chat")
+                mode = str(mode)
+                web_mode = os.getenv("JARVIS_WEB_RESULTS_MODE", "answer").lower()
+                if web_mode in ("append", "both"):
+                    # Keep response text as-is; (optional) UI can render action_results.
+                    response["text"] = (response.get("text") or "")
+                else:
+                    ans = await _answer_user_using_web_context(msg.text, web_ctx, mode=mode)
+                    if ans:
+                        response["text"] = ans
+            except Exception as e:
+                response["text"] = (response.get("text") or "") + f"\n\n(Web lookup failed: {e})"
+            actions = deferred_actions
+            response["actions"] = actions
 
     # In cloud mode, forward any PC/device actions to the connected local agent.
     if CLOUD_MODE:
@@ -2250,7 +2433,8 @@ async def capture_screen_endpoint(region: dict | None = None):
         reg = None
         if region:
             reg = (region.get("x"), region.get("y"), region.get("width"), region.get("height"))
-        screenshot_info = screen_access.take_screenshot_info()
+        include_base64 = bool((region or {}).get("include_base64", False)) if isinstance(region, dict) else False
+        screenshot_info = screen_access.take_screenshot_info(region=reg, include_base64=include_base64)
         return screenshot_info
     except Exception as e:
         return {"error": str(e)}

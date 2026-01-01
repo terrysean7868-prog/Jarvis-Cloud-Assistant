@@ -236,7 +236,14 @@ class ActionExecutor:
 
             # Handle screen capture actions
             if action_type == "capture_screen":
-                screenshot_info = screen_access.take_screenshot_info()
+                reg = action.get("region")
+                region = None
+                if isinstance(reg, dict):
+                    try:
+                        region = (int(reg.get("x", 0)), int(reg.get("y", 0)), int(reg.get("width", 0)), int(reg.get("height", 0)))
+                    except Exception:
+                        region = None
+                screenshot_info = screen_access.take_screenshot_info(region=region, include_base64=False)
                 results.append({
                     "status": "success",
                     "action_type": "capture_screen",
@@ -578,7 +585,14 @@ class ActionExecutor:
         
         try:
             if command == "capture_screen" or command == "screenshot":
-                screenshot_info = screen_access.take_screenshot_info()
+                reg = action.get("region")
+                region = None
+                if isinstance(reg, dict):
+                    try:
+                        region = (int(reg.get("x", 0)), int(reg.get("y", 0)), int(reg.get("width", 0)), int(reg.get("height", 0)))
+                    except Exception:
+                        region = None
+                screenshot_info = screen_access.take_screenshot_info(region=region, include_base64=False)
                 return {
                     "status": "success",
                     "message": "Screen captured",

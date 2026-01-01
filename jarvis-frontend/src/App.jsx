@@ -36,6 +36,15 @@ const PermissionModal = lazy(() => import("./components/PermissionModal"));
 const FILAMENT_WORKER_PATH = "/filamentWorker.js"; // put this file in public/
 
 export default function App() {
+  const WAKE_SESSION_MINUTES = useMemo(() => {
+    const raw = (typeof process !== "undefined" && process.env && process.env.REACT_APP_WAKE_SESSION_MINUTES)
+      ? String(process.env.REACT_APP_WAKE_SESSION_MINUTES)
+      : "15";
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.max(1, Math.min(n, 120)) : 15;
+  }, []);
+
+  const WAKE_SESSION_MS = useMemo(() => WAKE_SESSION_MINUTES * 60 * 1000, [WAKE_SESSION_MINUTES]);
   const isMobile = useMemo(() => {
     try {
       const ua = (navigator.userAgent || "").toLowerCase();
@@ -79,6 +88,31 @@ export default function App() {
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
 
+  const computeReactorSize = useCallback(() => {
+    if (typeof window === "undefined") return 340;
+    const availW = Math.max(320, window.innerWidth || 0);
+    const availH = Math.max(320, window.innerHeight || 0);
+    const vmin = Math.min(availW, availH);
+    const target = Math.floor(vmin * 0.8);
+    return Math.max(260, Math.min(target, 920));
+  }, []);
+
+  const [reactorSize, setReactorSize] = useState(() => {
+    try { return computeReactorSize(); } catch { return 340; }
+  });
+
+  useEffect(() => {
+    const onResize = () => {
+      try { setReactorSize(computeReactorSize()); } catch {}
+    };
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    return () => {
+      try { window.removeEventListener("resize", onResize); } catch {}
+      try { window.removeEventListener("orientationchange", onResize); } catch {}
+    };
+  }, [computeReactorSize]);
+
   const pendingAgentAutoStartRef = useRef(false);
   const autoStartListenerAttachedRef = useRef(false);
   const deviceAutoConfiguredRef = useRef(false);
@@ -90,9 +124,44 @@ export default function App() {
   // refs
   const wakeRecognizer = useRef(null);
   const isHandlingCommand = useRef(false);
+  const pendingTranscriptRef = useRef(null);
+  const speakingRef = useRef(false);
+  const wakeSessionUntilRef = useRef(0);
+  const wakeSessionTimerRef = useRef(null);
   const assistantNameRef = useRef("Jarvis");
   const micStreamRef = useRef(null);
   const filamentWorkerRef = useRef(null);
+
+  useEffect(() => {
+    speakingRef.current = !!speaking;
+  }, [speaking]);
+
+  // Minimal log writer (memoized to avoid re-creating)
+  const addLog = useCallback((type, message) => {
+    setLogs(prev => [{ type, message, time: new Date().toLocaleTimeString() }, ...prev.slice(0, 12)]);
+  }, []);
+
+  const startWakeSessionWindow = useCallback(() => {
+    const until = Date.now() + WAKE_SESSION_MS;
+    wakeSessionUntilRef.current = until;
+
+    try {
+      if (wakeSessionTimerRef.current) clearTimeout(wakeSessionTimerRef.current);
+    } catch {}
+
+    wakeSessionTimerRef.current = setTimeout(() => {
+      wakeSessionUntilRef.current = 0;
+      addLog("system", "Wake session expired. Say the wake word again.");
+    }, WAKE_SESSION_MS + 250);
+  }, [WAKE_SESSION_MS, addLog]);
+
+  const endWakeSessionWindow = useCallback(() => {
+    wakeSessionUntilRef.current = 0;
+    try {
+      if (wakeSessionTimerRef.current) clearTimeout(wakeSessionTimerRef.current);
+    } catch {}
+    wakeSessionTimerRef.current = null;
+  }, []);
 
   // No "Enable Voice" button: voice is always on.
   // On mobile we unlock mic/STT on first user gesture.
@@ -132,11 +201,6 @@ export default function App() {
       .toLowerCase()
       .replace(/\s+/g, " ")
       .trim();
-  }, []);
-
-  // Minimal log writer (memoized to avoid re-creating)
-  const addLog = useCallback((type, message) => {
-    setLogs(prev => [{ type, message, time: new Date().toLocaleTimeString() }, ...prev.slice(0, 12)]);
   }, []);
 
   // Unlock voice on mobile with a first user gesture (no explicit button).
@@ -526,11 +590,17 @@ export default function App() {
       }
     };
 
-    let transcript = null;
+    const inWakeSession = Date.now() < (wakeSessionUntilRef.current || 0);
+    let transcript = pendingTranscriptRef.current;
+    pendingTranscriptRef.current = null;
+    if (typeof transcript === "string") transcript = transcript.trim();
+    if (!transcript) transcript = null;
+
     if (webSpeechSupported) {
       try {
+        // During wake-session, allow more time for the user to speak naturally.
         transcript = await listenOnce({
-          timeout: isMobile ? 12000 : 9000,
+          timeout: inWakeSession ? (isMobile ? 20000 : 16000) : (isMobile ? 12000 : 9000),
           silenceTimeoutMs: isIOS ? 1500 : 1100,
           interim: false,
           language: voiceLang,
@@ -556,6 +626,17 @@ export default function App() {
 
     addLog("input", transcript);
     const textLower = transcript.toLowerCase();
+
+    // End the wake-session early.
+    if (/^(sleep|go to sleep|stop listening|stop|cancel|goodbye|bye|thanks\s+jarvis\s+stop)$/i.test(transcript.trim())) {
+      endWakeSessionWindow();
+      addLog("system", "Going idle. Say the wake word to continue.");
+      speak("Okay. Say the wake word when you need me.", () => {
+        try { wakeRecognizer.current?.start(); } catch {}
+        isHandlingCommand.current = false;
+      });
+      return;
+    }
 
     // Voice command: rename assistant
     // Examples:
@@ -901,7 +982,6 @@ export default function App() {
         const DEVICE_ACTION_TYPES = new Set([
           "open_app", "close_app", "switch_app",
           "execute_command",
-          "capture_screen", "screen_navigation",
           "read", "list", "mkdir",
           "write", "edit", "delete", "move", "copy", "cleanup",
           "self_update", "self_add",
@@ -1004,7 +1084,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, isMobile, isIOS, voiceLang]);
+  }, [sessionId, addLog, isMobile, isIOS, voiceLang, endWakeSessionWindow]);
 
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
@@ -1019,7 +1099,7 @@ export default function App() {
     const recognizer = new SpeechRecognition();
     recognizer.continuous = true;
     recognizer.interimResults = false;
-    recognizer.lang = "en-US";
+    recognizer.lang = voiceLang || "en-US";
 
     let active = false;
     let startAttempts = 0;
@@ -1039,9 +1119,13 @@ export default function App() {
     recognizer.onresult = (e) => {
       try {
         const result = e.results[e.resultIndex];
-        const transcript = normalizeWake(result[0].transcript || "");
+        const rawTranscript = (result[0].transcript || "").toString().trim();
+        const transcript = normalizeWake(rawTranscript);
         if (!transcript) return;
         if (isHandlingCommand.current) return;
+        if (speakingRef.current) return;
+
+        const inWakeSession = Date.now() < (wakeSessionUntilRef.current || 0);
 
         const nm = normalizeWake(assistantNameRef.current || "Jarvis");
         const wakeHit =
@@ -1050,6 +1134,9 @@ export default function App() {
           transcript.includes("wakeup");
 
         if (wakeHit) {
+
+          // Start/refresh the 15-minute wake session window.
+          startWakeSessionWindow();
 
           // vibrate UI briefly (visual) and pause auto recognition
           setWakePulse(true);
@@ -1060,6 +1147,19 @@ export default function App() {
           active = false;
 
           setTimeout(async () => await handleVoiceCommand(), 60);
+          return;
+        }
+
+        // During wake-session: treat ANY speech as a command (no re-wake needed).
+        if (inWakeSession && rawTranscript) {
+          pendingTranscriptRef.current = rawTranscript;
+
+          // stop recognizer safely so we can process command without overlap
+          try { recognizer.stop(); } catch {}
+          active = false;
+
+          setTimeout(async () => await handleVoiceCommand(), 60);
+          return;
         }
       } catch (err) {
         console.warn("Wake onresult parse err:", err);
@@ -1102,8 +1202,12 @@ export default function App() {
         recognizer.onend = null;
         recognizer.stop();
       } catch {}
+
+      try {
+        if (wakeSessionTimerRef.current) clearTimeout(wakeSessionTimerRef.current);
+      } catch {}
     };
-  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceUnlocked]);
+  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow]);
 
   // If filament worker exists, update it when relevant props change
   useEffect(() => {
@@ -1384,8 +1488,8 @@ export default function App() {
 
       <div className="hud-overlay" style={{ position: "fixed", inset: 0, zIndex: 5, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
         <div className="reactor-shell" style={{
-          width: "min(36vmin, 420px)",
-          height: "min(36vmin, 420px)",
+          width: reactorSize,
+          height: reactorSize,
           borderRadius: "50%",
           display: "flex",
           alignItems: "center",
@@ -1396,7 +1500,15 @@ export default function App() {
         }}>
           <div style={{ pointerEvents: "none", zIndex: 6 }}>
             <Suspense fallback={<div />}>
-              <ArcReactor active={listening || speaking} wakePulse={wakePulse} emotion={emotion} volume={volume} transformState={transformState} />
+              <ArcReactor
+                active={listening || speaking}
+                wakePulse={wakePulse}
+                emotion={emotion}
+                volume={volume}
+                transformState={transformState}
+                size={reactorSize}
+                showCaption={false}
+              />
             </Suspense>
           </div>
         </div>
@@ -1408,11 +1520,23 @@ export default function App() {
         </Suspense>
       </div>
 
-      <div style={{ position: "fixed", bottom: 30, left: 0, right: 0, display: "flex", justifyContent: "center", zIndex: 12, pointerEvents: "none" }}>
-        <div style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "white", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
-          <div style={{ width: 12, height: 12, borderRadius: 6, background: listening ? "#00ffc8" : wakePulse ? "#00d4ff" : speaking ? "#ffb86b" : "#6b7280", boxShadow: listening ? "0 0 12px rgba(0,255,200,0.6)" : wakePulse ? "0 0 10px rgba(0,212,255,0.45)" : "" }} />
-          <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
-            {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to begin`}
+      {/* Bottom stack: status above the wake prompt */}
+      <div style={{ position: "fixed", bottom: 24, left: 0, right: 0, display: "flex", justifyContent: "center", zIndex: 12, pointerEvents: "none" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
+          <div style={{ pointerEvents: "none", background: "rgba(10,10,12,0.28)", color: "rgba(230,238,248,0.92)", padding: "8px 14px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 10, minWidth: 220, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
+            <div style={{ width: 10, height: 10, borderRadius: 999, background: emotion === "critical" ? "#ff4d4f" : emotion === "analyzing" ? "#ffd24d" : "#00ffc8", boxShadow: emotion === "critical" ? "0 0 10px rgba(255,77,79,0.45)" : emotion === "analyzing" ? "0 0 10px rgba(255,210,77,0.35)" : "0 0 10px rgba(0,255,200,0.45)" }} />
+            <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 13, letterSpacing: 0.3 }}>
+              {emotion === "calm" && ((listening || speaking) ? "Listening (session)" : "Idle")}
+              {emotion === "analyzing" && "Analyzing"}
+              {emotion === "critical" && "Critical"}
+            </div>
+          </div>
+
+          <div style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "white", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
+            <div style={{ width: 12, height: 12, borderRadius: 6, background: listening ? "#00ffc8" : wakePulse ? "#00d4ff" : speaking ? "#ffb86b" : "#6b7280", boxShadow: listening ? "0 0 12px rgba(0,255,200,0.6)" : wakePulse ? "0 0 10px rgba(0,212,255,0.45)" : "" }} />
+            <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
+              {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to begin`}
+            </div>
           </div>
         </div>
       </div>
