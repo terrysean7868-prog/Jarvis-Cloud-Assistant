@@ -344,12 +344,15 @@ Allowed action types (only include required fields):
 - execute_command: {{"type":"execute_command","command":"...","wait":true}}
 - type_text: {{"type":"type_text","text":"...","interval":0.02}}
 - press_key: {{"type":"press_key","key":"enter","presses":1}}
+- hotkey: {{"type":"hotkey","keys":["ctrl","a"]}}
 
 Safety rules for actions:
 - Prefer fewer actions.
 - If the user asks to open an app and write content, include BOTH open_app and type_text (and press_key only if needed).
 - Never output actions that can damage or remove the OS (e.g., formatting disks, disk partition tools, deleting system folders, boot/registry edits). If asked, refuse and return no such actions.
 - For PC Settings/configuration requests: you may open the relevant settings page (e.g., Windows ms-settings: URIs) and provide safe step-by-step guidance, but do NOT apply security-critical/system-destructive changes.
+- If the user is continuing an editing task (e.g., "format this", "rewrite this", "fix this"), do NOT reopen apps. Prefer switch_app and then edit/replace text.
+- When the user says "this/that/same" (continuation), assume they mean the currently open/previously used app/document unless they explicitly ask to open a new one.
 - If details are missing, make reasonable assumptions and still provide a helpful answer.
 - Only ask at most 1 clarifying question, and only at the end (optional), and do NOT block the answer on it.
 - If you truly cannot proceed without a specific detail (rare), ask the question and return no actions.
@@ -405,6 +408,12 @@ Return ONLY valid JSON matching:
                 parsed = self._postprocess_write_actions(user_text=text, parsed=parsed)
             except Exception:
                 # never fail the response due to postprocessing
+                pass
+
+            # Post-process: treat follow-ups as continuations; avoid reopening apps and replace text safely.
+            try:
+                parsed = self._postprocess_followup_edit_actions(user_text=text, context=context, parsed=parsed)
+            except Exception:
                 pass
 
             # Post-process: for common PC settings requests, open the right Settings page safely.
@@ -491,6 +500,103 @@ Return ONLY valid JSON matching:
         if draft.strip() not in base_text:
             parsed["text"] = (base_text + "\n\n" + draft).strip() if base_text else draft
 
+        return parsed
+
+    @staticmethod
+    def _postprocess_followup_edit_actions(user_text: str, context: str, parsed: dict) -> dict:
+        """Prevent app re-open and other "repeat task" bugs on follow-ups.
+
+        Goals:
+        - If user says "format/rewrite/fix this" (or similar), treat it as editing the current document.
+        - Prefer switch_app over open_app (avoids launching a new window).
+        - When replacing text, use ctrl+a then type_text.
+        - If the model omitted app focus entirely, infer the most recent app from context and switch to it.
+        """
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list) or not actions:
+            parsed["actions"] = actions if isinstance(actions, list) else []
+            return parsed
+
+        t = (user_text or "").strip().lower()
+        if not t:
+            parsed["actions"] = actions
+            return parsed
+
+        is_followup_edit = bool(re.search(r"\b(format|reformat|rewrite|polish|improve|refine|fix|correct|cleanup)\b", t))
+        is_pronoun_followup = bool(re.search(r"\b(this|that|same|it)\b", t))
+        if not is_followup_edit:
+            parsed["actions"] = actions
+            return parsed
+
+        # If user explicitly asked to open/launch, don't override.
+        if re.search(r"\b(open|launch|start)\b", t):
+            parsed["actions"] = actions
+            return parsed
+
+        def _infer_recent_app_name(ctx: str) -> str:
+            s = (ctx or "")[-2500:]
+            # Look for recent app_name mentions in context/logs.
+            m = re.findall(r"\"app_name\"\s*:\s*\"([^\"]+)\"", s)
+            if m:
+                return str(m[-1]).strip()
+            # Fallback: simple phrases
+            m2 = re.findall(r"\b(?:open|opened|switch to|switched to)\s+([A-Za-z0-9 _\-]{2,32})\b", s, flags=re.IGNORECASE)
+            if m2:
+                return str(m2[-1]).strip()
+            return ""
+
+        def _is_editor_app(name: str) -> bool:
+            nl = (name or "").lower()
+            return any(k in nl for k in ("word", "winword", "notepad", "wordpad", "textedit", "vscode", "code"))
+
+        # Identify relevant actions
+        first_open_app_idx = None
+        first_switch_app_idx = None
+        first_type_text_idx = None
+        open_app_name = ""
+
+        for idx, a in enumerate(actions):
+            if not isinstance(a, dict):
+                continue
+            at = a.get("type")
+            if at == "open_app" and first_open_app_idx is None:
+                first_open_app_idx = idx
+                open_app_name = str(a.get("app_name") or "").strip()
+            if at == "switch_app" and first_switch_app_idx is None:
+                first_switch_app_idx = idx
+            if at == "type_text" and first_type_text_idx is None:
+                first_type_text_idx = idx
+
+        inferred_app = _infer_recent_app_name(context) if (is_pronoun_followup or is_followup_edit) else ""
+        target_app = open_app_name or inferred_app
+
+        # If we have no app focus but we are editing text, try to focus last app.
+        if first_open_app_idx is None and first_switch_app_idx is None and first_type_text_idx is not None and target_app:
+            if _is_editor_app(target_app):
+                actions.insert(0, {"type": "switch_app", "app_name": target_app})
+                first_type_text_idx += 1
+
+        # Convert open_app -> switch_app for follow-ups to avoid launching a new instance.
+        if first_open_app_idx is not None:
+            app_name = open_app_name or target_app
+            if app_name:
+                actions[first_open_app_idx] = {"type": "switch_app", "app_name": app_name}
+                # Drop any additional open_app actions.
+                actions = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "open_app")]
+
+        # Insert ctrl+a before the first type_text for editor-like apps.
+        if first_type_text_idx is not None and target_app and _is_editor_app(target_app):
+            # Recompute index after potential filtering.
+            for idx, a in enumerate(actions):
+                if isinstance(a, dict) and a.get("type") == "type_text":
+                    first_type_text_idx = idx
+                    break
+            # Avoid duplicating if hotkey already exists nearby.
+            has_select_all = any(isinstance(a, dict) and a.get("type") == "hotkey" and (a.get("keys") == ["ctrl", "a"] or a.get("key") == "ctrl+a") for a in actions)
+            if not has_select_all:
+                actions.insert(first_type_text_idx, {"type": "hotkey", "keys": ["ctrl", "a"]})
+
+        parsed["actions"] = actions
         return parsed
 
     @staticmethod

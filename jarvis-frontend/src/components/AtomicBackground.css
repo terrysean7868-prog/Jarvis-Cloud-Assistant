@@ -87,7 +87,7 @@
   top: 50%;
   width: var(--ring-size);
   height: var(--ring-size);
-  transform: translate(-50%, -50%) translateZ(var(--ring-z)) rotateX(var(--tilt-x)) rotateY(var(--tilt-y));
+  transform: translate(-50%, -50%) translateZ(var(--ring-z)) rotateZ(var(--tilt-z, 0deg)) rotateX(var(--tilt-x)) rotateY(var(--tilt-y));
   transform-style: preserve-3d;
   backface-visibility: hidden;
 }
@@ -100,6 +100,15 @@
   animation: atomic-ring-spin var(--ring-dur) linear infinite;
   animation-delay: var(--ring-delay, 0s);
   will-change: transform;
+}
+
+.atomic-ring-shape {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  transform: scaleX(var(--ring-sx, 1)) scaleY(var(--ring-sy, 1));
+  transform-origin: 50% 50%;
+  transform-style: preserve-3d;
 }
 
 @keyframes atomic-ring-spin {
@@ -116,6 +125,57 @@
   box-shadow:
     0 0 10px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.65)),
     inset 0 0 16px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.35));
+}
+
+.atomic-ring-nodes {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  pointer-events: none;
+  transform-style: preserve-3d;
+}
+
+.atomic-ring-node {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+
+  width: clamp(3px, 0.7vmin, 8px);
+  height: clamp(3px, 0.7vmin, 8px);
+  border-radius: 999px;
+
+  transform:
+    translate(-50%, -50%)
+    rotate(var(--n-ang))
+    translateX(calc(var(--ring-size) / 2));
+
+  background: rgba(255, 255, 255, calc(0.55 + (var(--a-vol) * 0.18)));
+  box-shadow:
+    0 0 12px rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.28 + (var(--a-vol) * 0.25))),
+    0 0 26px rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.14 + (var(--a-wake) * 0.22)));
+
+  opacity: calc(0.75 + (var(--a-wake) * 0.2));
+  animation: atomic-node-pulse 2.8s ease-in-out infinite;
+  animation-delay: calc(-0.35s * var(--n-seed, 0));
+}
+
+@keyframes atomic-node-pulse {
+  0%, 100% {
+    transform:
+      translate(-50%, -50%)
+      rotate(var(--n-ang))
+      translateX(calc(var(--ring-size) / 2))
+      scale(0.92);
+    opacity: 0.72;
+  }
+  50% {
+    transform:
+      translate(-50%, -50%)
+      rotate(var(--n-ang))
+      translateX(calc(var(--ring-size) / 2))
+      scale(1.12);
+    opacity: 1;
+  }
 }
 
 /* Premium dotted highlights along the ring */

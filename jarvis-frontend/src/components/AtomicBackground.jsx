@@ -1,12 +1,8 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo } from "react";
 import "./AtomicBackground.css";
 
+// React-logo-like: multiple rings around one center.
 const RING_COUNT = 7;
-const RANDOMIZE_MS = 5000;
-
-function randomElectronCounts() {
-  return Array.from({ length: RING_COUNT }, () => 2 + Math.floor(Math.random() * 4));
-}
 
 function colorForEmotion(emotion) {
   switch (emotion) {
@@ -25,25 +21,10 @@ function colorForEmotion(emotion) {
 
 export default function AtomicBackground({ emotion = "calm", wakePulse = false, volume = 0 }) {
   // This component avoids any high-FPS JS animation loop.
-  // Rotation is done with CSS keyframes (browser-optimized), and the only JS work
-  // is re-randomizing electron counts on a low-frequency interval.
-  const [counts, setCounts] = useState(() => randomElectronCounts());
-
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      setCounts(randomElectronCounts());
-    }, RANDOMIZE_MS);
-    return () => window.clearInterval(id);
-  }, []);
+  // Rotation is done with CSS keyframes (browser-optimized).
 
   const rgb = useMemo(() => colorForEmotion(emotion), [emotion]);
   const safeVolume = Math.max(0, Math.min(1, Number(volume) || 0));
-
-  // Larger scene: use ~80% of the viewport for the whole atomic section.
-  // Inner ring kept smaller to preserve spacing across 7 rings.
-  const innerVmin = 26;
-  const outerVmin = 80;
-  const gapVmin = (outerVmin - innerVmin) / Math.max(1, RING_COUNT - 1);
 
   return (
     <div
@@ -61,23 +42,31 @@ export default function AtomicBackground({ emotion = "calm", wakePulse = false, 
         <div className="atomic-nucleus" />
 
         {Array.from({ length: RING_COUNT }).map((_, i) => {
-          const ringSizeVmin = innerVmin + i * gapVmin;
-          // De-sync electron rotations so the scene doesn't "repeat" as obviously.
-          const durS = 11.7 + i * 2.3;
+          // React-like rings: mostly same size, slight variation for depth.
+          const ringSizeVmin = 64 + ((i % 3) - 1) * 1.6 + (i - 3) * 0.25;
+
+          // De-sync motion so it feels continuous/premium.
+          const ringSpinS = 18.5 + i * 2.9;
+          const ringDelayS = -(i * 1.4);
+          const durS = 10.9 + i * 2.6;
+          const electronDelayS = -(i * 0.85);
           const reverse = i % 2 !== 0;
-          const n = counts[i] || 2;
 
-          // Stronger 3D tilt per ring for depth.
-          const tiltX = -28 + i * 5.0;
-          const tiltY = 20 - i * 3.2;
+          // Repeating orientations to mimic the React logo (3 main orbits).
+          const tiltX = 66;
+          const tiltY = 0;
+          const tiltZ = `${(i % 3) * 60}deg`;
 
-          // De-sync ring rotations too (avoid multiples that "line up" periodically).
-          const ringSpinS = 17.3 + i * 2.1;
+          // Ellipse squash (React logo look)
+          const sx = 1.34;
+          const sy = 0.86;
 
-          // Negative delays start mid-cycle, making the motion feel continuous.
-          const ringDelayS = -(i * 1.35);
-          const electronDelayS = -(i * 0.9);
-          const ringZ = (i - 3) * 2; // px
+          // Slight depth separation.
+          const ringZ = (i - 1) * 2; // px
+
+          // One bright electron per ring + a few glow nodes.
+          const nElectrons = 1;
+          const nodeAngles = [20, 160, 280, 330];
 
           return (
             <div
@@ -85,28 +74,43 @@ export default function AtomicBackground({ emotion = "calm", wakePulse = false, 
               className="atomic-ring"
               style={{
                 "--ring-size": `${ringSizeVmin}vmin`,
-                "--ring-alpha": Math.max(0.06, 0.18 - i * 0.012),
+                "--ring-alpha": Math.max(0.06, 0.17 - i * 0.012),
                 "--tilt-x": `${tiltX}deg`,
                 "--tilt-y": `${tiltY}deg`,
+                "--tilt-z": tiltZ,
+                "--ring-sx": sx,
+                "--ring-sy": sy,
                 "--ring-dur": `${ringSpinS}s`,
                 "--ring-delay": `${ringDelayS}s`,
                 "--ring-z": `${ringZ}px`,
               }}
             >
               <div className="atomic-ring-rotator">
-                <div className="atomic-ring-outline" />
+                <div className="atomic-ring-shape">
+                  <div className="atomic-ring-outline" />
 
-                <div
-                  className={`atomic-electrons ${reverse ? "atomic-electrons-rev" : ""}`}
-                  style={{ "--dur": `${durS}s`, "--e-delay": `${electronDelayS}s` }}
-                >
-                  {Array.from({ length: n }).map((__, j) => (
-                    <div
-                      key={j}
-                      className="atomic-electron"
-                      style={{ "--e-ang": `${(j / n) * 360}deg` }}
-                    />
-                  ))}
+                  <div className="atomic-ring-nodes">
+                    {nodeAngles.map((ang, k) => (
+                      <div
+                        key={k}
+                        className="atomic-ring-node"
+                        style={{ "--n-ang": `${ang + i * 11}deg`, "--n-seed": k + i * 7 }}
+                      />
+                    ))}
+                  </div>
+
+                  <div
+                    className={`atomic-electrons ${reverse ? "atomic-electrons-rev" : ""}`}
+                    style={{ "--dur": `${durS}s`, "--e-delay": `${electronDelayS}s` }}
+                  >
+                    {Array.from({ length: nElectrons }).map((__, j) => (
+                      <div
+                        key={j}
+                        className="atomic-electron"
+                        style={{ "--e-ang": `${(j / nElectrons) * 360 + i * 80}deg` }}
+                      />
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>

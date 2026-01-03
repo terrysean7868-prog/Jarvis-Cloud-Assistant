@@ -219,6 +219,25 @@ class ScreenAccess:
         """Press keyboard key"""
         if not PYAUTOGUI_AVAILABLE or not pyautogui:
             return False
+
+    def hotkey(self, keys) -> bool:
+        """Press a keyboard shortcut (e.g., ['ctrl','a'])."""
+        if not PYAUTOGUI_AVAILABLE or not pyautogui:
+            return False
+        try:
+            if not keys:
+                return False
+            if isinstance(keys, str):
+                parts = [p.strip().lower() for p in keys.split("+") if p.strip()]
+            else:
+                parts = [str(p).strip().lower() for p in list(keys) if str(p).strip()]
+            if not parts:
+                return False
+            pyautogui.hotkey(*parts)
+            return True
+        except Exception as e:
+            print(f"Hotkey error: {e}")
+            return False
         
         try:
             pyautogui.press(key, presses=presses, interval=interval)

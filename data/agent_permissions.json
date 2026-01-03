@@ -2,7 +2,7 @@
   "allow_app_control": true,
   "allow_execute_command": false,
   "allow_file_ops": false,
-  "allow_screen": false,
+  "allow_screen": true,
   "allow_self_update": false,
-  "updated_at": "2026-01-03T18:09:04.438984+00:00"
+  "updated_at": "2026-01-03T18:48:49.774382+00:00"
 }

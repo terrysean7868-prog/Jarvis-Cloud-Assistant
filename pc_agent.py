@@ -416,7 +416,7 @@ async def _execute_action(action: dict) -> dict:
         # screen_navigation currently implemented in ActionExecutor; we keep agent minimal.
         return {"status": "error", "action_type": "screen_navigation", "message": "screen_navigation not implemented in agent"}
 
-    if t in ("type_text", "press_key"):
+    if t in ("type_text", "press_key", "hotkey"):
         if not ALLOW_SCREEN:
             return {"status": "forbidden", "action_type": t, "message": "Screen features disabled on agent"}
         sa = _get_screen_access()
@@ -431,6 +431,14 @@ async def _execute_action(action: dict) -> dict:
                 interval = 0.02
             ok = bool(sa.type_text(text, interval=interval))
             return {"status": "success" if ok else "error", "action_type": t, "typed": len(text)}
+
+        if t == "hotkey":
+            keys = (action or {}).get("keys")
+            # allow "ctrl+a" style too
+            if keys is None:
+                keys = (action or {}).get("key")
+            ok = bool(sa.hotkey(keys))
+            return {"status": "success" if ok else "error", "action_type": t, "keys": keys}
 
         key = str(action.get("key") or "").strip()
         try:
