@@ -13,10 +13,12 @@ import {
   dispatchDeviceActions,
   grantDevicePermissions,
   googleSpeechToText,
+  getAgentConfig,
   API_URL
 } from "./utils/api";
 import "./styles/jarvis.css";
 import AuthModal from "./components/AuthModal";
+import AtomicBackground from "./components/AtomicBackground";
 
 const scheduleIdle = (fn, timeout = 800) => {
   if (typeof window === "undefined") return setTimeout(fn, 0);
@@ -29,9 +31,6 @@ const scheduleIdle = (fn, timeout = 800) => {
 // Lazy-load heavy UI pieces
 const HUDLogs = lazy(() => import("./components/HUDLogs"));
 const PermissionModal = lazy(() => import("./components/PermissionModal"));
-
-// Constants
-const FILAMENT_WORKER_PATH = "/filamentWorker.js"; // put this file in public/
 
 export default function App() {
   const WAKE_SESSION_MINUTES = useMemo(() => {
@@ -69,6 +68,13 @@ export default function App() {
     }
   }, []);
 
+  const googleSttEnabled = useMemo(() => {
+    const raw = (typeof process !== "undefined" && process.env && process.env.REACT_APP_GOOGLE_SPEECH_ENABLED)
+      ? String(process.env.REACT_APP_GOOGLE_SPEECH_ENABLED)
+      : "false";
+    return ["1", "true", "yes", "y"].includes(raw.toLowerCase());
+  }, []);
+
   // Light state only — avoid large objects in state
   const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
@@ -76,7 +82,6 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [emotion, setEmotion] = useState("calm"); // calm|action|analyzing|critical
   const [volume, setVolume] = useState(0); // 0..1
-  const [transformState, setTransformState] = useState("normal");
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionId, setSessionId] = useState(null);
   const [username, setUsername] = useState(null);
@@ -100,7 +105,6 @@ export default function App() {
   const wakeSessionTimerRef = useRef(null);
   const assistantNameRef = useRef("Jarvis");
   const micStreamRef = useRef(null);
-  const filamentWorkerRef = useRef(null);
   const pcAgentLoginPromptedSessionRef = useRef(null);
 
   useEffect(() => {
@@ -148,6 +152,28 @@ export default function App() {
       const data = await r.json().catch(() => null);
       const agents = Array.isArray(data?.agents) ? data.agents : [];
       return agents.length > 0;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const promptCopyAgentToken = useCallback(async (token) => {
+    const t = (token || "").toString();
+    if (!t) return false;
+    try {
+      // Prefer clipboard when available.
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(t);
+        return true;
+      }
+    } catch {
+      // fallthrough
+    }
+
+    // Manual fallback: show a browser prompt so the token isn't persisted in HUD logs.
+    try {
+      window.prompt("Agent token (copy/paste into run_pc_agent.bat)", t);
+      return true;
     } catch {
       return false;
     }
@@ -248,122 +274,12 @@ export default function App() {
   // NOTE: The PC agent is started manually by the user (python pc_agent.py).
   // The web UI intentionally does not attempt to launch local processes.
 
-  // ---------- Offload visuals to worker (OffscreenCanvas) ----------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-
-    let raf1 = 0;
-    let raf2 = 0;
-    let idleHandle = null;
-    let cancelled = false;
-
-    const initWorker = () => {
-      if (cancelled) return;
-
-      const canvas = document.getElementById("filamentCanvas");
-      if (!canvas) {
-        console.warn("filamentCanvas not found");
-        return;
-      }
-
-      // Only start worker once
-      if (!("OffscreenCanvas" in window)) {
-        // Fallback: keep main-thread drawing but throttle it (not ideal)
-        addLog("system", "OffscreenCanvas not supported; falling back to main-thread rendering (may be slower).");
-        return;
-      }
-
-      try {
-        const offscreen = canvas.transferControlToOffscreen();
-        const worker = new Worker(FILAMENT_WORKER_PATH);
-        filamentWorkerRef.current = worker;
-
-        // Initialize worker with canvas and some config
-        worker.postMessage({
-          type: "init",
-          canvas: offscreen,
-          devicePixelRatio: Math.max(1, Math.min(1.5, window.devicePixelRatio || 1)),
-          width: window.innerWidth,
-          height: window.innerHeight
-        }, [offscreen]);
-
-        // Worker can send logs or events back
-        worker.onmessage = (ev) => {
-          const data = ev.data || {};
-          if (data.type === "log") addLog("system", `[filamentWorker] ${data.message}`);
-        };
-
-        // Resize handler: let worker handle resizing
-        const onResize = () => {
-          if (worker) {
-            worker.postMessage({ type: "resize", width: window.innerWidth, height: window.innerHeight });
-          }
-        };
-        window.addEventListener("resize", onResize);
-
-        // Pause rendering when hidden to save CPU/GPU.
-        const onVis = () => {
-          try {
-            worker.postMessage({ type: "set_running", running: document.visibilityState === "visible" });
-          } catch {}
-        };
-        document.addEventListener("visibilitychange", onVis);
-        onVis();
-
-        // cleanup
-        return () => {
-          window.removeEventListener("resize", onResize);
-          document.removeEventListener("visibilitychange", onVis);
-          try {
-            worker.postMessage({ type: "dispose" });
-            worker.terminate();
-          } catch {}
-        };
-      } catch (err) {
-        console.error("Filament worker init failed:", err);
-        addLog("system", "Filament worker failed to initialize.");
-      }
-    };
-
-    // Defer heavy worker init until after first paint + idle time
-    // so auth/UI becomes responsive instantly.
-    raf1 = window.requestAnimationFrame(() => {
-      raf2 = window.requestAnimationFrame(() => {
-        idleHandle = scheduleIdle(() => {
-          const cleanup = initWorker();
-          // if initWorker returned a cleanup, attach it to effect cleanup
-          // (we store it on the ref to keep closure simple)
-          filamentWorkerRef.current && (filamentWorkerRef.current.__cleanup = cleanup);
-        }, 1200);
-      });
-    });
-
-    return () => {
-      cancelled = true;
-      try { if (raf1) cancelAnimationFrame(raf1); } catch {}
-      try { if (raf2) cancelAnimationFrame(raf2); } catch {}
-      try {
-        if (idleHandle && typeof window.cancelIdleCallback === "function") window.cancelIdleCallback(idleHandle);
-        else if (idleHandle) clearTimeout(idleHandle);
-      } catch {}
-
-      // if we initialized a worker, run any stored cleanup
-      try {
-        const cleanup = filamentWorkerRef.current?.__cleanup;
-        if (typeof cleanup === "function") cleanup();
-      } catch {}
-    };
-    // run once
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAuthenticated]);
-
   // ---------- Audio processing (throttled) ----------
   useEffect(() => {
     if (!isAuthenticated) return;
     if (!vizAudioUnlocked) return;
     let rafId = null;
     let audioData = null;
-    let lastWorkerSend = 0;
     let lastUiUpdate = 0;
     let idleHandle = null;
     let cancelled = false;
@@ -396,15 +312,6 @@ export default function App() {
               setVolume(prev => {
                 const next = Math.min(1, prev * 0.8 + rms * 0.2);
                 return Math.abs(next - prev) < 0.01 ? prev : next;
-              });
-            }
-
-            // send small update to worker at throttled rate
-            if (filamentWorkerRef.current && now - lastWorkerSend > THROTTLE_MS) {
-              lastWorkerSend = now;
-              filamentWorkerRef.current.postMessage({
-                type: "audio",
-                volume: Math.min(1, rms * 3) // scaled for visuals
               });
             }
 
@@ -522,7 +429,7 @@ export default function App() {
       }
     }
 
-    if (!transcript) {
+    if (!transcript && googleSttEnabled) {
       transcript = await tryGoogleFallback();
     }
 
@@ -530,6 +437,9 @@ export default function App() {
 
     if (!transcript) {
       addLog("error", "No command received.");
+      if (!webSpeechSupported && !googleSttEnabled) {
+        addLog("system", "Speech-to-text is unavailable on this device.");
+      }
       try { wakeRecognizer.current?.start(); } catch {}
       isHandlingCommand.current = false;
       return;
@@ -842,7 +752,7 @@ export default function App() {
 
     // quick local commands (purely visual)
     if (/twist|vortex|snake/i.test(textLower)) {
-      setTransformState("twist");
+      // no background transform state (React/CSS atomic background)
       addLog("action", "Reactor twisting.");
       speak("Twisting reactor geometry.", () => {
         try { wakeRecognizer.current?.start(); } catch {}
@@ -851,7 +761,7 @@ export default function App() {
       return;
     }
     if (/expand|bigger|open up/i.test(textLower)) {
-      setTransformState("expand");
+      // no background transform state (React/CSS atomic background)
       addLog("action", "Reactor expanding.");
       speak("Expanding energy field.", () => {
         try { wakeRecognizer.current?.start(); } catch {}
@@ -860,7 +770,7 @@ export default function App() {
       return;
     }
     if (/reset|normal|stable/i.test(textLower)) {
-      setTransformState("normal");
+      // no background transform state (React/CSS atomic background)
       addLog("action", "Reactor normalized.");
       speak("Reactor returning to normal state.", () => {
         try { wakeRecognizer.current?.start(); } catch {}
@@ -980,7 +890,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, isMobile, isIOS, voiceLang, endWakeSessionWindow]);
+  }, [sessionId, addLog, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled]);
 
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
@@ -1105,18 +1015,6 @@ export default function App() {
     };
   }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow]);
 
-  // If filament worker exists, update it when relevant props change
-  useEffect(() => {
-    if (!filamentWorkerRef.current) return;
-    filamentWorkerRef.current.postMessage({
-      type: "state",
-      emotion,
-      wakePulse,
-      transformState,
-      volume
-    });
-  }, [emotion, wakePulse, transformState, volume]);
-
   // Authentication helpers (unchanged, stable)
   const handleAuthSuccess = useCallback((newSessionId, newUsername, newRole, newPermissions) => {
     setSessionId(newSessionId);
@@ -1217,7 +1115,32 @@ export default function App() {
             details={permissionPrompt.details}
             allowLabel={permissionPrompt.allowLabel || "Allow"}
             denyLabel={permissionPrompt.denyLabel || "Deny"}
-            onDeny={() => setPermissionPrompt(null)}
+            onDeny={() => {
+              const req = permissionPrompt;
+              setPermissionPrompt(null);
+              if (req?.kind === "pc_agent_login" && sessionId) {
+                (async () => {
+                  try {
+                    addLog("system", "Generating agent token…");
+                    const cfg = await getAgentConfig(sessionId);
+                    const token = (cfg?.agent_token || "").toString();
+                    if (token) {
+                      const ok = await promptCopyAgentToken(token);
+                      addLog(
+                        "system",
+                        ok
+                          ? "Agent token ready. Start run_pc_agent.bat and paste when prompted."
+                          : "Could not copy/show agent token. Open DevTools → Network, call /api/agent/config, and copy agent_token from the response."
+                      );
+                    } else {
+                      addLog("system", "Could not generate agent token.");
+                    }
+                  } catch (e) {
+                    addLog("system", `Could not generate agent token: ${e?.message || e}`);
+                  }
+                })();
+              }
+            }}
             onAllow={async () => {
               const req = permissionPrompt;
               setPermissionPrompt(null);
@@ -1230,7 +1153,24 @@ export default function App() {
 
                   const online = await isPcAgentOnline(sessionId);
                   if (!online) {
-                    addLog("system", "PC agent is offline. Start run_pc_agent.bat and login again.");
+                    addLog("system", "PC agent is offline. Generating agent token…");
+                    try {
+                      const cfg = await getAgentConfig(sessionId);
+                      const token = (cfg?.agent_token || "").toString();
+                      if (token) {
+                        const ok = await promptCopyAgentToken(token);
+                        addLog(
+                          "system",
+                          ok
+                            ? "Agent token ready. Start run_pc_agent.bat and paste when prompted, then click Yes after login."
+                            : "Could not copy/show agent token. Start run_pc_agent.bat using .env.agent."
+                        );
+                      } else {
+                        addLog("system", "Could not generate agent token. Start run_pc_agent.bat using .env.agent.");
+                      }
+                    } catch {
+                      addLog("system", "Could not generate agent token. Start run_pc_agent.bat using .env.agent.");
+                    }
                     return;
                   }
 
@@ -1307,8 +1247,7 @@ export default function App() {
         </div>
       )}
 
-      {/* OffscreenCanvas target */}
-      <canvas id="filamentCanvas" style={{ position: "fixed", inset: 0, zIndex: 1, pointerEvents: "none", width: "100vw", height: "100vh" }} />
+      <AtomicBackground emotion={emotion} wakePulse={wakePulse} volume={volume} />
 
       <div style={{ position: "fixed", left: 20, top: 20, zIndex: 10 }}>
         <Suspense fallback={<div />}>

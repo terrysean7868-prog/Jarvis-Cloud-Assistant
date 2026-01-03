@@ -49,6 +49,24 @@ class DeviceHub:
                 capabilities=capabilities or {},
             )
 
+    async def register_token(self, device_id: str, websocket: WebSocket, capabilities: Optional[Dict[str, Any]] = None) -> None:
+        """Register an agent using a verified server-issued JWT token.
+
+        No shared secret is required for this path.
+        """
+        if not device_id:
+            raise PermissionError("Missing device_id")
+
+        now = datetime.utcnow().isoformat()
+        async with self._lock:
+            self._agents[device_id] = AgentConnection(
+                device_id=device_id,
+                websocket=websocket,
+                connected_at=now,
+                last_seen_at=now,
+                capabilities=capabilities or {},
+            )
+
     async def get_agent(self, device_id: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
             conn = self._agents.get(device_id)

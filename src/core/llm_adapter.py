@@ -91,7 +91,9 @@ Allowed action types (only include required fields):
 
 Safety rules for actions:
 - Prefer fewer actions.
-- If unsure or missing details, ask 1 clarifying question and return no actions.
+- If details are missing, make reasonable assumptions and still provide a helpful answer.
+- Only ask at most 1 clarifying question, and only at the end (optional), and do NOT block the answer on it.
+- If you truly cannot proceed without a specific detail (rare), ask the question and return no actions.
 - For filesystem-related actions, use ONLY project-relative paths and never touch secrets.
 
 Style tone: {tone}.

@@ -4,6 +4,8 @@ from pathlib import Path
 import time
 from datetime import datetime
 import base64
+import secrets
+from datetime import timedelta, timezone
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
@@ -88,6 +90,9 @@ ADMIN_BOOTSTRAP_SECRET = os.getenv("JARVIS_ADMIN_BOOTSTRAP_SECRET", "")
 
 device_hub = DeviceHub(shared_secret=AGENT_SHARED_SECRET)
 auth_tokens = AuthTokens()
+
+PUBLIC_SERVER_URL = (os.getenv("JARVIS_PUBLIC_SERVER_URL") or "https://jarvis-cloud-assistant.onrender.com").strip().rstrip("/")
+AGENT_TOKEN_TTL_SECONDS = int(os.getenv("JARVIS_AGENT_TOKEN_TTL_SECONDS", "2592000"))  # 30d
 
 def _get_principal(session_id: str | None) -> dict:
     """Return principal dict: {username, role, auth_type}.
@@ -291,6 +296,54 @@ def _device_permissions_collection():
     except Exception:
         pass
     return col
+
+
+def _agent_config_collection():
+    """Collection storing agent bootstrap config (no secrets).
+
+    Document shape (upserted by device_id):
+    - device_id: str
+    - owner_username: str | None
+    - server_url: str
+    - updated_at, updated_by
+    """
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return None
+    col = database.db["agent_configs"]
+    try:
+        col.create_index("device_id", unique=True)
+    except Exception:
+        pass
+    try:
+        col.create_index("owner_username")
+    except Exception:
+        pass
+    return col
+
+
+def _issue_agent_token(device_id: str, owner_username: str | None) -> str:
+    if not auth_tokens.secret:
+        raise HTTPException(status_code=500, detail="Server misconfigured: JARVIS_JWT_SECRET is required")
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(seconds=max(300, AGENT_TOKEN_TTL_SECONDS))
+    jti = secrets.token_urlsafe(16)
+    payload = {
+        "iss": auth_tokens.issuer,
+        "sub": device_id,
+        "typ": "agent",
+        "device_id": device_id,
+        "owner": (owner_username or "").strip().lower() or None,
+        "jti": jti,
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+    }
+    # Use jose.jwt to avoid coupling to AuthTokens.issue() which assumes sub=username.
+    from jose import jwt
+    return jwt.encode(payload, auth_tokens.secret, algorithm="HS256")
 
 
 def _get_saved_device_permissions(device_id: str | None) -> dict | None:
@@ -695,14 +748,38 @@ async def agent_ws(ws: WebSocket):
             await ws.close(code=1008)
             return
 
-        device_id = (msg.get("device_id") or "").strip() or None
+        token = (msg.get("token") or "").strip()
+        # Normalize to avoid case-sensitive mismatches (e.g. AVADH vs avadh).
+        device_id = _normalize_device_id(msg.get("device_id")) or None
         secret = (msg.get("secret") or "").strip()
         capabilities = msg.get("capabilities") or {}
-        try:
-            await device_hub.register(device_id=device_id or "", secret=secret, websocket=ws, capabilities=capabilities if isinstance(capabilities, dict) else {})
-        except PermissionError:
-            await ws.close(code=1008)
-            return
+
+        # Preferred auth: JWT agent token issued by /api/agent/config.
+        if token:
+            if not auth_tokens.secret:
+                await ws.close(code=1008)
+                return
+            ok, _sub, payload = auth_tokens.verify(token)
+            if not ok or not payload or payload.get("typ") != "agent":
+                await ws.close(code=1008)
+                return
+            did = _normalize_device_id(payload.get("device_id") or payload.get("sub"))
+            if not did:
+                await ws.close(code=1008)
+                return
+            device_id = did
+            try:
+                await device_hub.register_token(device_id=device_id, websocket=ws, capabilities=capabilities if isinstance(capabilities, dict) else {})
+            except PermissionError:
+                await ws.close(code=1008)
+                return
+        else:
+            # Legacy auth: shared secret.
+            try:
+                await device_hub.register(device_id=device_id or "", secret=secret, websocket=ws, capabilities=capabilities if isinstance(capabilities, dict) else {})
+            except PermissionError:
+                await ws.close(code=1008)
+                return
 
         await ws.send_json({"type": "ack", "device_id": device_id, "status": "connected"})
 
@@ -756,6 +833,83 @@ async def agent_ws(ws: WebSocket):
     finally:
         if device_id:
             await device_hub.unregister(device_id)
+
+
+# =========================================================
+# Agent Config / Bootstrap (Cloud -> PC Agent)
+# =========================================================
+class AgentConfigRequest(BaseModel):
+    session_id: str
+    device_id: str | None = None
+
+
+@app.post("/api/agent/config")
+async def agent_config(req: AgentConfigRequest):
+    """Return agent connection config stored in MongoDB.
+
+    This avoids keeping secrets in local .env files. The server issues a JWT agent token
+    that the PC agent can present over /ws/agent.
+    """
+    p = _require_authenticated_session(req.session_id)
+    username = (p.get("username") or "").strip().lower()
+    role = (p.get("role") or "user").strip().lower()
+
+    did = None
+    if req.device_id:
+        did = _validate_device_id_or_400(req.device_id)
+    else:
+        # Prefer user's assigned device
+        did = _get_owner_device_id(username)
+        if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
+            did = DEFAULT_DEVICE_ID
+
+    if not did:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "No device assigned to this user",
+                "action": "configure_pc",
+                "hint": "Configure a device via /api/user/device/configure (auto-pick) or /api/user/device/set (explicit device_id).",
+            },
+        )
+
+    # Non-admin users can only request config for their own device.
+    if role != "admin":
+        owned = _get_owner_device_id(username)
+        if owned and _normalize_device_id(owned) != _normalize_device_id(did):
+            raise HTTPException(status_code=403, detail="Users cannot request agent config for another device")
+
+    # Record config in MongoDB (no secrets stored).
+    col = _agent_config_collection()
+    if col is not None:
+        try:
+            col.update_one(
+                {"device_id": did},
+                {
+                    "$set": {
+                        "device_id": did,
+                        "owner_username": username if role != "admin" else (_get_device_owner(did) or None),
+                        "server_url": PUBLIC_SERVER_URL,
+                        "updated_at": datetime.utcnow(),
+                        "updated_by": username,
+                    },
+                    "$setOnInsert": {"created_at": datetime.utcnow()},
+                },
+                upsert=True,
+            )
+        except Exception:
+            pass
+
+    token = _issue_agent_token(device_id=did, owner_username=username)
+    ws_url = ("wss://" + PUBLIC_SERVER_URL[len("https://"):] + "/ws/agent") if PUBLIC_SERVER_URL.startswith("https://") else ("ws://" + PUBLIC_SERVER_URL[len("http://"):] + "/ws/agent")
+    return {
+        "status": "success",
+        "device_id": did,
+        "server_url": PUBLIC_SERVER_URL,
+        "ws_url": ws_url,
+        "agent_token": token,
+        "expires_in_seconds": max(300, AGENT_TOKEN_TTL_SECONDS),
+    }
 
 
 # =========================================================

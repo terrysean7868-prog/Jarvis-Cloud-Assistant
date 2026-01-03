@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 import json
 import os
 import platform
@@ -16,7 +17,8 @@ try:
     for _p in (_HERE / ".env.agent", _HERE / ".env"):
         try:
             if _p.exists():
-                load_dotenv(_p, override=False)
+                # Prefer explicit agent config when present.
+                load_dotenv(_p, override=(_p.name == ".env.agent"))
         except Exception:
             pass
 except Exception:
@@ -39,7 +41,8 @@ def _env_bool(name: str, default: str = "false") -> bool:
 
 
 SERVER_BASE_URL = os.getenv("JARVIS_SERVER_URL", "https://jarvis-cloud-assistant.onrender.com").rstrip("/")
-DEVICE_ID = os.getenv("JARVIS_DEVICE_ID", platform.node() or "primary")
+# Device IDs are treated case-insensitively by the server.
+DEVICE_ID = (os.getenv("JARVIS_DEVICE_ID", platform.node() or "primary") or "primary").strip().lower()
 SHARED_SECRET = os.getenv("JARVIS_AGENT_SHARED_SECRET", "")
 
 ALLOW_EXECUTE_COMMAND = _env_bool("JARVIS_AGENT_ALLOW_EXECUTE_COMMAND", "false")
@@ -437,14 +440,16 @@ async def _execute_action(action: dict) -> dict:
     return {"status": "ignored", "action_type": t}
 
 
-async def run_agent():
+async def run_agent(agent_token: str | None = None, server_base_url: str | None = None):
     # Apply any previously approved permissions before connecting.
     _load_saved_permissions()
 
-    if not SHARED_SECRET:
-        raise SystemExit("Missing JARVIS_AGENT_SHARED_SECRET (must match Render env)")
+    base = (server_base_url or SERVER_BASE_URL).rstrip("/")
+    ws_url = _ws_url_from_base(base)
 
-    ws_url = _ws_url_from_base(SERVER_BASE_URL)
+    if not agent_token and not SHARED_SECRET:
+        raise SystemExit("Missing agent auth. Provide --token (recommended) or set JARVIS_AGENT_SHARED_SECRET.")
+
     print(f"[AGENT] Connecting to {ws_url} as device_id={DEVICE_ID}")
 
     stop_event = asyncio.Event()
@@ -462,21 +467,37 @@ async def run_agent():
             try:
                 async with session.ws_connect(ws_url, heartbeat=PING_INTERVAL_S) as ws:
                     capabilities = _current_capabilities()
-                    await ws.send_str(json.dumps({
+                    auth_msg = {
                         "type": "auth",
-                        "device_id": DEVICE_ID,
-                        "secret": SHARED_SECRET,
                         "capabilities": capabilities,
-                    }))
+                    }
+                    # Preferred auth: server-issued JWT token.
+                    if agent_token:
+                        auth_msg["token"] = agent_token
+                        # device_id is optional in token mode; server derives it from token.
+                        auth_msg["device_id"] = DEVICE_ID
+                    else:
+                        auth_msg["device_id"] = DEVICE_ID
+                        auth_msg["secret"] = SHARED_SECRET
+
+                    await ws.send_str(json.dumps(auth_msg))
                     ack = await ws.receive(timeout=15)
                     if ack.type != aiohttp.WSMsgType.TEXT:
                         raise RuntimeError("No ack from server")
                     print(f"[AGENT] Connected: {ack.data}")
 
+                    effective_device_id = DEVICE_ID
+                    try:
+                        ack_obj = json.loads(ack.data)
+                        if isinstance(ack_obj, dict) and ack_obj.get("device_id"):
+                            effective_device_id = str(ack_obj.get("device_id")).strip().lower() or effective_device_id
+                    except Exception:
+                        pass
+
                     async def pinger():
                         while True:
                             await asyncio.sleep(PING_INTERVAL_S)
-                            await ws.send_str(json.dumps({"type": "ping", "ts": _now_utc_iso()}))
+                            await ws.send_str(json.dumps({"type": "ping", "device_id": effective_device_id, "ts": _now_utc_iso()}))
 
                     ping_task = asyncio.create_task(pinger())
 
@@ -511,7 +532,7 @@ async def run_agent():
                                     if cap:
                                         await ws.send_str(json.dumps({
                                             "type": "capabilities",
-                                            "device_id": DEVICE_ID,
+                                            "device_id": effective_device_id,
                                             "capabilities": cap,
                                             "updated_at": _now_utc_iso(),
                                         }))
@@ -520,7 +541,7 @@ async def run_agent():
 
                                 await ws.send_str(json.dumps({
                                     "type": "result",
-                                    "device_id": DEVICE_ID,
+                                    "device_id": effective_device_id,
                                     "job_id": job_id,
                                     "results": results,
                                     "completed_at": _now_utc_iso(),
@@ -537,4 +558,9 @@ async def run_agent():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_agent())
+    parser = argparse.ArgumentParser(description="Jarvis PC Agent")
+    parser.add_argument("--token", dest="token", default=None, help="Agent token from /api/agent/config (recommended)")
+    parser.add_argument("--server", dest="server", default=None, help="Server base URL (defaults to JARVIS_SERVER_URL)")
+    args = parser.parse_args()
+
+    asyncio.run(run_agent(agent_token=args.token, server_base_url=args.server))

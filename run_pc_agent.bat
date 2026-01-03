@@ -33,11 +33,22 @@ echo.
 echo Starting Jarvis PC Agent...
 echo Repo: %REPO%
 echo Using python: %PYTHON%
-echo Tip: Put agent vars in .env.agent (recommended) or .env
+echo Tip: You can run WITHOUT .env.agent by using an agent token from the web UI.
 echo.
 
 :run_agent
-"%PYTHON%" "%REPO%pc_agent.py"
+set "AGENT_TOKEN=%JARVIS_AGENT_TOKEN%"
+if "%AGENT_TOKEN%"=="" (
+	echo Paste Agent Token (from web UI) and press Enter.
+	echo (Or just press Enter to use .env.agent / shared-secret mode.)
+	set /p "AGENT_TOKEN=> "
+)
+
+if not "%AGENT_TOKEN%"=="" (
+	"%PYTHON%" "%REPO%pc_agent.py" --token "%AGENT_TOKEN%"
+) else (
+	"%PYTHON%" "%REPO%pc_agent.py"
+)
 set "EXITCODE=%ERRORLEVEL%"
 
 if "%LOOP%"=="1" (

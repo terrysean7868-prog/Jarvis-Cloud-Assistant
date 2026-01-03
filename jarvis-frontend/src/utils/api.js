@@ -178,6 +178,23 @@ export async function dispatchDeviceActions(actions, sessionId, sourceText = "",
   return await res.json();
 }
 
+export async function getAgentConfig(sessionId, deviceId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = { session_id: sessionId };
+  if (deviceId) body.device_id = deviceId;
+
+  const res = await timeoutFetch(`${API_URL}/api/agent/config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    let errText = await res.text().catch(() => `HTTP ${res.status}`);
+    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+  }
+  return await res.json();
+}
+
 export async function grantDevicePermissions(sessionId, permissions, deviceId = null, ownerUsername = null, timeoutMs = DEFAULT_TIMEOUT) {
   const body = {
     session_id: sessionId,
