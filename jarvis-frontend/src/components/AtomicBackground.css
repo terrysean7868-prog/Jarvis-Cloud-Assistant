@@ -7,6 +7,10 @@
   display: grid;
   place-items: center;
 
+  /* 3D scene setup */
+  perspective: 900px;
+  perspective-origin: 50% 50%;
+
   /* dark base + subtle color wash */
   background:
     radial-gradient(
@@ -18,10 +22,26 @@
 
 .atomic-center {
   position: relative;
-  width: 100vmin;
-  height: 100vmin;
+  /* Whole atomic section ~80% of viewport */
+  width: min(80vmin, 80vw, 80vh);
+  height: min(80vmin, 80vw, 80vh);
   max-width: 100vw;
   max-height: 100vh;
+
+  transform-style: preserve-3d;
+  /* Slow global rotation for a premium 3D feel */
+  animation: atomic-center-spin 31s linear infinite;
+  will-change: transform;
+  backface-visibility: hidden;
+}
+
+@keyframes atomic-center-spin {
+  0% {
+    transform: rotateX(34deg) rotateY(-28deg) rotateZ(0deg);
+  }
+  100% {
+    transform: rotateX(34deg) rotateY(-28deg) rotateZ(360deg);
+  }
 }
 
 .atomic-nucleus {
@@ -43,6 +63,22 @@
   box-shadow:
     0 0 22px rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.25 + (var(--a-vol) * 0.15))),
     0 0 70px rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.12 + (var(--a-wake) * 0.1)));
+
+  filter: blur(0.2px);
+}
+
+.atomic-nucleus::after {
+  content: "";
+  position: absolute;
+  inset: -42px;
+  border-radius: 999px;
+  background: radial-gradient(
+    circle,
+    rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.16 + (var(--a-wake) * 0.08))) 0%,
+    rgba(var(--a-r), var(--a-g), var(--a-b), 0) 65%
+  );
+  filter: blur(10px);
+  opacity: calc(0.7 + (var(--a-vol) * 0.2));
 }
 
 .atomic-ring {
@@ -51,7 +87,24 @@
   top: 50%;
   width: var(--ring-size);
   height: var(--ring-size);
-  transform: translate(-50%, -50%);
+  transform: translate(-50%, -50%) translateZ(var(--ring-z)) rotateX(var(--tilt-x)) rotateY(var(--tilt-y));
+  transform-style: preserve-3d;
+  backface-visibility: hidden;
+}
+
+.atomic-ring-rotator {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  transform-style: preserve-3d;
+  animation: atomic-ring-spin var(--ring-dur) linear infinite;
+  animation-delay: var(--ring-delay, 0s);
+  will-change: transform;
+}
+
+@keyframes atomic-ring-spin {
+  from { transform: rotateZ(0deg); }
+  to { transform: rotateZ(360deg); }
 }
 
 .atomic-ring-outline {
@@ -65,11 +118,52 @@
     inset 0 0 16px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.35));
 }
 
+/* Premium dotted highlights along the ring */
+.atomic-ring-outline::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: 999px;
+
+  /* Dotted ring (conic segments) */
+  background: repeating-conic-gradient(
+    rgba(255, 255, 255, calc(0.05 + (var(--a-vol) * 0.05))) 0deg,
+    rgba(255, 255, 255, calc(0.05 + (var(--a-vol) * 0.05))) 3deg,
+    rgba(0, 0, 0, 0) 3deg,
+    rgba(0, 0, 0, 0) 10deg
+  );
+
+  /* Keep only a thin ring band */
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+
+  opacity: calc(0.7 + (var(--a-wake) * 0.25));
+  filter: blur(0.2px);
+}
+
+.atomic-ring-outline::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 999px;
+  background: radial-gradient(
+    circle,
+    rgba(var(--a-r), var(--a-g), var(--a-b), 0) 58%,
+    rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.35)) 62%,
+    rgba(var(--a-r), var(--a-g), var(--a-b), 0) 70%
+  );
+  filter: blur(8px);
+  opacity: calc(0.45 + (var(--a-vol) * 0.2));
+}
+
 .atomic-electrons {
   position: absolute;
   inset: 0;
   border-radius: 999px;
   animation: atomic-spin var(--dur) linear infinite;
+  animation-delay: var(--e-delay, 0s);
+  transform-style: preserve-3d;
+  will-change: transform;
 }
 
 .atomic-electrons-rev {

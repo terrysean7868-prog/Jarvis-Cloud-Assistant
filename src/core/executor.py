@@ -5,6 +5,7 @@ import asyncio
 import webbrowser
 import subprocess
 import platform
+import re
 from typing import List
 from src.core.jarvis_brain import JarvisBrain
 from src.utils.git_sync import git_sync  # ✅ now importing the function, not a class
@@ -290,6 +291,14 @@ class ActionExecutor:
             if action_type == "execute_command":
                 command = action.get("command", "")
                 wait = action.get("wait", True)
+                # Safety backstop: refuse commands that could damage OS/system.
+                if self._is_dangerous_command(str(command or "")):
+                    results.append({
+                        "status": "forbidden",
+                        "action_type": "execute_command",
+                        "message": "Blocked dangerous command (OS/system safety)."
+                    })
+                    continue
                 result = app_manager.execute_command(command, wait)
                 results.append(result)
                 continue
@@ -446,6 +455,61 @@ class ActionExecutor:
                 })
 
         return results
+
+    @staticmethod
+    def _is_dangerous_command(command: str) -> bool:
+        c = (command or "").strip()
+        if not c:
+            return False
+        cl = c.lower()
+
+        high_risk_patterns = [
+            r"\bformat\b",
+            r"\bdiskpart\b",
+            r"\bmkfs(\.[a-z0-9]+)?\b",
+            r"\bfdisk\b",
+            r"\bparted\b",
+            r"\bgparted\b",
+            r"\b(wipefs|dd)\b",
+            r"\bbootrec\b",
+            r"\bbcdedit\b",
+            r"\breg(ed(it)?|\s+add|\s+delete|\s+import)\b",
+            r"\bdism\b.*\/(remove-package|disable-feature)",
+            r"remove-item\b.*\b(-recurse|-force)\b",
+        ]
+        for pat in high_risk_patterns:
+            try:
+                if re.search(pat, cl, re.IGNORECASE):
+                    return True
+            except Exception:
+                continue
+
+        if re.search(r"\brm\b\s+.*\s-\s*rf\s+/(?:\s|$)", cl):
+            return True
+        if "--no-preserve-root" in cl and "rm" in cl and "/" in cl:
+            return True
+
+        delete_words = ("rm ", " del ", "erase", "rmdir", " rd ", "remove-item")
+        system_markers = (
+            "c:\\windows",
+            "\\windows\\system32",
+            "system32",
+            "c:\\program files",
+            "c:\\program files (x86)",
+            "c:\\programdata",
+            "system volume information",
+            "/etc/",
+            "/bin/",
+            "/sbin/",
+            "/usr/",
+            "/boot/",
+            "/system/",
+            "/library/",
+        )
+        if any(dw in cl for dw in delete_words) and any(sm in cl for sm in system_markers):
+            return True
+
+        return False
 
     def _open_url(self, url: str):
         """

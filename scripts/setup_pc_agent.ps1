@@ -1,27 +1,18 @@
 param(
   [string]$RepoPath = "",
-  [string]$ServerUrl = "",
-  [string]$SharedSecret = "",
-  [string]$DeviceId = "",
   [switch]$AllUsers,
-  [switch]$StartNow,
-  [switch]$NonInteractive
+  [switch]$StartNow
 )
 
 # One-command setup for a new Windows PC.
 # - Installs jarvisagent:// protocol handler (current user)
-# - Installs Scheduled Task autostart at Windows login
-# - Prompts for JARVIS_AGENT_SHARED_SECRET if missing
+# - Does NOT install any Windows-login autostart (user requested manual start)
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_pc_agent.ps1 -StartNow
 #
-# Unattended (recommended for repeatable installs):
-#   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_pc_agent.ps1 \
-#     -ServerUrl "https://<your-render-service>.onrender.com" \
-#     -SharedSecret "<same-as-backend>" \
-#     -DeviceId "<stable-device-id>" \
-#     -StartNow -NonInteractive
+# Non-interactive install (no autostart):
+#   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_pc_agent.ps1
 
 $ErrorActionPreference = 'Stop'
 
@@ -32,13 +23,11 @@ if (-not $RepoPath) {
 }
 
 $protocolInstaller = Join-Path $RepoPath 'scripts\install_jarvisagent_protocol.ps1'
-$autostartInstaller = Join-Path $RepoPath 'scripts\install_pc_agent_autostart.ps1'
+
+$starter = Join-Path $RepoPath 'scripts\start_pc_agent_hidden.ps1'
 
 if (-not (Test-Path $protocolInstaller)) {
   throw "Protocol installer not found: $protocolInstaller"
-}
-if (-not (Test-Path $autostartInstaller)) {
-  throw "Autostart installer not found: $autostartInstaller"
 }
 
 Write-Host "[1/2] Installing jarvisagent:// protocol handler (current user)…" -ForegroundColor Cyan
@@ -49,39 +38,19 @@ if ($AllUsers) {
   powershell -NoProfile -ExecutionPolicy Bypass -File $protocolInstaller -RepoPath $RepoPath | Out-Host
 }
 
-Write-Host "[2/2] Installing PC agent autostart Scheduled Task…" -ForegroundColor Cyan
-if ($NonInteractive) {
-  if (-not $SharedSecret) {
-    throw "NonInteractive requires -SharedSecret"
-  }
-}
-
-$commonArgs = @(
-  '-NoProfile',
-  '-ExecutionPolicy',
-  'Bypass',
-  '-File',
-  $autostartInstaller,
-  '-RepoPath',
-  $RepoPath
-)
-
-if ($ServerUrl) { $commonArgs += @('-ServerUrl', $ServerUrl) }
-if ($SharedSecret) { $commonArgs += @('-SharedSecret', $SharedSecret) }
-if ($DeviceId) { $commonArgs += @('-DeviceId', $DeviceId) }
-
 if ($StartNow) {
-  if ($SharedSecret) {
-    powershell @($commonArgs + @('-StartNow')) | Out-Host
-  } else {
-    powershell @($commonArgs + @('-PromptForSecret','-StartNow')) | Out-Host
+  if (-not (Test-Path $starter)) {
+    throw "Agent starter not found: $starter"
   }
-} else {
-  if ($SharedSecret) {
-    powershell @($commonArgs) | Out-Host
-  } else {
-    powershell @($commonArgs + @('-PromptForSecret')) | Out-Host
-  }
-}
 
-Write-Host "Done. The agent will auto-start at Windows login." -ForegroundColor Green
+  Write-Host "[2/2] Starting PC agent now (no login autostart)…" -ForegroundColor Cyan
+  Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+    '-NoProfile','-ExecutionPolicy','Bypass','-File', $starter,
+    '-RepoPath', $RepoPath, '-Loop'
+  ) -WorkingDirectory $RepoPath -WindowStyle Hidden | Out-Null
+
+  Write-Host "Done. The agent is running (started on demand)." -ForegroundColor Green
+} else {
+  Write-Host "Done. No Windows-login autostart is installed." -ForegroundColor Green
+  Write-Host "Start the agent manually with run_pc_agent.bat when needed." -ForegroundColor Green
+}

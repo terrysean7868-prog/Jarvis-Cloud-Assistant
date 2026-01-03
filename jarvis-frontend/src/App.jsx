@@ -803,6 +803,7 @@ export default function App() {
         const DEVICE_ACTION_TYPES = new Set([
           "open_app", "close_app", "switch_app",
           "execute_command",
+          "type_text", "press_key",
           "read", "list", "mkdir",
           "write", "edit", "delete", "move", "copy", "cleanup",
           "self_update", "self_add",

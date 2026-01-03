@@ -1268,7 +1268,7 @@ async def device_dispatch(req: DeviceDispatchRequest):
             return ("allow_app_control", "JARVIS_AGENT_ALLOW_APP_CONTROL")
         if t == "execute_command":
             return ("allow_execute_command", "JARVIS_AGENT_ALLOW_EXECUTE_COMMAND")
-        if t in ("capture_screen", "screen_navigation"):
+        if t in ("capture_screen", "screen_navigation", "type_text", "press_key"):
             return ("allow_screen", "JARVIS_AGENT_ALLOW_SCREEN")
         if t in ("read", "write", "edit", "delete", "move", "copy", "list", "mkdir", "cleanup"):
             return ("allow_file_ops", "JARVIS_AGENT_ALLOW_FILE_OPS")

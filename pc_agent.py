@@ -10,15 +10,14 @@ from datetime import datetime, UTC
 
 import aiohttp
 
-# Load environment from .env/.env.agent if present (avoids manual env setup).
+# Load environment from .env if present (avoids manual env setup).
 try:
     from dotenv import load_dotenv
     _HERE = Path(__file__).resolve().parent
-    for _p in (_HERE / ".env.agent", _HERE / ".env"):
+    for _p in (_HERE / ".env",):
         try:
             if _p.exists():
-                # Prefer explicit agent config when present.
-                load_dotenv(_p, override=(_p.name == ".env.agent"))
+                load_dotenv(_p, override=False)
         except Exception:
             pass
 except Exception:
@@ -206,6 +205,61 @@ def _is_path_allowed(path: str) -> bool:
     return False
 
 
+def _is_dangerous_command(command: str) -> bool:
+    c = (command or "").strip()
+    if not c:
+        return False
+    cl = c.lower()
+
+    high_risk_patterns = [
+        r"\bformat\b",
+        r"\bdiskpart\b",
+        r"\bmkfs(\.[a-z0-9]+)?\b",
+        r"\bfdisk\b",
+        r"\bparted\b",
+        r"\bgparted\b",
+        r"\b(wipefs|dd)\b",
+        r"\bbootrec\b",
+        r"\bbcdedit\b",
+        r"\breg(ed(it)?|\s+add|\s+delete|\s+import)\b",
+        r"\bdism\b.*\/(remove-package|disable-feature)",
+        r"remove-item\b.*\b(-recurse|-force)\b",
+    ]
+    for pat in high_risk_patterns:
+        try:
+            if re.search(pat, cl, re.IGNORECASE):
+                return True
+        except Exception:
+            continue
+
+    if re.search(r"\brm\b\s+.*\s-\s*rf\s+/(?:\s|$)", cl):
+        return True
+    if "--no-preserve-root" in cl and "rm" in cl and "/" in cl:
+        return True
+
+    delete_words = ("rm ", " del ", "erase", "rmdir", " rd ", "remove-item")
+    system_markers = (
+        "c:\\windows",
+        "\\windows\\system32",
+        "system32",
+        "c:\\program files",
+        "c:\\program files (x86)",
+        "c:\\programdata",
+        "system volume information",
+        "/etc/",
+        "/bin/",
+        "/sbin/",
+        "/usr/",
+        "/boot/",
+        "/system/",
+        "/library/",
+    )
+    if any(dw in cl for dw in delete_words) and any(sm in cl for sm in system_markers):
+        return True
+
+    return False
+
+
 def _read_text_file(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
@@ -336,6 +390,8 @@ async def _execute_action(action: dict) -> dict:
             return {"status": "error", "action_type": t, "message": "Command runner not available on this agent"}
         cmd = action.get("command") or ""
         wait = bool(action.get("wait", True))
+        if _is_dangerous_command(str(cmd)):
+            return {"status": "forbidden", "action_type": t, "message": "Blocked dangerous command (OS/system safety)."}
         return mgr.execute_command(cmd, wait)
 
     if t in ("capture_screen", "screen_navigation"):
@@ -359,6 +415,31 @@ async def _execute_action(action: dict) -> dict:
             }
         # screen_navigation currently implemented in ActionExecutor; we keep agent minimal.
         return {"status": "error", "action_type": "screen_navigation", "message": "screen_navigation not implemented in agent"}
+
+    if t in ("type_text", "press_key"):
+        if not ALLOW_SCREEN:
+            return {"status": "forbidden", "action_type": t, "message": "Screen features disabled on agent"}
+        sa = _get_screen_access()
+        if not sa:
+            return {"status": "error", "action_type": t, "message": "Screen features not available on this agent"}
+
+        if t == "type_text":
+            text = str(action.get("text") or "")
+            try:
+                interval = float(action.get("interval", 0.02))
+            except Exception:
+                interval = 0.02
+            ok = bool(sa.type_text(text, interval=interval))
+            return {"status": "success" if ok else "error", "action_type": t, "typed": len(text)}
+
+        key = str(action.get("key") or "").strip()
+        try:
+            presses = int(action.get("presses", 1))
+        except Exception:
+            presses = 1
+        presses = max(1, min(20, presses))
+        ok = bool(sa.press_key(key, presses=presses)) if key else False
+        return {"status": "success" if ok else "error", "action_type": t, "key": key, "presses": presses}
 
     if t.startswith("system_") or t in ("process_kill",):
         if not SYSTEM_OPS_AVAILABLE or not system_ops:

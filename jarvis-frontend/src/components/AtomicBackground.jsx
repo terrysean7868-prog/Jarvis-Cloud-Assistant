@@ -39,9 +39,10 @@ export default function AtomicBackground({ emotion = "calm", wakePulse = false, 
   const rgb = useMemo(() => colorForEmotion(emotion), [emotion]);
   const safeVolume = Math.max(0, Math.min(1, Number(volume) || 0));
 
-  // Match the worker geometry: inner ~14% and outer ~42% of min dimension.
-  const innerVmin = 14;
-  const outerVmin = 42;
+  // Larger scene: use ~80% of the viewport for the whole atomic section.
+  // Inner ring kept smaller to preserve spacing across 7 rings.
+  const innerVmin = 26;
+  const outerVmin = 80;
   const gapVmin = (outerVmin - innerVmin) / Math.max(1, RING_COUNT - 1);
 
   return (
@@ -61,9 +62,22 @@ export default function AtomicBackground({ emotion = "calm", wakePulse = false, 
 
         {Array.from({ length: RING_COUNT }).map((_, i) => {
           const ringSizeVmin = innerVmin + i * gapVmin;
-          const durS = 9.5 + i * 1.9;
+          // De-sync electron rotations so the scene doesn't "repeat" as obviously.
+          const durS = 11.7 + i * 2.3;
           const reverse = i % 2 !== 0;
           const n = counts[i] || 2;
+
+          // Stronger 3D tilt per ring for depth.
+          const tiltX = -28 + i * 5.0;
+          const tiltY = 20 - i * 3.2;
+
+          // De-sync ring rotations too (avoid multiples that "line up" periodically).
+          const ringSpinS = 17.3 + i * 2.1;
+
+          // Negative delays start mid-cycle, making the motion feel continuous.
+          const ringDelayS = -(i * 1.35);
+          const electronDelayS = -(i * 0.9);
+          const ringZ = (i - 3) * 2; // px
 
           return (
             <div
@@ -72,21 +86,28 @@ export default function AtomicBackground({ emotion = "calm", wakePulse = false, 
               style={{
                 "--ring-size": `${ringSizeVmin}vmin`,
                 "--ring-alpha": Math.max(0.06, 0.18 - i * 0.012),
+                "--tilt-x": `${tiltX}deg`,
+                "--tilt-y": `${tiltY}deg`,
+                "--ring-dur": `${ringSpinS}s`,
+                "--ring-delay": `${ringDelayS}s`,
+                "--ring-z": `${ringZ}px`,
               }}
             >
-              <div className="atomic-ring-outline" />
+              <div className="atomic-ring-rotator">
+                <div className="atomic-ring-outline" />
 
-              <div
-                className={`atomic-electrons ${reverse ? "atomic-electrons-rev" : ""}`}
-                style={{ "--dur": `${durS}s` }}
-              >
-                {Array.from({ length: n }).map((__, j) => (
-                  <div
-                    key={j}
-                    className="atomic-electron"
-                    style={{ "--e-ang": `${(j / n) * 360}deg` }}
-                  />
-                ))}
+                <div
+                  className={`atomic-electrons ${reverse ? "atomic-electrons-rev" : ""}`}
+                  style={{ "--dur": `${durS}s`, "--e-delay": `${electronDelayS}s` }}
+                >
+                  {Array.from({ length: n }).map((__, j) => (
+                    <div
+                      key={j}
+                      className="atomic-electron"
+                      style={{ "--e-ang": `${(j / n) * 360}deg` }}
+                    />
+                  ))}
+                </div>
               </div>
             </div>
           );
