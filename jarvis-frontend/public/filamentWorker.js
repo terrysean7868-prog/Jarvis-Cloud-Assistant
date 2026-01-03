@@ -7,7 +7,12 @@ let height = 0;
 let devicePixelRatio = 1;
 let nodes = [];
 let running = false;
+let paused = false;
 let t = 0;
+
+// Render cap for low CPU/GPU usage
+const TARGET_FPS = 30;
+const FRAME_MS = 1000 / TARGET_FPS;
 
 function initNodes(center, nodeCount, baseRadius) {
   nodes = [];
@@ -20,8 +25,10 @@ function initNodes(center, nodeCount, baseRadius) {
       r,
       x: center.x + Math.cos(angle) * r,
       y: center.y + Math.sin(angle) * r,
+      z: 0,
       twist: Math.random() * 0.9 + 0.1,
-      phase: Math.random() * Math.PI * 2
+      phase: Math.random() * Math.PI * 2,
+      zAmp: 0.35 + Math.random() * 0.75,
     });
   }
 }
@@ -69,11 +76,21 @@ onmessage = (ev) => {
     state.volume = data.volume || state.volume;
   } else if (data.type === "state") {
     state = { ...state, ...data };
+  } else if (data.type === "set_running") {
+    paused = !data.running;
   } else if (data.type === "dispose") {
     running = false;
     close();
   }
 };
+
+function _project3D(center, x, y, z, fov) {
+  // Classic perspective projection: scale = fov / (fov + z)
+  // Keep denominator safe.
+  const denom = Math.max(120, fov + z);
+  const s = fov / denom;
+  return { x: center.x + x * s, y: center.y + y * s, s };
+}
 
 function startLoop(reinit = false) {
   if (!ctx) return;
@@ -86,9 +103,23 @@ function startLoop(reinit = false) {
 
   t = 0;
   let last = performance.now();
+  let lastRender = last;
 
   function frame(now) {
     if (!running) return;
+    if (paused) {
+      // Stay registered but do no work.
+      self.requestAnimationFrame(frame);
+      return;
+    }
+
+    // FPS cap (worker RAF can be 60fps+; keep it cheap)
+    if (now - lastRender < FRAME_MS) {
+      self.requestAnimationFrame(frame);
+      return;
+    }
+    lastRender = now;
+
     const dt = (now - last) / 1000;
     last = now;
     t += dt;
@@ -102,26 +133,58 @@ function startLoop(reinit = false) {
     ctx.fillStyle = `rgba(${emo.r},${emo.g},${emo.b},${Math.max(0.02, glowAlpha * 0.12)})`;
     ctx.fillRect(0, 0, width, height);
 
-    // update nodes
+    // update nodes (pseudo-3D motion with perspective projection)
     for (let i = 0; i < nodes.length; i++) {
       const n = nodes[i];
       const tw = Math.sin(t * 0.6 + n.phase) * 0.4 * n.twist;
       const volPush = 1 + state.volume * 0.8;
       n.angle = n.baseAngle + tw * (state.transformState === "twist" ? 2.2 : 1.0);
+
       const radius = n.r * (state.transformState === "expand" ? 1.25 : state.transformState === "contract" ? 0.7 : 1) * volPush;
-      n.x = center.x + Math.cos(n.angle + t * 0.06) * radius;
-      n.y = center.y + Math.sin(n.angle + t * 0.06) * radius;
+      const baseX = Math.cos(n.angle + t * 0.06) * radius;
+      const baseY = Math.sin(n.angle + t * 0.06) * radius;
+      const baseZ = Math.sin(t * 0.85 + n.phase) * (Math.min(width, height) * 0.12) * n.zAmp * (0.25 + state.volume);
+
+      // Rotations create a true 3D feel.
+      const rx = 0.55 + Math.sin(t * 0.25) * 0.12 + state.volume * 0.18;
+      const ry = 0.35 + Math.cos(t * 0.22) * 0.12 + state.volume * 0.14;
+
+      // rotate around X
+      const cosx = Math.cos(rx);
+      const sinx = Math.sin(rx);
+      const y1 = baseY * cosx - baseZ * sinx;
+      const z1 = baseY * sinx + baseZ * cosx;
+
+      // rotate around Y
+      const cosy = Math.cos(ry);
+      const siny = Math.sin(ry);
+      const x2 = baseX * cosy + z1 * siny;
+      const z2 = -baseX * siny + z1 * cosy;
+
+      n.x = center.x + x2;
+      n.y = center.y + y1;
+      n.z = z2;
     }
 
-    ctx.lineWidth = 1 + Math.min(2.2, 1.2 + state.volume * 2);
+    const fov = Math.min(width, height) * 0.9;
+    const proj = new Array(nodes.length);
     for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i];
-      const b = nodes[(i + 1) % nodes.length];
-      const midx = (a.x + b.x) / 2 + Math.sin(t * 1.2 + i) * 8 * (state.volume + 0.05);
-      const midy = (a.y + b.y) / 2 + Math.cos(t * 1.3 + i) * 8 * (state.volume + 0.05);
+      const n = nodes[i];
+      proj[i] = _project3D(center, n.x - center.x, n.y - center.y, n.z, fov);
+    }
+
+    ctx.lineWidth = 0.9 + Math.min(2.0, 1.1 + state.volume * 1.6);
+    for (let i = 0; i < nodes.length; i++) {
+      const a = proj[i];
+      const b = proj[(i + 1) % proj.length];
+      const depthAlpha = Math.max(0.18, Math.min(1, (a.s + b.s) * 0.55));
+
+      const midx = (a.x + b.x) / 2 + Math.sin(t * 1.1 + i) * 10 * (state.volume + 0.05) * depthAlpha;
+      const midy = (a.y + b.y) / 2 + Math.cos(t * 1.0 + i) * 10 * (state.volume + 0.05) * depthAlpha;
+
       const grad = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
-      grad.addColorStop(0, `rgba(${emo.r},${emo.g},${emo.b},${0.85 * (0.6 + state.volume)})`);
-      grad.addColorStop(1, `rgba(255,255,255,${0.08 + state.volume * 0.18})`);
+      grad.addColorStop(0, `rgba(${emo.r},${emo.g},${emo.b},${(0.78 * (0.55 + state.volume)) * depthAlpha})`);
+      grad.addColorStop(1, `rgba(255,255,255,${(0.06 + state.volume * 0.14) * depthAlpha})`);
       ctx.strokeStyle = grad;
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);

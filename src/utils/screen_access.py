@@ -135,12 +135,23 @@ class ScreenAccess:
         screenshot = self.capture_screen(region)
         if not screenshot:
             return None
-        
+
         try:
             buffer = BytesIO()
-            screenshot.save(buffer, format='PNG')
-            img_str = base64.b64encode(buffer.getvalue()).decode()
-            return img_str
+            screenshot.save(buffer, format="PNG")
+            return base64.b64encode(buffer.getvalue()).decode()
+        except Exception as e:
+            print(f"Base64 encoding error: {e}")
+            return None
+
+    def _image_to_base64_png(self, image) -> Optional[str]:
+        """Encode an existing PIL image to base64 PNG without re-capturing."""
+        if not image:
+            return None
+        try:
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+            return base64.b64encode(buffer.getvalue()).decode()
         except Exception as e:
             print(f"Base64 encoding error: {e}")
             return None
@@ -265,13 +276,13 @@ class ScreenAccess:
         screenshot = self.capture_screen(region)
         if not screenshot:
             return {"error": "Failed to capture screen"}
-        
+
         return {
             "width": screenshot.width,
             "height": screenshot.height,
             "size": self.screen_size,
             "mouse_position": self.get_mouse_position(),
-            **({"base64": self.capture_screen_base64()} if include_base64 else {})
+            **({"base64": self._image_to_base64_png(screenshot)} if include_base64 else {})
         }
 
 

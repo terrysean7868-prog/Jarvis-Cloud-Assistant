@@ -12,7 +12,6 @@ import {
   configureMyPc,
   dispatchDeviceActions,
   grantDevicePermissions,
-  getSavedDevicePermissions,
   googleSpeechToText,
   API_URL
 } from "./utils/api";
@@ -28,7 +27,6 @@ const scheduleIdle = (fn, timeout = 800) => {
 };
 
 // Lazy-load heavy UI pieces
-const ArcReactor = lazy(() => import("./components/ArcReactor"));
 const HUDLogs = lazy(() => import("./components/HUDLogs"));
 const PermissionModal = lazy(() => import("./components/PermissionModal"));
 
@@ -88,34 +86,6 @@ export default function App() {
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
 
-  const computeReactorSize = useCallback(() => {
-    if (typeof window === "undefined") return 340;
-    const availW = Math.max(320, window.innerWidth || 0);
-    const availH = Math.max(320, window.innerHeight || 0);
-    const vmin = Math.min(availW, availH);
-    const target = Math.floor(vmin * 0.8);
-    return Math.max(260, Math.min(target, 920));
-  }, []);
-
-  const [reactorSize, setReactorSize] = useState(() => {
-    try { return computeReactorSize(); } catch { return 340; }
-  });
-
-  useEffect(() => {
-    const onResize = () => {
-      try { setReactorSize(computeReactorSize()); } catch {}
-    };
-    window.addEventListener("resize", onResize);
-    window.addEventListener("orientationchange", onResize);
-    return () => {
-      try { window.removeEventListener("resize", onResize); } catch {}
-      try { window.removeEventListener("orientationchange", onResize); } catch {}
-    };
-  }, [computeReactorSize]);
-
-  const pendingAgentAutoStartRef = useRef(false);
-  const autoStartListenerAttachedRef = useRef(false);
-  const deviceAutoConfiguredRef = useRef(false);
   const googleSttDisabledUntilRef = useRef(0);
   const lastWakeNoSpeechLogRef = useRef(0);
   const [voiceUnlocked, setVoiceUnlocked] = useState(() => !isMobile);
@@ -131,6 +101,7 @@ export default function App() {
   const assistantNameRef = useRef("Jarvis");
   const micStreamRef = useRef(null);
   const filamentWorkerRef = useRef(null);
+  const pcAgentLoginPromptedSessionRef = useRef(null);
 
   useEffect(() => {
     speakingRef.current = !!speaking;
@@ -170,22 +141,39 @@ export default function App() {
     assistantNameRef.current = assistantName || "Jarvis";
   }, [assistantName]);
 
-  // After auth (including session restore), auto-bind this user to a connected agent if possible.
-  // This prevents "No device assigned" errors for PC actions.
+  const isPcAgentOnline = useCallback(async (sid) => {
+    if (!sid) return false;
+    try {
+      const r = await fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(sid)}`);
+      const data = await r.json().catch(() => null);
+      const agents = Array.isArray(data?.agents) ? data.agents : [];
+      return agents.length > 0;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  // Required flow:
+  // - On login, ask via popup if PC agent is started.
+  // - If user says Yes: establish connection (bind) if agent is online.
+  // - If user says No: do nothing; user can start agent using the .bat file.
   useEffect(() => {
     if (!isAuthenticated || !sessionId) return;
-    if (deviceAutoConfiguredRef.current) return;
-    deviceAutoConfiguredRef.current = true;
+    if (pcAgentLoginPromptedSessionRef.current === sessionId) return;
+    pcAgentLoginPromptedSessionRef.current = sessionId;
 
     let cancelled = false;
-    const h = scheduleIdle(async () => {
+    const h = scheduleIdle(() => {
       if (cancelled) return;
-      try {
-        await configureMyPc(sessionId);
-      } catch {
-        // best-effort; if no agent is connected, user can still start it via modal/OS autostart
-      }
-    }, 900);
+      setPermissionPrompt({
+        title: "PC agent",
+        message: "Is PC agent started?",
+        details: "If Yes, Jarvis will establish connection. If No, start PC agent using run_pc_agent.bat then login again.",
+        kind: "pc_agent_login",
+        allowLabel: "Yes",
+        denyLabel: "No",
+      });
+    }, 350);
 
     return () => {
       cancelled = true;
@@ -257,95 +245,8 @@ export default function App() {
     };
   }, [isAuthenticated, isMobile, vizAudioUnlocked]);
 
-  const agentStartAttemptedRef = useRef(false);
-  const agentStartInFlightRef = useRef(false);
-
-  useEffect(() => {
-    agentStartAttemptedRef.current = false;
-    agentStartInFlightRef.current = false;
-  }, [sessionId]);
-
-  const _launchJarvisAgentProtocol = useCallback((action) => {
-    // Avoid navigating away from the page; use an iframe.
-    try {
-      const iframe = document.createElement("iframe");
-      iframe.style.display = "none";
-      iframe.src = `jarvisagent://${action}`;
-      document.body.appendChild(iframe);
-      setTimeout(() => {
-        try { document.body.removeChild(iframe); } catch {}
-      }, 1200);
-      return true;
-    } catch {
-      return false;
-    }
-  }, []);
-
-  const _pollAgentOnline = useCallback(async (sid, timeoutMs = 20000) => {
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < timeoutMs) {
-      try {
-        const r = await fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(sid)}`);
-        const data = await r.json().catch(() => null);
-        const agents = Array.isArray(data?.agents) ? data.agents : [];
-        if (agents.length) return true;
-      } catch {}
-      await new Promise(res => setTimeout(res, 900));
-    }
-    return false;
-  }, []);
-
-  const requestAgentStart = useCallback(async ({ silent = false } = {}) => {
-    if (!sessionId) return false;
-    if (agentStartInFlightRef.current) return false;
-    agentStartInFlightRef.current = true;
-    agentStartAttemptedRef.current = true;
-
-    try {
-      if (!silent) addLog("system", "Starting PC agent…");
-      _launchJarvisAgentProtocol("start");
-      const ok = await _pollAgentOnline(sessionId, 20000);
-      if (ok && !silent) addLog("system", "PC agent is online.");
-      return ok;
-    } finally {
-      agentStartInFlightRef.current = false;
-    }
-  }, [addLog, _launchJarvisAgentProtocol, _pollAgentOnline, sessionId]);
-
-  const _hasAnySavedDevicePermission = useCallback((perms) => {
-    if (!perms || typeof perms !== "object") return false;
-    return Object.values(perms).some(v => v === true);
-  }, []);
-
-  // If the user already granted device permissions, we can "auto-start" the agent on the
-  // next user gesture after login (browser-safe way to trigger jarvisagent://).
-  useEffect(() => {
-    if (!isAuthenticated || !sessionId) return;
-    if (!pendingAgentAutoStartRef.current) return;
-    if (isMobile) return;
-    if (autoStartListenerAttachedRef.current) return;
-
-    autoStartListenerAttachedRef.current = true;
-
-    let cancelled = false;
-    const handler = async () => {
-      if (cancelled) return;
-      pendingAgentAutoStartRef.current = false;
-      try {
-        await requestAgentStart({ silent: true });
-      } catch {}
-    };
-
-    window.addEventListener("pointerdown", handler, true);
-    window.addEventListener("keydown", handler, true);
-
-    return () => {
-      cancelled = true;
-      autoStartListenerAttachedRef.current = false;
-      try { window.removeEventListener("pointerdown", handler, true); } catch {}
-      try { window.removeEventListener("keydown", handler, true); } catch {}
-    };
-  }, [isAuthenticated, sessionId, isMobile, requestAgentStart]);
+  // NOTE: The PC agent is started manually by the user (python pc_agent.py).
+  // The web UI intentionally does not attempt to launch local processes.
 
   // ---------- Offload visuals to worker (OffscreenCanvas) ----------
   useEffect(() => {
@@ -381,7 +282,7 @@ export default function App() {
         worker.postMessage({
           type: "init",
           canvas: offscreen,
-          devicePixelRatio: window.devicePixelRatio || 1,
+          devicePixelRatio: Math.max(1, Math.min(1.5, window.devicePixelRatio || 1)),
           width: window.innerWidth,
           height: window.innerHeight
         }, [offscreen]);
@@ -400,9 +301,19 @@ export default function App() {
         };
         window.addEventListener("resize", onResize);
 
+        // Pause rendering when hidden to save CPU/GPU.
+        const onVis = () => {
+          try {
+            worker.postMessage({ type: "set_running", running: document.visibilityState === "visible" });
+          } catch {}
+        };
+        document.addEventListener("visibilitychange", onVis);
+        onVis();
+
         // cleanup
         return () => {
           window.removeEventListener("resize", onResize);
+          document.removeEventListener("visibilitychange", onVis);
           try {
             worker.postMessage({ type: "dispose" });
             worker.terminate();
@@ -1032,25 +943,10 @@ export default function App() {
                   speak("Permission required. Please approve the popup.");
                 } catch {}
               } else if (permDetail?.message === "Device agent is not connected" || /device agent is not connected/i.test(String(permMsg || raw))) {
-                const deviceId = permDetail?.device_id;
-                setPermissionPrompt({
-                  title: "PC agent offline",
-                  message: deviceId ? `Your PC agent (${deviceId}) is offline. Start it now?` : "Your PC agent is offline. Start it now?",
-                  details: "This will try to launch the agent on this Windows PC using a local protocol handler.",
-                  kind: "start_agent",
-                  deviceId,
-                });
-                try { speak("Your PC agent is offline. Please approve the popup to start it."); } catch {}
+                addLog("system", "PC agent is not connected. Start PC agent using run_pc_agent.bat and login again (then click Yes).");
+                try { speak("PC agent is not connected. Start it and login again."); } catch {}
               } else if (/no device assigned to this user/i.test(String(permMsg || raw))) {
-                setPermissionPrompt({
-                  title: "PC not configured",
-                  message: "Your account is not linked to a PC device yet. Configure this PC now?",
-                  details: "This links your user to the connected PC agent so PC actions can run.",
-                  kind: "configure_pc",
-                  pendingActions: deviceActions,
-                  sourceText: transcript,
-                });
-                try { speak("Your PC is not configured yet. Please approve the popup."); } catch {}
+                addLog("system", "PC is not configured. Login again and click Yes when asked about PC agent.");
               } else {
                 addLog("system", `PC action dispatch failed: ${permMsg || raw}`);
                 addLog("system", "Make sure pc_agent.py is running on your PC and connected.");
@@ -1253,55 +1149,7 @@ export default function App() {
       .catch(() => {});
   }, [addLog]);
 
-  // On every login (including auto-session restore), auto-start the PC agent.
-  useEffect(() => {
-    if (!isAuthenticated || !sessionId) return;
-
-    let cancelled = false;
-    (async () => {
-      try {
-        const r = await fetch(`${API_URL}/api/device/status?session_id=${encodeURIComponent(sessionId)}`);
-        const data = await r.json().catch(() => null);
-        if (cancelled) return;
-        const agents = Array.isArray(data?.agents) ? data.agents : [];
-        if (agents.length) return;
-
-        // Only attempt auto-start behavior if the user already granted device permissions.
-        // We arm the start on next user gesture (required by browsers for custom protocols).
-        if (!agentStartAttemptedRef.current && !isMobile) {
-          let savedPerms = null;
-          try {
-            const res = await getSavedDevicePermissions(sessionId);
-            savedPerms = res?.permissions || null;
-          } catch {
-            savedPerms = null;
-          }
-
-          if (_hasAnySavedDevicePermission(savedPerms)) {
-            agentStartAttemptedRef.current = true;
-            // Show a prompt right after login/session restore so it feels like the same flow.
-            setPermissionPrompt({
-              title: "Start PC agent",
-              message: "You already granted PC permissions. Start your PC agent now?",
-              details: "This will try to launch the agent on this Windows PC using the local jarvisagent:// protocol. For true zero-click startup, install the Scheduled Task autostart script on the PC.",
-              kind: "start_agent",
-              allowLabel: "Start",
-              denyLabel: "Not now",
-            });
-
-            // Also arm the next-gesture start as a fallback if the modal is dismissed.
-            pendingAgentAutoStartRef.current = true;
-          }
-        }
-      } catch {
-        // ignore
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [isAuthenticated, sessionId, isMobile, addLog, _hasAnySavedDevicePermission]);
+  // PC agent is started manually (python pc_agent.py).
 
   useEffect(() => {
     const storedSession = localStorage.getItem("jarvis_session");
@@ -1374,45 +1222,32 @@ export default function App() {
               const req = permissionPrompt;
               setPermissionPrompt(null);
               try {
-                if (req.kind === "start_agent") {
-                  const ok = await requestAgentStart({ silent: false });
-                  if (!ok) {
-                    addLog("system", "Agent start requested, but it is still offline. If nothing opened, install scripts/install_jarvisagent_protocol.ps1 on this PC, or start the agent manually.");
-                  }
-                  return;
-                }
+                if (req.kind === "info") return;
 
-                if (req.kind === "configure_pc") {
-                  addLog("system", "Configuring your PC device…");
+                if (req.kind === "pc_agent_login") {
+                  if (!sessionId) return;
+                  addLog("system", "Checking PC agent…");
+
+                  const online = await isPcAgentOnline(sessionId);
+                  if (!online) {
+                    addLog("system", "PC agent is offline. Start run_pc_agent.bat and login again.");
+                    return;
+                  }
+
+                  addLog("system", "PC agent online. Establishing connection…");
                   try {
                     await configureMyPc(sessionId);
+                    addLog("system", "PC agent connected.");
                   } catch {
-                    // If the agent isn't online yet, attempt to start it (best-effort) then retry.
-                    const ok = await requestAgentStart({ silent: false });
-                    if (!ok) {
-                      addLog("system", "PC agent is still offline. Start it on this PC and retry.");
-                      return;
-                    }
-                    await configureMyPc(sessionId);
-                  }
-
-                  if (Array.isArray(req.pendingActions) && req.pendingActions.length) {
-                    await dispatchDeviceActions(req.pendingActions, sessionId, req.sourceText || "");
-                    addLog("system", "PC configured. Action queued.");
-                  } else {
-                    addLog("system", "PC configured.");
+                    addLog("system", "Could not establish connection. Try again.");
                   }
                   return;
                 }
 
                 const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
                 if (grantRes?.offline) {
-                  addLog("system", "Permission saved. Starting your PC agent…");
-                  const ok = await requestAgentStart({ silent: false });
-                  if (!ok) {
-                    addLog("system", "PC agent is still offline. Start it manually on this PC and retry the action.");
-                    return;
-                  }
+                  addLog("system", "Permission saved. Start run_pc_agent.bat and login again (then click Yes).");
+                  return;
                 }
 
                 await dispatchDeviceActions(req.pendingActions, sessionId, req.sourceText);
@@ -1450,17 +1285,6 @@ export default function App() {
                 }
               } catch {}
 
-              // Local fallback (requires protocol handler installed on this PC).
-              try {
-                const iframe = document.createElement("iframe");
-                iframe.style.display = "none";
-                iframe.src = "jarvisagent://stop";
-                document.body.appendChild(iframe);
-                setTimeout(() => {
-                  try { document.body.removeChild(iframe); } catch {}
-                }, 1500);
-              } catch {}
-
               localStorage.removeItem("jarvis_session");
               localStorage.removeItem("jarvis_username");
               localStorage.removeItem("jarvis_role");
@@ -1485,34 +1309,6 @@ export default function App() {
 
       {/* OffscreenCanvas target */}
       <canvas id="filamentCanvas" style={{ position: "fixed", inset: 0, zIndex: 1, pointerEvents: "none", width: "100vw", height: "100vh" }} />
-
-      <div className="hud-overlay" style={{ position: "fixed", inset: 0, zIndex: 5, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
-        <div className="reactor-shell" style={{
-          width: reactorSize,
-          height: reactorSize,
-          borderRadius: "50%",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          transition: "transform 420ms ease, box-shadow 320ms ease",
-          transform: transformState === "expand" ? "scale(1.08)" : transformState === "contract" ? "scale(0.88)" : "scale(1)",
-          pointerEvents: "none"
-        }}>
-          <div style={{ pointerEvents: "none", zIndex: 6 }}>
-            <Suspense fallback={<div />}>
-              <ArcReactor
-                active={listening || speaking}
-                wakePulse={wakePulse}
-                emotion={emotion}
-                volume={volume}
-                transformState={transformState}
-                size={reactorSize}
-                showCaption={false}
-              />
-            </Suspense>
-          </div>
-        </div>
-      </div>
 
       <div style={{ position: "fixed", left: 20, top: 20, zIndex: 10 }}>
         <Suspense fallback={<div />}>
