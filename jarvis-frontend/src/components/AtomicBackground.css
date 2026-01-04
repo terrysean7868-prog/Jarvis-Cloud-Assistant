@@ -8,7 +8,8 @@
   place-items: center;
 
   /* 3D scene setup */
-  perspective: 900px;
+  /* Stronger depth: smaller perspective value increases 3D parallax */
+  perspective: 650px;
   perspective-origin: 50% 50%;
 
   /* dark base + subtle color wash */
@@ -20,7 +21,7 @@
     );
 
   /* Size + stroke knobs (no color/theme changes) */
-  --atomic-nucleus-size: clamp(34px, 6vmin, 84px);
+  --atomic-nucleus-size: clamp(38px, 7vmin, 96px);
   --atomic-ring-stroke: 3px;
   --atomic-ring-band: 6px;
 }
@@ -42,10 +43,10 @@
 
 @keyframes atomic-center-spin {
   0% {
-    transform: rotateX(18deg) rotateY(-14deg) rotateZ(0deg);
+    transform: translateZ(18px) rotateX(20deg) rotateY(-18deg) rotateZ(0deg);
   }
   100% {
-    transform: rotateX(18deg) rotateY(-14deg) rotateZ(360deg);
+    transform: translateZ(18px) rotateX(20deg) rotateY(-18deg) rotateZ(360deg);
   }
 }
 
@@ -97,6 +98,25 @@
   backface-visibility: hidden;
 }
 
+.atomic-ring-gyro-x,
+.atomic-ring-gyro-y {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+
+.atomic-ring-gyro-x {
+  animation: atomic-gyro-x var(--gyro-x-dur, 28s) linear infinite;
+  animation-delay: var(--gyro-delay, 0s);
+}
+
+.atomic-ring-gyro-y {
+  animation: atomic-gyro-y var(--gyro-y-dur, 22s) linear infinite;
+  animation-delay: var(--gyro-delay, 0s);
+}
+
 .atomic-ring-rotator {
   position: absolute;
   inset: 0;
@@ -117,8 +137,22 @@
 }
 
 @keyframes atomic-ring-spin {
-  from { transform: rotateZ(0deg); }
-  to { transform: rotateZ(360deg); }
+  from {
+    transform: rotateZ(0deg);
+  }
+  to {
+    transform: rotateZ(360deg);
+  }
+}
+
+@keyframes atomic-gyro-x {
+  from { transform: rotateX(0deg); }
+  to { transform: rotateX(360deg); }
+}
+
+@keyframes atomic-gyro-y {
+  from { transform: rotateY(0deg); }
+  to { transform: rotateY(360deg); }
 }
 
 .atomic-ring-outline {

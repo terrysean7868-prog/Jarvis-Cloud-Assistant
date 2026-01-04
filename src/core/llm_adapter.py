@@ -119,6 +119,208 @@ class LLMAdapter:
         return min(max(base, 800), self.max_max_tokens), 0.5
 
     @staticmethod
+    def _normalize_phrase(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"[\"'`]+", "", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    @staticmethod
+    def _maybe_map_local_app_name(phrase: str) -> str:
+        """Return a canonical local app name if phrase clearly refers to a local app.
+
+        Conservative mapping: only well-known apps + common speech-to-text variants.
+        """
+        p = LLMAdapter._normalize_phrase(phrase)
+        if not p:
+            return ""
+
+        # Drop leading filler.
+        p = re.sub(r"^(the|a|an)\s+", "", p).strip()
+        # Remove trailing politeness/filler.
+        p = re.sub(r"\b(please|pls|now|quickly)\b", "", p).strip()
+        p = re.sub(r"\s+", " ", p).strip()
+
+        # Common synonyms/aliases (include STT variants like "note pad").
+        alias_map = {
+            "notepad": "notepad",
+            "note pad": "notepad",
+            "wordpad": "wordpad",
+            "word pad": "wordpad",
+            "textedit": "textedit",
+            "text edit": "textedit",
+            "calculator": "calculator",
+            "calc": "calculator",
+            "paint": "paint",
+            "ms paint": "paint",
+            "mspaint": "paint",
+            "cmd": "cmd",
+            "command prompt": "cmd",
+            "powershell": "powershell",
+            "power shell": "powershell",
+            "windows powershell": "powershell",
+            "file explorer": "explorer",
+            "files": "explorer",
+            "explorer": "explorer",
+            "task manager": "taskmgr",
+            "taskmanager": "taskmgr",
+            "taskmgr": "taskmgr",
+            "vs code": "vscode",
+            "vscode": "vscode",
+            "visual studio code": "vscode",
+            "chrome": "chrome",
+            "google chrome": "chrome",
+            "firefox": "firefox",
+            "edge": "edge",
+            "microsoft edge": "edge",
+            "word": "word",
+            "microsoft word": "word",
+            "excel": "excel",
+            "microsoft excel": "excel",
+            "powerpoint": "powerpoint",
+            "microsoft powerpoint": "powerpoint",
+            "outlook": "outlook",
+            "microsoft outlook": "outlook",
+        }
+
+        if p in alias_map:
+            return alias_map[p]
+
+        # Handle patterns like "notepad and type ...".
+        for k, v in alias_map.items():
+            if p.startswith(k + " "):
+                return v
+
+        # If it matches a known local app key from AppManager, treat it as local.
+        try:
+            from src.utils.app_manager import app_manager as _app_mgr
+
+            app_paths = getattr(_app_mgr, "app_paths", {}) or {}
+            if p in app_paths:
+                return p
+            for k in app_paths.keys():
+                k2 = str(k or "").strip().lower()
+                if k2 and (p == k2 or p.startswith(k2 + " ")):
+                    return k2
+        except Exception:
+            pass
+
+        return ""
+
+    @staticmethod
+    def _preparse_deterministic_voice_actions(user_text: str) -> dict | None:
+        """Deterministic intent parser for voice mode.
+
+        Goal: when the user says a simple PC command, do the *obvious* thing without
+        relying on the LLM (which may be unavailable/rate-limited in production).
+
+        Keep this conservative to avoid breaking complex requests.
+        """
+        t = (user_text or "").strip()
+        if not t:
+            return None
+
+        tl = t.lower().strip()
+
+        # Avoid hijacking internet/research tasks.
+        if re.search(r"\b(latest|today|current|news|download|install|update|documentation|docs|how\s+to)\b", tl):
+            return None
+        if re.search(r"\b(look\s+up|search\s+online|from\s+the\s+internet|on\s+the\s+internet|with\s+sources?|citations?|links?)\b", tl):
+            return None
+
+        # If the user explicitly provided a URL/domain, let normal URL tooling handle it.
+        if re.search(r"\bhttps?://|\bwww\.|\b[a-z0-9\-]+\.(com|org|net|io|dev)\b", tl):
+            # Unless they also clearly mention a local app (rare but possible).
+            if not LLMAdapter._maybe_map_local_app_name(tl):
+                return None
+
+        words = re.findall(r"[a-z0-9']+", tl)
+        # Allow more words because voice often includes filler.
+        if len(words) > 24:
+            return None
+
+        parsed: dict = {"text": "", "actions": []}
+
+        # Accept natural phrasing, not just "<verb> <target>".
+        # Examples:
+        # - jarvis please open notepad
+        # - can you open notepad and type hello
+        # - i want to open calculator
+        # - please close the notepad
+        # - switch to chrome
+        open_verb = re.search(r"\b(open|start|launch)\b", tl)
+        close_verb = re.search(r"\b(close|quit|exit)\b", tl)
+        switch_verb = re.search(r"\b(switch\s+to|switch|focus|go\s+to)\b", tl)
+
+        if close_verb:
+            target = LLMAdapter._maybe_map_local_app_name(tl)
+            if not target:
+                # Heuristic: take words after the close verb.
+                m = re.search(r"\b(?:close|quit|exit)\b\s+(.*)$", tl)
+                target = (m.group(1).strip() if m else "")
+                target = LLMAdapter._maybe_map_local_app_name(target) or target
+            if target:
+                parsed["actions"] = [{"type": "close_app", "app_name": target}]
+                parsed["text"] = f"Closing {target}."
+                parsed["source"] = "deterministic-voice"
+                return parsed
+            return None
+
+        if switch_verb:
+            target = LLMAdapter._maybe_map_local_app_name(tl)
+            if not target:
+                m = re.search(r"\b(?:switch\s+to|switch|focus|go\s+to)\b\s+(.*)$", tl)
+                target = (m.group(1).strip() if m else "")
+                target = LLMAdapter._maybe_map_local_app_name(target) or target
+            if target:
+                parsed["actions"] = [{"type": "switch_app", "app_name": target}]
+                parsed["text"] = f"Switching to {target}."
+                parsed["source"] = "deterministic-voice"
+                return parsed
+            return None
+
+        if open_verb:
+            # If the user says "open X and type Y", keep the whole string so existing
+            # postprocessors can add type_text. We don't require a strict format; we
+            # just attempt the deterministic postprocessing pipeline.
+            parsed = {"text": "", "actions": []}
+            try:
+                parsed = LLMAdapter._postprocess_open_url_actions(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_pc_settings_actions(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_write_actions(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_system_safety(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+
+            actions = parsed.get("actions") or []
+            if isinstance(actions, list) and actions:
+                # Provide a short deterministic user-facing line.
+                first = actions[0] if isinstance(actions[0], dict) else {}
+                at = (first.get("type") or "").strip()
+                if at == "open_app":
+                    name = str(first.get("app_name") or "").strip() or "the app"
+                    parsed["text"] = f"Opening {name}."
+                elif at == "open_url":
+                    parsed["text"] = "Opening it."
+                elif at == "web_search":
+                    parsed["text"] = "Looking it up online."
+                else:
+                    parsed["text"] = "Done."
+                parsed["source"] = "deterministic-voice"
+                return parsed
+
+        return None
+
+    @staticmethod
     def _is_high_level_analysis_task(user_text: str) -> bool:
         """Return True if the user is asking for high-level informational synthesis.
 
@@ -414,6 +616,39 @@ class LLMAdapter:
         if not t:
             return False
 
+        # High-level analysis doesn't always need web (many prompts are conceptual).
+        # Only trigger web for analysis when the user explicitly requests research/sources
+        # or when the topic is time-sensitive.
+        try:
+            if LLMAdapter._is_high_level_analysis_task(user_text):
+                analysis_web_triggers = (
+                    "research",
+                    "do research",
+                    "make research",
+                    "with sources",
+                    "with citations",
+                    "with links",
+                    "sources",
+                    "citations",
+                    "as of",
+                    "today",
+                    "current",
+                    "latest",
+                    "market",
+                    "price",
+                    "outlook",
+                    "forecast",
+                    "2025",
+                    "2026",
+                    "documentation",
+                    "docs",
+                    "official",
+                )
+                if any(s in t for s in analysis_web_triggers):
+                    return True
+        except Exception:
+            pass
+
         # Strong signals that web lookup is useful/required.
         strong = (
             "latest",
@@ -463,7 +698,6 @@ class LLMAdapter:
             "stack trace",
             "fix this error",
             "why is",
-            "compare",
 
             # Knowledge domains where the user explicitly wants internet-backed answers
             # (e.g., psychology, history, crises) or specific reference sites.
@@ -631,6 +865,30 @@ class LLMAdapter:
 
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None):
         """Generate a rich, humanlike structured response."""
+        # Deterministic voice mode: handle simple commands without relying on LLM.
+        try:
+            if (mode or "").lower() == "voice":
+                pre = self._preparse_deterministic_voice_actions(text)
+                if isinstance(pre, dict) and isinstance(pre.get("actions"), list) and pre["actions"]:
+                    return pre
+        except Exception:
+            pass
+
+        # Voice + web-worthy requests: do web_search first (better UX, fewer hallucinations).
+        # We only do this when we did NOT match a deterministic PC command above.
+        try:
+            if (mode or "").lower() == "voice":
+                if self._should_use_web_lookup(text):
+                    parsed = {"text": "Looking it up online.", "actions": []}
+                    try:
+                        parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
+                    except Exception:
+                        pass
+                    if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list) and parsed["actions"]:
+                        parsed["source"] = "voice-pre-web"
+                        return parsed
+        except Exception:
+            pass
         # Optional offline mode: reduce dependency on OpenAI for high-level analysis.
         # If enabled, we skip the LLM call and trigger web_search directly (2-pass pipeline
         # will still run, and backend will synthesize if continuation fails).
@@ -880,6 +1138,45 @@ Return ONLY valid JSON matching:
             except Exception:
                 pass
 
+            # Local deterministic fallback: if the model is unavailable, still try to
+            # execute obvious low-risk intents (open_app/open_url/settings).
+            try:
+                parsed = {"text": "", "actions": []}
+                try:
+                    parsed = self._postprocess_open_url_actions(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+                try:
+                    parsed = self._postprocess_pc_settings_actions(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+                try:
+                    parsed = self._postprocess_write_actions(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+                try:
+                    parsed = self._postprocess_system_safety(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+
+                actions = parsed.get("actions") or []
+                if isinstance(actions, list) and actions:
+                    first = actions[0] if isinstance(actions[0], dict) else {}
+                    at = (first.get("type") or "").strip()
+                    if at == "open_app":
+                        name = str(first.get("app_name") or "").strip() or "the app"
+                        parsed["text"] = f"Opening {name}."
+                    elif at == "open_url":
+                        parsed["text"] = "Opening it."
+                    elif at == "web_search":
+                        parsed["text"] = "Looking it up online."
+                    else:
+                        parsed["text"] = "Done."
+                    parsed["source"] = "fallback-local"
+                    return parsed
+            except Exception:
+                pass
+
             # Fallback humanlike reply
             fallback_replies = [
                 "I'm thinking it through, one moment please.",
@@ -902,84 +1199,7 @@ Return ONLY valid JSON matching:
         if not isinstance(actions, list):
             actions = []
 
-        def _normalize_phrase(s: str) -> str:
-            s = (s or "").strip().lower()
-            s = re.sub(r"[\"'`]+", "", s)
-            s = re.sub(r"\s+", " ", s).strip()
-            return s
-
-        def _maybe_map_local_app_name(phrase: str) -> str:
-            """Return a canonical local app name if phrase clearly refers to a local app.
-
-            This method is intentionally conservative: it only maps well-known apps and
-            common synonyms so we don't break genuine website intents like "open spotify".
-            """
-            p = _normalize_phrase(phrase)
-            if not p:
-                return ""
-
-            # Drop leading articles and simple fillers.
-            p = re.sub(r"^(the|a|an)\s+", "", p).strip()
-
-            # Common synonyms/aliases.
-            alias_map = {
-                "notepad": "notepad",
-                "wordpad": "wordpad",
-                "textedit": "textedit",
-                "calculator": "calculator",
-                "calc": "calculator",
-                "paint": "paint",
-                "mspaint": "paint",
-                "cmd": "cmd",
-                "command prompt": "cmd",
-                "powershell": "powershell",
-                "windows powershell": "powershell",
-                "file explorer": "explorer",
-                "explorer": "explorer",
-                "task manager": "taskmgr",
-                "taskmgr": "taskmgr",
-                "vs code": "vscode",
-                "vscode": "vscode",
-                "visual studio code": "vscode",
-                "chrome": "chrome",
-                "firefox": "firefox",
-                "edge": "edge",
-                "microsoft edge": "edge",
-                "word": "word",
-                "microsoft word": "word",
-                "excel": "excel",
-                "microsoft excel": "excel",
-                "powerpoint": "powerpoint",
-                "microsoft powerpoint": "powerpoint",
-                "outlook": "outlook",
-                "microsoft outlook": "outlook",
-            }
-
-            if p in alias_map:
-                return alias_map[p]
-
-            # Handle common patterns like "notepad and type ..." or "notepad then ...".
-            for k, v in alias_map.items():
-                if p.startswith(k + " "):
-                    return v
-
-            # If it matches a known local app key from AppManager, treat it as local.
-            try:
-                from src.utils.app_manager import app_manager as _app_mgr
-
-                app_paths = getattr(_app_mgr, "app_paths", {}) or {}
-                if p in app_paths or p in app_paths.keys():
-                    return p
-
-                # Also accept prefixes like "calculator please".
-                for k in app_paths.keys():
-                    k2 = str(k or "").strip().lower()
-                    if k2 and p.startswith(k2 + " "):
-                        return k2
-            except Exception:
-                pass
-
-            return ""
+        _maybe_map_local_app_name = LLMAdapter._maybe_map_local_app_name
 
         site_map = {
             "youtube": "https://www.youtube.com",

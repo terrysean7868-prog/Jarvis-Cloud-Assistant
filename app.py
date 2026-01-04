@@ -238,6 +238,86 @@ def _user_explicitly_requested_screen_capture(text: str) -> bool:
     return any(k in t for k in keywords)
 
 
+def _user_explicitly_requested_research_open(text: str) -> bool:
+    """Return True when the user explicitly asked for research + opening a source.
+
+    This is used to add an open_url action *after* web-backed answering.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # "research" is the primary explicit keyword the user asked for.
+    # Opening phrases cover "open this url in new tab" style requests.
+    research_markers = (
+        "research",
+        "do research",
+        "make research",
+        "research it",
+        "research this",
+        "find sources",
+        "with sources",
+        "with links",
+        "with citations",
+    )
+    open_markers = (
+        "open in new tab",
+        "open this url",
+        "open the url",
+        "open the link",
+        "open source",
+        "open the source",
+        "open it in browser",
+        "open in browser",
+    )
+    return any(m in t for m in research_markers) or any(m in t for m in open_markers)
+
+
+def _pick_best_source_url(action_results: list[dict]) -> str | None:
+    """Pick a best-effort 'source' URL from web tool results."""
+    try:
+        prefer = (
+            "wikipedia.org",
+            "docs.",
+            "developer.",
+            "github.com",
+            "nodejs.org",
+            "python.org",
+            "openai.com",
+            "microsoft.com",
+            "mozilla.org",
+        )
+        urls: list[str] = []
+        for r in action_results or []:
+            if not isinstance(r, dict):
+                continue
+            if (r.get("status") or "").lower() != "success":
+                continue
+            action = (r.get("action") or r.get("action_type") or "").lower()
+            if action == "fetch_url":
+                u = str(r.get("url") or "").strip()
+                if u:
+                    urls.append(u)
+                continue
+            if action in {"web_search", "search"}:
+                for item in (r.get("results") or [])[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                    u = str(item.get("url") or "").strip()
+                    if u:
+                        urls.append(u)
+
+        if not urls:
+            return None
+
+        for p in prefer:
+            for u in urls:
+                if p in u.lower():
+                    return u
+        return urls[0]
+    except Exception:
+        return None
+
+
 
 def _require_device_owner(username: str | None):
     if DEVICE_OWNER_USERNAME and (username or "").lower() != DEVICE_OWNER_USERNAME.lower():
@@ -2679,6 +2759,19 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                             # Continuation failed (often rate limits). Provide a deterministic fallback.
                             response["text"] = _fallback_answer_from_web_results(msg.text, tool_results, found=found)
                             continued_actions = []
+
+                    # If the user explicitly asked for research + opening the source, add an open_url
+                    # action AFTER we have web-backed text (2-pass pipeline). This enables "open in new tab".
+                    try:
+                        if found and _user_explicitly_requested_research_open(msg.text):
+                            best = _pick_best_source_url(tool_results)
+                            if best:
+                                if not isinstance(continued_actions, list):
+                                    continued_actions = []
+                                if not any(isinstance(a, dict) and a.get("type") == "open_url" for a in continued_actions):
+                                    continued_actions = list(continued_actions) + [{"type": "open_url", "url": best}]
+                    except Exception:
+                        pass
             except Exception as e:
                 response["text"] = (response.get("text") or "") + f"\n\n(Web lookup failed: {e})"
             actions = deferred_actions
