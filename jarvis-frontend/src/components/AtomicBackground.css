@@ -22,6 +22,8 @@
 
   /* Size + stroke knobs (no color/theme changes) */
   --atomic-nucleus-size: clamp(38px, 7vmin, 96px);
+  --atomic-nucleus-scale: 2.5;
+  --atomic-nucleus-glow-inset: -64px;
   --atomic-ring-stroke: 3px;
   --atomic-ring-band: 6px;
 }
@@ -54,9 +56,10 @@
   position: absolute;
   left: 50%;
   top: 50%;
-  width: var(--atomic-nucleus-size);
-  height: var(--atomic-nucleus-size);
-  transform: translate(-50%, -50%);
+  width: calc(var(--atomic-nucleus-size) * var(--atomic-nucleus-scale));
+  height: calc(var(--atomic-nucleus-size) * var(--atomic-nucleus-scale));
+  /* Keep nucleus perfectly round even though the parent scene is tilted in 3D. */
+  transform: translate(-50%, -50%) rotateY(18deg) rotateX(-20deg);
   border-radius: 999px;
 
   background: radial-gradient(
@@ -76,7 +79,7 @@
 .atomic-nucleus::after {
   content: "";
   position: absolute;
-  inset: -64px;
+  inset: calc(var(--atomic-nucleus-glow-inset) * var(--atomic-nucleus-scale));
   border-radius: 999px;
   background: radial-gradient(
     circle,

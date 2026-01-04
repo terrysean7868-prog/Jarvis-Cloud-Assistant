@@ -167,16 +167,44 @@ export default function App() {
     pcAgentLoginPromptedSessionRef.current = sessionId;
 
     let cancelled = false;
+    const sid = sessionId;
     const h = scheduleIdle(() => {
       if (cancelled) return;
+      // Single popup: include agent token/secret in the SAME prompt so the
+      // user can copy them immediately (no second modal).
       setPermissionPrompt({
         title: "PC agent",
         message: "Is PC agent started?",
-        details: "If Yes, Jarvis will establish connection. If No, start PC agent using run_pc_agent.bat then login again.",
+        details: "If Yes, Jarvis will establish connection. If No, start PC agent using run_pc_agent.bat (use the values below).",
         kind: "pc_agent_login",
         allowLabel: "Yes",
         denyLabel: "No",
+        copyFields: [],
       });
+
+      (async () => {
+        try {
+          if (!sid) return;
+          const cfg = await getAgentConfig(sid);
+          const token = (cfg?.agent_token || "").toString();
+          const shared = (cfg?.agent_shared_secret || "").toString();
+          if (!token && !shared) return;
+
+          // Only update if the same prompt is still open.
+          setPermissionPrompt((prev) => {
+            if (!prev || prev.kind !== "pc_agent_login") return prev;
+            return {
+              ...prev,
+              copyFields: [
+                token ? { label: "Agent token", value: token } : null,
+                shared ? { label: "Shared secret", value: shared } : null,
+              ].filter(Boolean),
+            };
+          });
+        } catch {
+          // ignore: popup still works without credentials
+        }
+      })();
     }, 350);
 
     return () => {
@@ -1096,78 +1124,26 @@ export default function App() {
             allowLabel={permissionPrompt.allowLabel || "Allow"}
             denyLabel={permissionPrompt.denyLabel || "Deny"}
             onDeny={() => {
-              const req = permissionPrompt;
               setPermissionPrompt(null);
-              if (req?.kind === "pc_agent_login" && sessionId) {
-                (async () => {
-                  try {
-                    addLog("system", "Generating agent token…");
-                    const cfg = await getAgentConfig(sessionId);
-                    const token = (cfg?.agent_token || "").toString();
-                    const shared = (cfg?.agent_shared_secret || "").toString();
-
-                    if (!token && !shared) {
-                      addLog("system", "Could not generate agent token.");
-                      return;
-                    }
-
-                    setPermissionPrompt({
-                      kind: "info",
-                      title: "PC agent setup",
-                      message: "Copy these values into run_pc_agent.bat when prompted.",
-                      details: "Agent token is recommended. Shared secret is optional (local/dev).",
-                      allowLabel: "Close",
-                      denyLabel: "Close",
-                      copyFields: [
-                        token ? { label: "Agent token", value: token } : null,
-                        shared ? { label: "Shared secret", value: shared } : null,
-                      ].filter(Boolean),
-                    });
-                    addLog("system", "Agent credentials ready in popup.");
-                  } catch (e) {
-                    addLog("system", `Could not generate agent token: ${e?.message || e}`);
-                  }
-                })();
-              }
             }}
             onAllow={async () => {
               const req = permissionPrompt;
-              setPermissionPrompt(null);
               try {
-                if (req.kind === "info") return;
-
                 if (req.kind === "pc_agent_login") {
                   if (!sessionId) return;
                   addLog("system", "Checking PC agent…");
 
                   const online = await isPcAgentOnline(sessionId);
                   if (!online) {
-                    addLog("system", "PC agent is offline. Generating agent token…");
-                    try {
-                      const cfg = await getAgentConfig(sessionId);
-                      const token = (cfg?.agent_token || "").toString();
-                      const shared = (cfg?.agent_shared_secret || "").toString();
-                      if (!token && !shared) {
-                        addLog("system", "Could not generate agent token. Start run_pc_agent.bat using .env.agent.");
-                        return;
-                      }
-
-                      setPermissionPrompt({
-                        kind: "info",
-                        title: "PC agent setup",
-                        message: "Copy these values into run_pc_agent.bat when prompted, then click Yes.",
-                        details: "Agent token is recommended. Shared secret is optional (local/dev).",
-                        allowLabel: "Close",
-                        denyLabel: "Close",
-                        copyFields: [
-                          token ? { label: "Agent token", value: token } : null,
-                          shared ? { label: "Shared secret", value: shared } : null,
-                        ].filter(Boolean),
-                      });
-                      addLog("system", "Agent credentials ready in popup.");
-                    } catch {
-                      addLog("system", "Could not generate agent token. Start run_pc_agent.bat using .env.agent.");
-                    }
+                    addLog("system", "PC agent is offline. Start it with the values shown in the popup, then click Yes.");
+                    setPermissionPrompt((prev) => {
+                      if (!prev || prev.kind !== "pc_agent_login") return prev;
+                      return {
+                        ...prev,
+                        message: "PC agent is offline.",
+                        details: "Start PC agent using run_pc_agent.bat (use the values below), then click Yes.",
+                      };
+                    });
                     return;
                   }
 
@@ -1175,12 +1151,23 @@ export default function App() {
                   try {
                     await configureMyPc(sessionId);
                     addLog("system", "PC agent connected.");
+                    setPermissionPrompt(null);
                   } catch {
                     addLog("system", "Could not establish connection. Try again.");
+                    setPermissionPrompt((prev) => {
+                      if (!prev || prev.kind !== "pc_agent_login") return prev;
+                      return {
+                        ...prev,
+                        message: "Could not establish connection.",
+                        details: "Make sure pc_agent.py is running and connected, then click Yes again.",
+                      };
+                    });
                   }
                   return;
                 }
 
+                // For all other permission prompts, close the modal immediately before proceeding.
+                setPermissionPrompt(null);
                 const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
                 if (grantRes?.offline) {
                   addLog("system", "Permission saved. Start run_pc_agent.bat and login again (then click Yes).");

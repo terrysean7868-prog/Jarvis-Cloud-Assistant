@@ -5,6 +5,8 @@ Allows Jarvis to open, close, switch, and manage applications on the PC
 """
 import os
 import platform
+import re
+import shlex
 import subprocess
 import time
 from typing import Dict, List, Optional, Tuple
@@ -270,29 +272,159 @@ class AppManager:
     def execute_command(self, command: str, wait: bool = True) -> Dict:
         """Execute a system command"""
         try:
+            cl = (command or "").strip()
+            if not cl:
+                return {"status": "error", "message": "Empty command"}
+
+            timeout = 30 if wait else None
+
             if platform.system() == "Windows":
+                # Open Settings/URLs via explorer.exe (more reliable than `start`).
+                if "ms-settings:" in cl.lower():
+                    m = re.search(r"(?i)\b(ms-settings:[^\s\"']+)", cl)
+                    target = m.group(1) if m else "ms-settings:"
+                    if wait:
+                        result = subprocess.run(
+                            ["explorer.exe", target],
+                            shell=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout,
+                        )
+                        return {
+                            "status": "success",
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                            "returncode": result.returncode,
+                        }
+                    subprocess.Popen(["explorer.exe", target], shell=False)
+                    return {"status": "success", "stdout": "", "stderr": "", "returncode": 0}
+
+                url_match = re.search(r"(?i)\bhttps?://[^\s\"']+", cl)
+                if url_match:
+                    target = url_match.group(0)
+                    if wait:
+                        result = subprocess.run(
+                            ["explorer.exe", target],
+                            shell=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout,
+                        )
+                        return {
+                            "status": "success",
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                            "returncode": result.returncode,
+                        }
+                    subprocess.Popen(["explorer.exe", target], shell=False)
+                    return {"status": "success", "stdout": "", "stderr": "", "returncode": 0}
+
+                # Decide whether this needs cmd.exe (shell built-ins / metacharacters).
+                shell_builtins = {
+                    "assoc",
+                    "break",
+                    "call",
+                    "cd",
+                    "chdir",
+                    "cls",
+                    "color",
+                    "copy",
+                    "date",
+                    "del",
+                    "dir",
+                    "echo",
+                    "endlocal",
+                    "erase",
+                    "exit",
+                    "for",
+                    "ftype",
+                    "goto",
+                    "if",
+                    "md",
+                    "mkdir",
+                    "mklink",
+                    "move",
+                    "path",
+                    "pause",
+                    "popd",
+                    "pushd",
+                    "rd",
+                    "rem",
+                    "ren",
+                    "rename",
+                    "rmdir",
+                    "set",
+                    "setlocal",
+                    "shift",
+                    "start",
+                    "time",
+                    "title",
+                    "type",
+                    "ver",
+                    "verify",
+                    "vol",
+                }
+
+                has_shell_metachars = bool(re.search(r"\|\||&&|[|<>]", cl))
+                parsed = shlex.split(cl, posix=False)
+                first = (parsed[0].lower() if parsed else "")
+                needs_cmd = has_shell_metachars or first in shell_builtins
+
+                if needs_cmd:
+                    args = ["cmd.exe", "/c", cl]
+                    if wait:
+                        result = subprocess.run(
+                            args,
+                            shell=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout,
+                        )
+                        return {
+                            "status": "success",
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                            "returncode": result.returncode,
+                        }
+                    subprocess.Popen(args, shell=False)
+                    return {"status": "success", "stdout": "", "stderr": "", "returncode": 0}
+
+                # Normal executables: run without shell for reliability.
+                if wait:
+                    result = subprocess.run(
+                        parsed,
+                        shell=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                    return {
+                        "status": "success",
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "returncode": result.returncode,
+                    }
+                subprocess.Popen(parsed, shell=False)
+                return {"status": "success", "stdout": "", "stderr": "", "returncode": 0}
+
+            # Non-Windows: keep existing shell execution, but honor wait=False.
+            if wait:
                 result = subprocess.run(
-                    command,
+                    cl,
                     shell=True,
                     capture_output=True,
                     text=True,
-                    timeout=30 if wait else None
+                    timeout=timeout,
                 )
-            else:
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=30 if wait else None
-                )
-            
-            return {
-                "status": "success",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode
-            }
+                return {
+                    "status": "success",
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "returncode": result.returncode,
+                }
+            subprocess.Popen(cl, shell=True)
+            return {"status": "success", "stdout": "", "stderr": "", "returncode": 0}
         except subprocess.TimeoutExpired:
             return {
                 "status": "error",

@@ -1,8 +1,8 @@
 {
   "allow_app_control": true,
-  "allow_execute_command": false,
+  "allow_execute_command": true,
   "allow_file_ops": false,
   "allow_screen": true,
   "allow_self_update": false,
-  "updated_at": "2026-01-04T09:31:00.463934+00:00"
+  "updated_at": "2026-01-04T11:00:47.523494+00:00"
 }
