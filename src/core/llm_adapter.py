@@ -902,6 +902,85 @@ Return ONLY valid JSON matching:
         if not isinstance(actions, list):
             actions = []
 
+        def _normalize_phrase(s: str) -> str:
+            s = (s or "").strip().lower()
+            s = re.sub(r"[\"'`]+", "", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
+        def _maybe_map_local_app_name(phrase: str) -> str:
+            """Return a canonical local app name if phrase clearly refers to a local app.
+
+            This method is intentionally conservative: it only maps well-known apps and
+            common synonyms so we don't break genuine website intents like "open spotify".
+            """
+            p = _normalize_phrase(phrase)
+            if not p:
+                return ""
+
+            # Drop leading articles and simple fillers.
+            p = re.sub(r"^(the|a|an)\s+", "", p).strip()
+
+            # Common synonyms/aliases.
+            alias_map = {
+                "notepad": "notepad",
+                "wordpad": "wordpad",
+                "textedit": "textedit",
+                "calculator": "calculator",
+                "calc": "calculator",
+                "paint": "paint",
+                "mspaint": "paint",
+                "cmd": "cmd",
+                "command prompt": "cmd",
+                "powershell": "powershell",
+                "windows powershell": "powershell",
+                "file explorer": "explorer",
+                "explorer": "explorer",
+                "task manager": "taskmgr",
+                "taskmgr": "taskmgr",
+                "vs code": "vscode",
+                "vscode": "vscode",
+                "visual studio code": "vscode",
+                "chrome": "chrome",
+                "firefox": "firefox",
+                "edge": "edge",
+                "microsoft edge": "edge",
+                "word": "word",
+                "microsoft word": "word",
+                "excel": "excel",
+                "microsoft excel": "excel",
+                "powerpoint": "powerpoint",
+                "microsoft powerpoint": "powerpoint",
+                "outlook": "outlook",
+                "microsoft outlook": "outlook",
+            }
+
+            if p in alias_map:
+                return alias_map[p]
+
+            # Handle common patterns like "notepad and type ..." or "notepad then ...".
+            for k, v in alias_map.items():
+                if p.startswith(k + " "):
+                    return v
+
+            # If it matches a known local app key from AppManager, treat it as local.
+            try:
+                from src.utils.app_manager import app_manager as _app_mgr
+
+                app_paths = getattr(_app_mgr, "app_paths", {}) or {}
+                if p in app_paths or p in app_paths.keys():
+                    return p
+
+                # Also accept prefixes like "calculator please".
+                for k in app_paths.keys():
+                    k2 = str(k or "").strip().lower()
+                    if k2 and p.startswith(k2 + " "):
+                        return k2
+            except Exception:
+                pass
+
+            return ""
+
         site_map = {
             "youtube": "https://www.youtube.com",
             "linkedin": "https://www.linkedin.com",
@@ -1019,6 +1098,12 @@ Return ONLY valid JSON matching:
             url = str(a.get("url") or "").strip()
             url_name = str(a.get("url_name") or "").strip().lower()
 
+            # If the model used open_url for a local app intent (e.g., "notepad"), convert to open_app.
+            local_app = _maybe_map_local_app_name(url_name)
+            if (not url) and local_app:
+                normalized.append({"type": "open_app", "app_name": local_app, "args": []})
+                continue
+
             if not url and url_name:
                 mapped = site_map.get(url_name)
                 if not mapped and url_name:
@@ -1083,6 +1168,18 @@ Return ONLY valid JSON matching:
         m = re.search(r"\b(?:open|visit|go\s+to|browse|navigate\s+to)\b\s+(.+)$", t)
         target = (m.group(1).strip() if m else "")
         target = re.sub(r"[\.!?]+$", "", target).strip()
+
+        # If the target is clearly a local app name (e.g., "notepad"), emit open_app.
+        local_app = _maybe_map_local_app_name(target)
+        if local_app:
+            parsed["actions"] = [{"type": "open_app", "app_name": local_app, "args": []}]
+            # open_url postprocessing runs after write postprocessing; re-run write postprocessing
+            # so "open notepad and type ..." reliably emits type_text.
+            try:
+                parsed = LLMAdapter._postprocess_write_actions(user_text=user_text, parsed=parsed)
+            except Exception:
+                pass
+            return parsed
 
         if not target:
             parsed["actions"] = actions
@@ -1307,12 +1404,28 @@ Return ONLY valid JSON matching:
 
         # Generic fallback: keep it short and clearly marked.
         # Extract a rough topic after 'write'/'type' if possible.
+        # If the user explicitly provided text to type (often quoted), prefer typing exactly that.
+        try:
+            quoted = re.findall(r"[\"\u201c\u201d]([^\"\u201c\u201d]{1,500})[\"\u201c\u201d]", t)
+            if not quoted:
+                quoted = re.findall(r"'([^']{1,500})'", t)
+            if quoted:
+                return str(quoted[-1]).strip() + "\n"
+        except Exception:
+            pass
+
         m = re.search(r"\b(?:write|type|draft|compose|create|make)\b\s*(.*)", t, re.IGNORECASE)
         topic = (m.group(1).strip() if m else "")
         if not topic:
             topic = t
 
-        return (
-            "Draft:\n"
-            f"{topic}\n"
-        )
+        # For explicit 'type X' commands, type the text as-is (no 'Draft:' label).
+        try:
+            is_type = bool(re.search(r"\btype\b", tl))
+            is_drafty = bool(re.search(r"\b(draft|compose)\b", tl))
+            if is_type and not is_drafty and ("email" not in tl):
+                return f"{topic}\n"
+        except Exception:
+            pass
+
+        return f"Draft:\n{topic}\n"

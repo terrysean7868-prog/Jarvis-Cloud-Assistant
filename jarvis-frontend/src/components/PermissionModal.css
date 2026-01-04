@@ -87,6 +87,53 @@
   line-height: 1.45;
 }
 
+.perm-copy-fields {
+  margin-top: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.perm-copy-row {
+  background: rgba(0, 255, 200, 0.05);
+  border: 1px dashed rgba(0, 255, 200, 0.22);
+  border-radius: 14px;
+  padding: 12px;
+}
+
+.perm-copy-label {
+  color: #c9d1d9;
+  font-size: 13px;
+  margin-bottom: 8px;
+  opacity: 0.95;
+}
+
+.perm-copy-controls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.perm-copy-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 255, 200, 0.22);
+  background: rgba(0, 0, 0, 0.25);
+  color: #00d4ff;
+  font-size: 12px;
+  outline: none;
+}
+
+.perm-copy-input:focus {
+  border-color: rgba(0, 255, 200, 0.55);
+  box-shadow: 0 0 16px rgba(0, 255, 200, 0.12);
+}
+
+.perm-copy {
+  min-width: 96px;
+}
+
 .perm-actions {
   display: flex;
   gap: 12px;

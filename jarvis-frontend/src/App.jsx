@@ -157,28 +157,6 @@ export default function App() {
     }
   }, []);
 
-  const promptCopyAgentToken = useCallback(async (token) => {
-    const t = (token || "").toString();
-    if (!t) return false;
-    try {
-      // Prefer clipboard when available.
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(t);
-        return true;
-      }
-    } catch {
-      // fallthrough
-    }
-
-    // Manual fallback: show a browser prompt so the token isn't persisted in HUD logs.
-    try {
-      window.prompt("Agent token (copy/paste into run_pc_agent.bat)", t);
-      return true;
-    } catch {
-      return false;
-    }
-  }, []);
-
   // Required flow:
   // - On login, ask via popup if PC agent is started.
   // - If user says Yes: establish connection (bind) if agent is online.
@@ -1114,6 +1092,7 @@ export default function App() {
             title={permissionPrompt.title}
             message={permissionPrompt.message}
             details={permissionPrompt.details}
+            copyFields={permissionPrompt.copyFields}
             allowLabel={permissionPrompt.allowLabel || "Allow"}
             denyLabel={permissionPrompt.denyLabel || "Deny"}
             onDeny={() => {
@@ -1125,17 +1104,26 @@ export default function App() {
                     addLog("system", "Generating agent token…");
                     const cfg = await getAgentConfig(sessionId);
                     const token = (cfg?.agent_token || "").toString();
-                    if (token) {
-                      const ok = await promptCopyAgentToken(token);
-                      addLog(
-                        "system",
-                        ok
-                          ? "Agent token ready. Start run_pc_agent.bat and paste when prompted."
-                          : "Could not copy/show agent token. Open DevTools → Network, call /api/agent/config, and copy agent_token from the response."
-                      );
-                    } else {
+                    const shared = (cfg?.agent_shared_secret || "").toString();
+
+                    if (!token && !shared) {
                       addLog("system", "Could not generate agent token.");
+                      return;
                     }
+
+                    setPermissionPrompt({
+                      kind: "info",
+                      title: "PC agent setup",
+                      message: "Copy these values into run_pc_agent.bat when prompted.",
+                      details: "Agent token is recommended. Shared secret is optional (local/dev).",
+                      allowLabel: "Close",
+                      denyLabel: "Close",
+                      copyFields: [
+                        token ? { label: "Agent token", value: token } : null,
+                        shared ? { label: "Shared secret", value: shared } : null,
+                      ].filter(Boolean),
+                    });
+                    addLog("system", "Agent credentials ready in popup.");
                   } catch (e) {
                     addLog("system", `Could not generate agent token: ${e?.message || e}`);
                   }
@@ -1158,17 +1146,25 @@ export default function App() {
                     try {
                       const cfg = await getAgentConfig(sessionId);
                       const token = (cfg?.agent_token || "").toString();
-                      if (token) {
-                        const ok = await promptCopyAgentToken(token);
-                        addLog(
-                          "system",
-                          ok
-                            ? "Agent token ready. Start run_pc_agent.bat and paste when prompted, then click Yes after login."
-                            : "Could not copy/show agent token. Start run_pc_agent.bat using .env.agent."
-                        );
-                      } else {
+                      const shared = (cfg?.agent_shared_secret || "").toString();
+                      if (!token && !shared) {
                         addLog("system", "Could not generate agent token. Start run_pc_agent.bat using .env.agent.");
+                        return;
                       }
+
+                      setPermissionPrompt({
+                        kind: "info",
+                        title: "PC agent setup",
+                        message: "Copy these values into run_pc_agent.bat when prompted, then click Yes.",
+                        details: "Agent token is recommended. Shared secret is optional (local/dev).",
+                        allowLabel: "Close",
+                        denyLabel: "Close",
+                        copyFields: [
+                          token ? { label: "Agent token", value: token } : null,
+                          shared ? { label: "Shared secret", value: shared } : null,
+                        ].filter(Boolean),
+                      });
+                      addLog("system", "Agent credentials ready in popup.");
                     } catch {
                       addLog("system", "Could not generate agent token. Start run_pc_agent.bat using .env.agent.");
                     }

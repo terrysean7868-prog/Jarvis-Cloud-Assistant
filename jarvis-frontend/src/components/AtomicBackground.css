@@ -20,9 +20,9 @@
     );
 
   /* Size + stroke knobs (no color/theme changes) */
-  --atomic-nucleus-size: clamp(26px, 4.6vmin, 62px);
-  --atomic-ring-stroke: 2px;
-  --atomic-ring-band: 4px;
+  --atomic-nucleus-size: clamp(34px, 6vmin, 84px);
+  --atomic-ring-stroke: 3px;
+  --atomic-ring-band: 6px;
 }
 
 .atomic-center {
@@ -42,10 +42,10 @@
 
 @keyframes atomic-center-spin {
   0% {
-    transform: rotateZ(0deg);
+    transform: rotateX(18deg) rotateY(-14deg) rotateZ(0deg);
   }
   100% {
-    transform: rotateZ(360deg);
+    transform: rotateX(18deg) rotateY(-14deg) rotateZ(360deg);
   }
 }
 
@@ -66,8 +66,8 @@
   );
 
   box-shadow:
-    0 0 22px rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.25 + (var(--a-vol) * 0.15))),
-    0 0 70px rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.12 + (var(--a-wake) * 0.1)));
+    0 0 34px rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.32 + (var(--a-vol) * 0.18))),
+    0 0 110px rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.16 + (var(--a-wake) * 0.12)));
 
   filter: blur(0.2px);
 }
@@ -75,15 +75,15 @@
 .atomic-nucleus::after {
   content: "";
   position: absolute;
-  inset: -42px;
+  inset: -64px;
   border-radius: 999px;
   background: radial-gradient(
     circle,
     rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.16 + (var(--a-wake) * 0.08))) 0%,
     rgba(var(--a-r), var(--a-g), var(--a-b), 0) 65%
   );
-  filter: blur(10px);
-  opacity: calc(0.7 + (var(--a-vol) * 0.2));
+  filter: blur(14px);
+  opacity: calc(0.78 + (var(--a-vol) * 0.25));
 }
 
 .atomic-ring {
@@ -128,8 +128,8 @@
 
   border: var(--atomic-ring-stroke) solid rgba(var(--a-r), var(--a-g), var(--a-b), var(--ring-alpha));
   box-shadow:
-    0 0 10px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.65)),
-    inset 0 0 16px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.35));
+    0 0 16px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.75)),
+    inset 0 0 22px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.45));
 }
 
 .atomic-ring-nodes {
@@ -217,8 +217,8 @@
     rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.35)) 62%,
     rgba(var(--a-r), var(--a-g), var(--a-b), 0) 70%
   );
-  filter: blur(8px);
-  opacity: calc(0.45 + (var(--a-vol) * 0.2));
+  filter: blur(10px);
+  opacity: calc(0.55 + (var(--a-vol) * 0.25));
 }
 
 .atomic-electrons {

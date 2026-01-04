@@ -570,14 +570,38 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                         auth_msg["secret"] = SHARED_SECRET
 
                     await ws.send_str(json.dumps(auth_msg))
-                    ack = await ws.receive(timeout=15)
-                    if ack.type != aiohttp.WSMsgType.TEXT:
-                        raise RuntimeError("No ack from server")
-                    print(f"[AGENT] Connected: {ack.data}")
+                    try:
+                        ack = await ws.receive(timeout=15)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError("Timed out waiting for server ack")
+
+                    if ack.type == aiohttp.WSMsgType.TEXT:
+                        ack_text = (ack.data or "").strip()
+                        # Server may send a structured error payload.
+                        try:
+                            ack_obj = json.loads(ack_text) if ack_text else {}
+                        except Exception:
+                            ack_obj = {}
+
+                        if isinstance(ack_obj, dict) and ack_obj.get("type") == "error":
+                            reason = ack_obj.get("reason") or ack_obj.get("message") or "auth_failed"
+                            hint = ""
+                            if str(reason) in {"invalid_agent_token", "auth_failed"}:
+                                hint = " (Hint: paste the agent_token from /api/agent/config, not your login/session JWT.)"
+                            raise RuntimeError(f"Server rejected connection: {reason}{hint}")
+
+                        print(f"[AGENT] Connected: {ack_text}")
+
+                    elif ack.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                        close_code = getattr(ws, "close_code", None)
+                        raise RuntimeError(f"Connection closed before ack (close_code={close_code})")
+                    elif ack.type == aiohttp.WSMsgType.ERROR:
+                        raise RuntimeError(f"WebSocket error before ack: {ws.exception()}")
+                    else:
+                        raise RuntimeError(f"No ack from server (msg_type={ack.type})")
 
                     effective_device_id = DEVICE_ID
                     try:
-                        ack_obj = json.loads(ack.data)
                         if isinstance(ack_obj, dict) and ack_obj.get("device_id"):
                             effective_device_id = str(ack_obj.get("device_id")).strip().lower() or effective_device_id
                     except Exception:

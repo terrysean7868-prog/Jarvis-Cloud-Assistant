@@ -83,6 +83,7 @@ ENABLE_SCHEDULER = os.getenv("JARVIS_ENABLE_SCHEDULER", "true").lower() in ("1",
 # - Disable local/PC control and local filesystem endpoints (these are unsafe + meaningless in cloud)
 CLOUD_MODE = os.getenv("JARVIS_CLOUD_MODE", "false").lower() in ("1", "true", "yes", "y")
 AGENT_SHARED_SECRET = os.getenv("JARVIS_AGENT_SHARED_SECRET", "")
+EXPOSE_AGENT_SHARED_SECRET = os.getenv("JARVIS_EXPOSE_AGENT_SHARED_SECRET", "false").lower() in ("1", "true", "yes", "y")
 DEFAULT_DEVICE_ID = os.getenv("JARVIS_DEFAULT_DEVICE_ID", "primary")
 DEVICE_OWNER_USERNAME = os.getenv("JARVIS_DEVICE_OWNER_USERNAME", "")
 ADMIN_USERNAME = (os.getenv("JARVIS_ADMIN_USERNAME", "admin") or "admin").strip().lower()
@@ -734,6 +735,19 @@ async def _dispatch_actions_to_device(device_id: str, username: str, actions: li
 async def agent_ws(ws: WebSocket):
     await ws.accept()
     device_id: str | None = None
+
+    async def _auth_fail(reason: str):
+        # Send a small error payload so the PC agent can show a helpful message.
+        # Keep it generic enough to avoid leaking sensitive server configuration.
+        try:
+            await ws.send_json({"type": "error", "error": "auth_failed", "reason": reason})
+        except Exception:
+            pass
+        try:
+            await ws.close(code=1008)
+        except Exception:
+            pass
+
     try:
         # Expect initial auth message
         raw = await ws.receive_text()
@@ -742,11 +756,11 @@ async def agent_ws(ws: WebSocket):
             import json
             msg = json.loads(raw)
         except Exception:
-            await ws.close(code=1008)
+            await _auth_fail("invalid_json")
             return
 
         if msg.get("type") != "auth":
-            await ws.close(code=1008)
+            await _auth_fail("expected_auth")
             return
 
         token = (msg.get("token") or "").strip()
@@ -758,28 +772,29 @@ async def agent_ws(ws: WebSocket):
         # Preferred auth: JWT agent token issued by /api/agent/config.
         if token:
             if not auth_tokens.secret:
-                await ws.close(code=1008)
+                await _auth_fail("server_missing_jwt_secret")
                 return
             ok, _sub, payload = auth_tokens.verify(token)
             if not ok or not payload or payload.get("typ") != "agent":
-                await ws.close(code=1008)
+                # Most common cause: user pasted a login/session JWT instead of the agent token.
+                await _auth_fail("invalid_agent_token")
                 return
             did = _normalize_device_id(payload.get("device_id") or payload.get("sub"))
             if not did:
-                await ws.close(code=1008)
+                await _auth_fail("missing_device_id")
                 return
             device_id = did
             try:
                 await device_hub.register_token(device_id=device_id, websocket=ws, capabilities=capabilities if isinstance(capabilities, dict) else {})
             except PermissionError:
-                await ws.close(code=1008)
+                await _auth_fail("device_not_authorized")
                 return
         else:
             # Legacy auth: shared secret.
             try:
                 await device_hub.register(device_id=device_id or "", secret=secret, websocket=ws, capabilities=capabilities if isinstance(capabilities, dict) else {})
             except PermissionError:
-                await ws.close(code=1008)
+                await _auth_fail("invalid_shared_secret")
                 return
 
         await ws.send_json({"type": "ack", "device_id": device_id, "status": "connected"})
@@ -903,7 +918,7 @@ async def agent_config(req: AgentConfigRequest):
 
     token = _issue_agent_token(device_id=did, owner_username=username)
     ws_url = ("wss://" + PUBLIC_SERVER_URL[len("https://"):] + "/ws/agent") if PUBLIC_SERVER_URL.startswith("https://") else ("ws://" + PUBLIC_SERVER_URL[len("http://"):] + "/ws/agent")
-    return {
+    payload = {
         "status": "success",
         "device_id": did,
         "server_url": PUBLIC_SERVER_URL,
@@ -911,6 +926,15 @@ async def agent_config(req: AgentConfigRequest):
         "agent_token": token,
         "expires_in_seconds": max(300, AGENT_TOKEN_TTL_SECONDS),
     }
+
+    # Only expose the shared secret for local/dev setups.
+    # In cloud mode, avoid leaking a global secret unless explicitly enabled.
+    if AGENT_SHARED_SECRET and (not CLOUD_MODE or EXPOSE_AGENT_SHARED_SECRET):
+        # If explicitly enabled in cloud mode, restrict to admins.
+        if (not CLOUD_MODE) or (role == "admin"):
+            payload["agent_shared_secret"] = AGENT_SHARED_SECRET
+
+    return payload
 
 
 # =========================================================
