@@ -9,7 +9,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from bs4 import BeautifulSoup
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse, parse_qs, unquote
 import json
 
 # Setup logging
@@ -87,42 +87,113 @@ class WebScraper:
             List of search results with title, url, and snippet
         """
         try:
-            # Using DuckDuckGo API as free alternative (no key needed)
-            search_url = f"https://html.duckduckgo.com/?q={quote(query)}"
+            # DuckDuckGo HTML results page (no key needed)
+            # NOTE: https://html.duckduckgo.com/?q=... often returns the homepage, not results.
+            # Encode fully; quote() defaults to safe='/' which can break queries containing slashes.
+            search_url = f"https://duckduckgo.com/html/?q={quote(query, safe='')}"
+            lite_url = f"https://lite.duckduckgo.com/lite/?q={quote(query, safe='')}"
             
             await self.initialize()
             html = await self.fetch_url(search_url, timeout=8)
-            
+            used_lite = False
+
+            if not html:
+                # /html sometimes responds with 202 (bot protection). Fall back to /lite.
+                html = await self.fetch_url(lite_url, timeout=8)
+                used_lite = bool(html)
+
             if not html:
                 logger.warning(f"Could not perform search: {query}")
                 return []
             
             soup = BeautifulSoup(html, 'html.parser')
-            results = []
-            
-            # Extract results from DuckDuckGo
-            for item in soup.find_all('div', class_='result'):
+            results: List[Dict[str, str]] = []
+
+            def _normalize_ddg_href(href: str) -> str:
+                if not href:
+                    return ""
+                href = href.strip()
+                if href.startswith("//"):
+                    href = "https:" + href
+                # DuckDuckGo often returns redirect URLs like /l/?uddg=<encoded>
                 try:
-                    title_elem = item.find('a', class_='result__a')
-                    snippet_elem = item.find('a', class_='result__snippet')
-                    
-                    if title_elem:
-                        title = title_elem.get_text(strip=True)
-                        url = title_elem.get('href', '')
-                        snippet = snippet_elem.get_text(strip=True) if snippet_elem else ''
-                        
-                        results.append({
-                            'title': title,
-                            'url': url,
-                            'snippet': snippet,
-                            'source': 'DuckDuckGo'
-                        })
-                        
+                    if href.startswith("/"):
+                        href_full = urljoin("https://duckduckgo.com", href)
+                    else:
+                        href_full = href
+
+                    u = urlparse(href_full)
+                    if "duckduckgo.com" in (u.netloc or "") and u.path.startswith("/l/"):
+                        uddg = parse_qs(u.query).get("uddg", [""])[0]
+                        if uddg:
+                            return unquote(uddg)
+                    return href_full
+                except Exception:
+                    return href
+
+            if used_lite:
+                # DuckDuckGo lite parsing
+                for a in soup.select("a.result-link"):
+                    try:
+                        title = a.get_text(" ", strip=True)
+                        href = a.get("href", "")
+                        url = _normalize_ddg_href(href)
+                        if not title or not url:
+                            continue
+
+                        snippet = ""
+                        tr = a.find_parent("tr")
+                        if tr:
+                            snippet_td = tr.find_next("td", class_="result-snippet")
+                            if snippet_td:
+                                snippet = snippet_td.get_text(" ", strip=True)
+
+                        results.append({"title": title, "url": url, "snippet": snippet, "source": "DuckDuckGo"})
                         if len(results) >= num_results:
                             break
-                except Exception as e:
-                    logger.debug(f"Error parsing search result: {e}")
-                    continue
+                    except Exception as e:
+                        logger.debug(f"Error parsing search result: {e}")
+                        continue
+            else:
+                # DuckDuckGo /html parsing
+                for a in soup.select("a.result__a"):
+                    try:
+                        title = a.get_text(strip=True)
+                        href = a.get("href", "")
+                        url = _normalize_ddg_href(href)
+                        if not title or not url:
+                            continue
+
+                        container = a.find_parent("div", class_=lambda c: isinstance(c, str) and "result" in c.split())
+                        if container:
+                            classes = container.get("class") or []
+                            if isinstance(classes, list) and any("result--ad" in str(x) for x in classes):
+                                continue
+
+                        snippet = ""
+                        if container:
+                            snippet_elem = (
+                                container.select_one("a.result__snippet")
+                                or container.select_one("div.result__snippet")
+                                or container.select_one("span.result__snippet")
+                                or container.select_one("div.result__content")
+                            )
+                            if snippet_elem:
+                                snippet = snippet_elem.get_text(" ", strip=True)
+
+                        results.append(
+                            {
+                                "title": title,
+                                "url": url,
+                                "snippet": snippet,
+                                "source": "DuckDuckGo",
+                            }
+                        )
+                        if len(results) >= num_results:
+                            break
+                    except Exception as e:
+                        logger.debug(f"Error parsing search result: {e}")
+                        continue
             
             if results:
                 logger.info(f"🔍 Found {len(results)} results for: {query}")

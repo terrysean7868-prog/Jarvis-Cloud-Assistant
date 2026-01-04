@@ -18,6 +18,11 @@
       rgba(var(--a-r), var(--a-g), var(--a-b), calc(0.035 + (var(--a-vol) * 0.03) + (var(--a-wake) * 0.03))) 0%,
       rgba(0, 0, 0, 0) 65%
     );
+
+  /* Size + stroke knobs (no color/theme changes) */
+  --atomic-nucleus-size: clamp(26px, 4.6vmin, 62px);
+  --atomic-ring-stroke: 2px;
+  --atomic-ring-band: 4px;
 }
 
 .atomic-center {
@@ -37,10 +42,10 @@
 
 @keyframes atomic-center-spin {
   0% {
-    transform: rotateX(34deg) rotateY(-28deg) rotateZ(0deg);
+    transform: rotateZ(0deg);
   }
   100% {
-    transform: rotateX(34deg) rotateY(-28deg) rotateZ(360deg);
+    transform: rotateZ(360deg);
   }
 }
 
@@ -48,8 +53,8 @@
   position: absolute;
   left: 50%;
   top: 50%;
-  width: clamp(18px, 3vmin, 40px);
-  height: clamp(18px, 3vmin, 40px);
+  width: var(--atomic-nucleus-size);
+  height: var(--atomic-nucleus-size);
   transform: translate(-50%, -50%);
   border-radius: 999px;
 
@@ -121,7 +126,7 @@
   inset: 0;
   border-radius: 999px;
 
-  border: 1px solid rgba(var(--a-r), var(--a-g), var(--a-b), var(--ring-alpha));
+  border: var(--atomic-ring-stroke) solid rgba(var(--a-r), var(--a-g), var(--a-b), var(--ring-alpha));
   box-shadow:
     0 0 10px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.65)),
     inset 0 0 16px rgba(var(--a-r), var(--a-g), var(--a-b), calc(var(--ring-alpha) * 0.35));
@@ -182,7 +187,7 @@
 .atomic-ring-outline::before {
   content: "";
   position: absolute;
-  inset: -1px;
+  inset: calc(-1 * var(--atomic-ring-stroke));
   border-radius: 999px;
 
   /* Dotted ring (conic segments) */
@@ -194,8 +199,8 @@
   );
 
   /* Keep only a thin ring band */
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
-  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - var(--atomic-ring-band)), #000 calc(100% - var(--atomic-ring-band)));
+  mask: radial-gradient(farthest-side, transparent calc(100% - var(--atomic-ring-band)), #000 calc(100% - var(--atomic-ring-band)));
 
   opacity: calc(0.7 + (var(--a-wake) * 0.25));
   filter: blur(0.2px);

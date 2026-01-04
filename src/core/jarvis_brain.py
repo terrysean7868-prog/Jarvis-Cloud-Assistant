@@ -375,12 +375,25 @@ class JarvisBrain:
                             url = (it.get("url") or "").strip()
                             snippet = (it.get("snippet") or "").strip()
                             summary = (it.get("summary") or "").strip()
-                            body = summary or snippet
+                            insight = (it.get("analysis_insight") or "").strip()
+                            tags = it.get("analysis_tags") or []
+                            if not isinstance(tags, list):
+                                tags = []
+
+                            # Prefer compact, precomputed insight (background analysis) for best UX.
+                            body = insight or summary or snippet
                             if not body:
                                 continue
                             header = title if title else (it.get("topic") or "").strip()
                             if url:
-                                chunks.append(f"- {header}\n  {body}\n  Source: {url}")
+                                if tags:
+                                    tag_str = ", ".join([str(t) for t in tags[:8] if str(t).strip()])
+                                    if tag_str:
+                                        chunks.append(f"- {header}\n  {body}\n  Tags: {tag_str}\n  Source: {url}")
+                                    else:
+                                        chunks.append(f"- {header}\n  {body}\n  Source: {url}")
+                                else:
+                                    chunks.append(f"- {header}\n  {body}\n  Source: {url}")
                             else:
                                 chunks.append(f"- {header}\n  {body}")
                         web_block = "\n".join(chunks)[:max_chars]

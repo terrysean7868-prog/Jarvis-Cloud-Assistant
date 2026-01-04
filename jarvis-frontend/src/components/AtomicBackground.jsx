@@ -42,8 +42,8 @@ export default function AtomicBackground({ emotion = "calm", wakePulse = false, 
         <div className="atomic-nucleus" />
 
         {Array.from({ length: RING_COUNT }).map((_, i) => {
-          // React-like rings: mostly same size, slight variation for depth.
-          const ringSizeVmin = 64 + ((i % 3) - 1) * 1.6 + (i - 3) * 0.25;
+          // Concentric rings: keep clear spacing so the rings don't visually merge.
+          const ringSizeVmin = 46 + (i * 4);
 
           // De-sync motion so it feels continuous/premium.
           const ringSpinS = 18.5 + i * 2.9;
@@ -53,13 +53,14 @@ export default function AtomicBackground({ emotion = "calm", wakePulse = false, 
           const reverse = i % 2 !== 0;
 
           // Repeating orientations to mimic the React logo (3 main orbits).
-          const tiltX = 66;
+          // Keep rings visually round (no X/Y tilt on the ring itself).
+          const tiltX = 0;
           const tiltY = 0;
           const tiltZ = `${(i % 3) * 60}deg`;
 
-          // Ellipse squash (React logo look)
-          const sx = 1.34;
-          const sy = 0.86;
+          // Keep true circle shape (no ellipse squash).
+          const sx = 1;
+          const sy = 1;
 
           // Slight depth separation.
           const ringZ = (i - 1) * 2; // px

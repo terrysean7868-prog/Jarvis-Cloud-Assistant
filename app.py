@@ -2,6 +2,7 @@ import os
 import asyncio
 from pathlib import Path
 import time
+import re
 from datetime import datetime
 import base64
 import secrets
@@ -1268,7 +1269,7 @@ async def device_dispatch(req: DeviceDispatchRequest):
             return ("allow_app_control", "JARVIS_AGENT_ALLOW_APP_CONTROL")
         if t == "execute_command":
             return ("allow_execute_command", "JARVIS_AGENT_ALLOW_EXECUTE_COMMAND")
-        if t in ("capture_screen", "screen_navigation", "type_text", "press_key"):
+        if t in ("capture_screen", "screen_navigation", "type_text", "press_key", "hotkey"):
             return ("allow_screen", "JARVIS_AGENT_ALLOW_SCREEN")
         if t in ("read", "write", "edit", "delete", "move", "copy", "list", "mkdir", "cleanup"):
             return ("allow_file_ops", "JARVIS_AGENT_ALLOW_FILE_OPS")
@@ -1616,6 +1617,13 @@ class AdminWebTrainingFetchRequest(BaseModel):
     num_results: int | None = 2
 
 
+class AdminWikiTrainingFetchRequest(BaseModel):
+    session_id: str
+    topics: List[str] | None = None
+    max_pages: int | None = 2
+    lang: str | None = "en"
+
+
 @app.post("/api/admin/web-training/fetch")
 async def admin_web_training_fetch(req: AdminWebTrainingFetchRequest):
     """Fetch and store web training summaries now (admin-only)."""
@@ -1660,6 +1668,74 @@ async def admin_web_training_fetch(req: AdminWebTrainingFetchRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
+@app.post("/api/admin/wiki-training/fetch")
+async def admin_wiki_training_fetch(req: AdminWikiTrainingFetchRequest):
+    """Fetch and store compact Wikipedia summaries (admin-only).
+
+    Notes:
+    - Uses the official Wikipedia API.
+    - Stores only short extracts + URLs via `save_web_training_item`.
+    - Bounded by `max_pages` to avoid large crawls.
+    """
+    _require_admin_session(req.session_id)
+
+    topics = req.topics or [
+        "human psychology",
+        "cognitive bias",
+        "cognitive dissonance",
+        "confirmation bias",
+        "social psychology",
+        "behavioral economics",
+    ]
+    max_pages = max(1, min(int(req.max_pages or 2), 5))
+    lang = (req.lang or "en").strip().lower() or "en"
+
+    try:
+        # Ensure DB is available (best-effort)
+        try:
+            database._ensure_connected()
+        except Exception:
+            pass
+        if getattr(database, "db", None) is None:
+            return {"status": "error", "message": "Database unavailable"}
+
+        from src.internet.wikipedia_client import wikipedia_topic_summaries
+
+        saved = 0
+        for topic in topics[:30]:
+            t = (topic or "").strip()
+            if not t:
+                continue
+            try:
+                summaries = await wikipedia_topic_summaries(t, lang=lang, max_pages=max_pages)
+                for s in summaries:
+                    try:
+                        # Use a short snippet; DB layer also truncates.
+                        snippet = (s.description or "").strip()
+                        if snippet and s.extract:
+                            snippet = (snippet + ": " + s.extract).strip()
+                        else:
+                            snippet = s.extract
+
+                        database.save_web_training_item(
+                            topic=t,
+                            title=s.title,
+                            snippet=(snippet or "")[:500],
+                            summary=(s.extract or ""),
+                            url=s.url,
+                            source="wikipedia_api",
+                        )
+                        saved += 1
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+        return {"status": "success", "saved": saved, "topics": topics, "max_pages": max_pages, "lang": lang}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 # =========================================================
 # CORS Configuration
 # =========================================================
@@ -1696,6 +1772,29 @@ app.add_middleware(
 llm = LLMAdapter()
 brain = JarvisBrain(llm=llm)
 executor = ActionExecutor(brain=brain)
+
+
+@app.on_event("shutdown")
+async def _shutdown_cleanup():
+    """Best-effort cleanup for async HTTP sessions.
+
+    Prevents aiohttp 'Unclosed client session/connector' warnings on shutdown/reload.
+    """
+    # Close LLMAdapter's aiohttp session
+    try:
+        llm = getattr(brain, "llm", None)
+        if llm and hasattr(llm, "close"):
+            await llm.close()
+    except Exception:
+        pass
+
+    # Close global web scraper session (DuckDuckGo/HTTP client)
+    try:
+        from src.internet.web_scraper import close_scraper
+
+        await close_scraper()
+    except Exception:
+        pass
 
 
 def _build_web_context_from_action_results(action_results: list[dict], max_chars: int = 380) -> str:
@@ -1756,8 +1855,51 @@ def _build_web_context_from_action_results(action_results: list[dict], max_chars
     ctx = "\n\n".join([b for b in blocks if b]).strip()
     if not ctx:
         return ""
-    ctx = ctx[-max_chars:]
+    # Keep the head so we retain the top-ranked URLs/titles.
+    ctx = ctx[:max_chars]
     return ctx
+
+
+def _web_lookup_found(action_results: list[dict]) -> bool:
+    """Return True if web tool results include any usable hits."""
+    for r in action_results or []:
+        if not isinstance(r, dict):
+            continue
+        if (r.get("status") or "").lower() != "success":
+            continue
+        action = (r.get("action") or r.get("action_type") or "").lower()
+        if action in {"web_search", "search"}:
+            results = r.get("results") or []
+            if isinstance(results, list) and len(results) > 0:
+                return True
+            try:
+                if int(r.get("results_count") or 0) > 0:
+                    return True
+            except Exception:
+                pass
+        if action == "fetch_url":
+            if (r.get("title") or "") or (r.get("summary") or ""):
+                return True
+    return False
+
+
+def _fallback_answer_from_web_results(user_text: str, tool_results: list[dict], *, found: bool) -> str:
+    """Non-LLM fallback text when web lookup succeeded but LLM continuation fails.
+
+    Keeps the same UX contract: explicit found/not-found prefix and 1-2 source URLs when found.
+    """
+    try:
+        from src.core.offline_analysis import synthesize_from_web
+
+        return synthesize_from_web(user_text, tool_results, found=found)
+    except Exception:
+        # Extremely defensive: preserve the contract even if the offline synthesizer fails.
+        if not found:
+            return (
+                "Not found this: No usable web results were returned. "
+                "What exactly should I look for (asset/topic + timeframe or specific question)?"
+            )
+        return "I found this: Web results were returned, but synthesis failed.\n\nSource URLs:\n1. (no source URL available)"
 
 
 async def _answer_user_using_web_context(user_text: str, web_context: str, mode: str = "chat") -> str | None:
@@ -1784,6 +1926,145 @@ async def _answer_user_using_web_context(user_text: str, web_context: str, mode:
             txt = (out.get("text") or "").strip()
             return txt or None
         return None
+    except Exception:
+        return None
+
+
+def _persist_web_context_items(topic: str, action_results: list[dict]):
+    """Best-effort: store short web snippets/summaries to MongoDB.
+
+    We store only short snippets/summaries + URLs (no full-page mirroring).
+    """
+    try:
+        database._ensure_connected()
+        if database.db is None:
+            return
+    except Exception:
+        return
+
+    try:
+        for r in action_results or []:
+            if not isinstance(r, dict):
+                continue
+            if (r.get("status") or "").lower() != "success":
+                continue
+
+            action = (r.get("action") or r.get("action_type") or "").lower()
+            if action in {"web_search", "search"}:
+                query = (r.get("query") or topic or "").strip()
+                results = r.get("results") or []
+                for item in results[:3]:
+                    if not isinstance(item, dict):
+                        continue
+                    title = (item.get("title") or "").strip()
+                    url = (item.get("url") or "").strip()
+                    snippet = (item.get("snippet") or "").strip()
+                    if url:
+                        database.save_web_training_item(topic=query, title=title, snippet=snippet, summary=None, url=url, source="web_search")
+                continue
+
+            if action == "fetch_url":
+                url = (r.get("url") or "").strip()
+                title = (r.get("title") or "").strip()
+                summary = (r.get("summary") or "").strip()
+                if url:
+                    database.save_web_training_item(topic=(topic or "").strip(), title=title, snippet=None, summary=summary, url=url, source="fetch_url")
+                continue
+    except Exception:
+        # never break chat flow on DB issues
+        return
+
+
+async def _continue_user_using_web_context(user_text: str, web_context: str, mode: str = "chat", *, found: bool) -> dict | None:
+    """Ask the LLM to continue using provided web context and MAY return actions.
+
+    Critical behavior:
+    - It must NOT request another web_search/fetch_url loop (we already have web context).
+    - It may propose PC/app actions based on what it learned.
+    """
+    try:
+        import re
+        if not web_context:
+            return None
+
+        status_line = "I found this:" if found else "Not found this:"
+        prompt = (
+            "You are completing the user's request using the provided web context.\n"
+            "Rules:\n"
+            "- Use the web context to learn app features/steps if needed.\n"
+            "- Do NOT output web_search, fetch_url, or search actions again.\n"
+            "- You MAY output normal actions (open_app, switch_app, open_url, execute_command, type_text, hotkey, press_key, etc.) if they help complete the task.\n"
+            "- Your reply MUST start with an explicit lookup status line so the user understands the result.\n"
+            f"  - If info exists in context: start with '{status_line} <short answer>'\n"
+            f"  - If info does not exist in context: start with '{status_line} <what was missing>'\n"
+            "- If you say 'I found this:', include a very short extracted summary (2-6 lines) and include 1-2 Source URLs from the context.\n"
+            "- If you say 'Not found this:', ask exactly ONE clarifying question to learn what the user actually needs next, and return actions: [].\n"
+            "- If the context is insufficient, ask at most 1 clarifying question and return actions: [].\n\n"
+            f"User request: {user_text.strip()}"
+        )
+
+        out = await brain.llm.generate_response(prompt, context=web_context, mode=mode)
+        if not isinstance(out, dict):
+            return None
+
+        # If the LLM adapter returned a fallback (e.g., rate limit), let the caller use
+        # a deterministic fallback based on tool results.
+        if (out.get("source") or "").startswith("fallback"):
+            return None
+
+        # Enforce the explicit UX contract even if the model is slightly off.
+        txt = (out.get("text") or "").strip()
+        status_prefix = "I found this:" if found else "Not found this:"
+        if not txt.lower().startswith(status_prefix.lower()):
+            txt = f"{status_prefix} {txt}".strip()
+
+        if found:
+            # Require at least one URL; if missing, pull 1-2 URLs from web_context.
+            has_url = bool(re.search(r"https?://\S+", txt))
+            if not has_url:
+                urls = re.findall(r"https?://\S+", web_context or "")
+                urls = [u.rstrip(").,;") for u in urls]
+                urls = [u for i, u in enumerate(urls) if u and u not in urls[:i]]
+                if urls:
+                    txt = (txt + "\n\nSource URLs:\n" + "\n".join([f"{i+1}. {u}" for i, u in enumerate(urls[:2])])).strip()
+
+            # If the user asked an informational question (not to open anything), avoid emitting side-effect actions.
+            ut = (user_text or "").strip().lower()
+            if ut and ("open " not in ut) and ("launch " not in ut) and ("go to " not in ut) and ("visit " not in ut):
+                if ut.endswith("?") or re.search(r"\b(what is|what are|latest|current|as of)\b", ut):
+                    out["actions"] = []
+        else:
+            # Must ask exactly ONE clarifying question and must not emit actions.
+            out["actions"] = []
+            qcount = txt.count("?")
+            if qcount == 0:
+                txt = (txt + " What exactly should I look for (product name/version or the exact feature)?").strip()
+            elif qcount > 1:
+                # Keep only the first question.
+                first_q = txt.find("?")
+                txt = (txt[: first_q + 1]).strip()
+
+        out["text"] = txt
+
+        # Hard filter: prevent re-triggering web loop.
+        actions = out.get("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+        blocked = []
+        kept = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            t = (a.get("type") or "").strip().lower()
+            if t in {"web_search", "fetch_url", "search"}:
+                blocked.append(a)
+                continue
+            kept.append(a)
+        out["actions"] = kept
+        if blocked and not kept:
+            # Keep the assistant honest and avoid silent failures.
+            out["text"] = ((out.get("text") or "").strip() + "\n\n(I used the web context, but won't run another web search loop here.)").strip()
+        return out
     except Exception:
         return None
 
@@ -2157,22 +2438,29 @@ async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
         immediate_actions = [a for a in actions if (a or {}).get("type") in immediate_types]
         deferred_actions = [a for a in actions if (a or {}).get("type") not in immediate_types]
         if immediate_actions:
+            continued_actions = None
             try:
                 tool_results = await executor.process_actions(immediate_actions, (username or "user"))
                 if os.getenv("JARVIS_RETURN_ACTION_RESULTS", "false").lower() in ("1", "true", "yes", "y"):
                     response["action_results"] = tool_results
                 mode = (response.get("mode") or "chat")
                 web_ctx = _build_web_context_from_action_results(tool_results)
+                _persist_web_context_items(topic=text, action_results=tool_results)
+                found = _web_lookup_found(tool_results)
                 if os.getenv("JARVIS_WEB_RESULTS_MODE", "answer").lower() in ("append", "both"):
                     # Legacy/debug mode: append raw results.
                     response["text"] = (response.get("text") or "")
                 else:
-                    ans = await _answer_user_using_web_context(text, web_ctx, mode=mode)
-                    if ans:
-                        response["text"] = ans
+                    continued = await _continue_user_using_web_context(text, web_ctx, mode=mode, found=found)
+                    if continued:
+                        response["text"] = (continued.get("text") or response.get("text") or "")
+                        # Allow dynamic actions after web lookup
+                        continued_actions = continued.get("actions") or []
             except Exception as e:
                 response["text"] = (response.get("text") or "") + f"\n\n(Web lookup failed: {e})"
             actions = deferred_actions
+            if isinstance(continued_actions, list) and continued_actions:
+                actions = continued_actions
             response["actions"] = actions
 
         if actions:
@@ -2261,6 +2549,7 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         immediate_actions = [a for a in actions if (a or {}).get("type") in immediate_types]
         deferred_actions = [a for a in actions if (a or {}).get("type") not in immediate_types]
         if immediate_actions:
+            continued_actions = None
             try:
                 tool_results = await executor.process_actions(immediate_actions, (msg.user or username or "user"))
                 if os.getenv("JARVIS_RETURN_ACTION_RESULTS", "false").lower() in ("1", "true", "yes", "y"):
@@ -2273,12 +2562,104 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                     # Keep response text as-is; (optional) UI can render action_results.
                     response["text"] = (response.get("text") or "")
                 else:
-                    ans = await _answer_user_using_web_context(msg.text, web_ctx, mode=mode)
-                    if ans:
-                        response["text"] = ans
+                    _persist_web_context_items(topic=msg.text, action_results=tool_results)
+                    found = _web_lookup_found(tool_results)
+
+                    offline_analysis = os.getenv("JARVIS_OFFLINE_ANALYSIS", "false").lower() in ("1", "true", "yes", "y")
+                    offline_only = os.getenv("JARVIS_OFFLINE_ONLY", "false").lower() in ("1", "true", "yes", "y")
+
+                    def _needs_offline_drilldown(prompt: str) -> bool:
+                        tl = (prompt or "").strip().lower()
+                        if not tl:
+                            return False
+                        return bool(
+                            re.search(
+                                r"\b(latest|current|as\s+of\s+today|as\s+of\s+now|today)\b", tl
+                            )
+                            and re.search(
+                                r"\b(version|release|price|rate|market\s+cap|marketcap|cap|value|"
+                                r"release\s+date|released\s+on|when\s+was|announced|published|"
+                                r"eol|end\s+of\s+life|end\-of\-life|supported\s+until|support\s+ends|"
+                                r"compatible|compatibility|requirements?|minimum|supported\s+versions?)\b",
+                                tl,
+                            )
+                        )
+
+                    def _pick_best_fetch_url(action_results: list[dict]) -> str | None:
+                        # Prefer official/primary sources when available.
+                        prefer = (
+                            "nodejs.org",
+                            "github.com",
+                            "docs.",
+                            "developer.",
+                            "support.",
+                            "learn.",
+                            "openai.com",
+                            "microsoft.com",
+                            "mozilla.org",
+                            "python.org",
+                            "wikipedia.org",
+                            "w3schools.com",
+                        )
+                        urls: list[str] = []
+                        for r in action_results or []:
+                            if not isinstance(r, dict):
+                                continue
+                            if (r.get("status") or "").lower() != "success":
+                                continue
+                            action = (r.get("action") or r.get("action_type") or "").lower()
+                            if action not in {"web_search", "search"}:
+                                continue
+                            for item in (r.get("results") or [])[:5]:
+                                if not isinstance(item, dict):
+                                    continue
+                                u = str(item.get("url") or "").strip()
+                                if u:
+                                    urls.append(u)
+                        if not urls:
+                            return None
+                        for p in prefer:
+                            for u in urls:
+                                if p in u.lower():
+                                    return u
+                        return urls[0]
+
+                    # If OpenAI is rate-limited (or intentionally disabled), avoid calling it and
+                    # synthesize from web results locally.
+                    if offline_only or offline_analysis:
+                        # Optional offline drilldown: for queries that need a specific "current/latest" value,
+                        # fetch the top primary source page and let the offline engine extract concrete data points.
+                        try:
+                            if found and _needs_offline_drilldown(msg.text):
+                                fetch_url = _pick_best_fetch_url(tool_results)
+                                if fetch_url:
+                                    more = await executor.process_actions(
+                                        [{"type": "fetch_url", "url": fetch_url}],
+                                        (msg.user or username or "user"),
+                                    )
+                                    if isinstance(more, list) and more:
+                                        tool_results.extend(more)
+                                        if os.getenv("JARVIS_RETURN_ACTION_RESULTS", "false").lower() in ("1", "true", "yes", "y"):
+                                            response["action_results"] = tool_results
+                        except Exception:
+                            pass
+
+                        response["text"] = _fallback_answer_from_web_results(msg.text, tool_results, found=found)
+                        continued_actions = []
+                    else:
+                        continued = await _continue_user_using_web_context(msg.text, web_ctx, mode=mode, found=found)
+                        if continued:
+                            response["text"] = (continued.get("text") or response.get("text") or "")
+                            continued_actions = continued.get("actions") or []
+                        else:
+                            # Continuation failed (often rate limits). Provide a deterministic fallback.
+                            response["text"] = _fallback_answer_from_web_results(msg.text, tool_results, found=found)
+                            continued_actions = []
             except Exception as e:
                 response["text"] = (response.get("text") or "") + f"\n\n(Web lookup failed: {e})"
             actions = deferred_actions
+            if isinstance(continued_actions, list) and continued_actions:
+                actions = continued_actions
             response["actions"] = actions
 
     # In cloud mode, forward any PC/device actions to the connected local agent.

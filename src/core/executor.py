@@ -630,15 +630,43 @@ class ActionExecutor:
         """
         Handles the action to open a URL in the browser.
         """
-        url_name = action.get("url_name", "").lower()
-        url = self.url_map.get(url_name, f"https://www.{url_name}.com")
+        raw_url = (action.get("url") or "").strip()
+        url_name = (action.get("url_name") or "").strip().lower()
 
+        # Backward/forward compatible:
+        # - New schema: {"type":"open_url","url":"https://..."}
+        # - Legacy schema: {"type":"open_url","url_name":"youtube"}
+        url = ""
+        if raw_url:
+            url = raw_url
+        elif url_name:
+            url = self.url_map.get(url_name, "")
+            if not url:
+                # Accept a domain-like name (e.g., example.com) or fallback to https://www.<name>.com
+                if "." in url_name:
+                    url = f"https://{url_name}"
+                else:
+                    url = f"https://www.{url_name}.com"
+
+        if not url:
+            return {"status": "error", "message": "Missing url for open_url"}
+
+        # If the user passed a bare domain without a scheme, assume https.
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", url):
+            url = f"https://{url}"
+
+        # Prefer system default browser (works without selenium/chromedriver).
         try:
-            self._initialize_browser()
-            self.browser.get(url)
+            self._open_url(url)
             return {"status": "success", "message": f"Opened {url} in browser"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+        except Exception:
+            # Fallback: attempt selenium (may be unavailable in some environments)
+            try:
+                self._initialize_browser()
+                self.browser.get(url)
+                return {"status": "success", "message": f"Opened {url} in browser"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
 
     async def _handle_screen_navigation(self, action: dict):
         """

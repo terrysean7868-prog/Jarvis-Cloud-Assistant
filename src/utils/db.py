@@ -181,7 +181,15 @@ class Database:
         ])
         try:
             web_training_data.create_index(
-                [("topic", "text"), ("title", "text"), ("snippet", "text"), ("summary", "text")],
+                [
+                    ("topic", "text"),
+                    ("title", "text"),
+                    ("snippet", "text"),
+                    ("summary", "text"),
+                    # Optional enrichment fields (added by background analysis)
+                    ("analysis_insight", "text"),
+                    ("analysis_tags", "text"),
+                ],
                 name="web_training_text_idx",
                 default_language="english",
             )
@@ -407,28 +415,22 @@ class Database:
         if self.db is None:
             return None
 
-        topic = (topic or "").strip()
-        url = (url or "").strip()
-        if not topic or not url:
+        from src.core.web_training_schema import normalize_web_training_item
+
+        doc = normalize_web_training_item(
+            topic=topic,
+            title=title,
+            snippet=snippet,
+            summary=summary,
+            url=url,
+            source=source,
+        )
+        if not doc:
             return None
 
-        # Keep content short to avoid storing large copyrighted text.
-        title = (title or "").strip()[:300]
-        snippet = (snippet or "").strip()[:500]
-        summary = (summary or "").strip()[:1200]
-
         collection = self.db.web_training_data
-        doc = {
-            "topic": topic,
-            "title": title,
-            "snippet": snippet,
-            "summary": summary,
-            "url": url,
-            "fetched_at": datetime.utcnow(),
-            "source": source,
-        }
         # Upsert to avoid duplicates by (topic,url)
-        return collection.update_one({"topic": topic, "url": url}, {"$set": doc}, upsert=True)
+        return collection.update_one({"topic": doc["topic"], "url": doc["url"]}, {"$set": doc}, upsert=True)
 
     def search_web_training(self, query: str, limit: int = 3):
         """Search web_training_data by query and return best-effort relevant items."""
@@ -456,7 +458,18 @@ class Database:
                 safe = re.escape(q)
                 regex = {"$regex": safe, "$options": "i"}
                 cursor = (
-                    collection.find({"$or": [{"topic": regex}, {"title": regex}, {"snippet": regex}, {"summary": regex}]})
+                    collection.find(
+                        {
+                            "$or": [
+                                {"topic": regex},
+                                {"title": regex},
+                                {"snippet": regex},
+                                {"summary": regex},
+                                {"analysis_insight": regex},
+                                {"analysis_tags": regex},
+                            ]
+                        }
+                    )
                     .sort("fetched_at", DESCENDING)
                     .limit(limit)
                 )

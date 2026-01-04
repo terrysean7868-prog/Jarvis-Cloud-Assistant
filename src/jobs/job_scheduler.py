@@ -64,6 +64,8 @@ class JobScheduler:
         enable_git_sync = os.getenv("JARVIS_AUTO_GIT_SYNC", "false").lower() in ("1", "true", "yes", "y")
         enable_db_maintenance = os.getenv("JARVIS_ENABLE_DB_MAINTENANCE", "true").lower() in ("1", "true", "yes", "y")
         enable_web_training = os.getenv("JARVIS_ENABLE_WEB_TRAINING_JOB", "true").lower() in ("1", "true", "yes", "y")
+        enable_wiki_training = os.getenv("JARVIS_ENABLE_WIKI_TRAINING_JOB", "false").lower() in ("1", "true", "yes", "y")
+        enable_background_analysis = os.getenv("JARVIS_ENABLE_BACKGROUND_ANALYSIS_JOB", "true").lower() in ("1", "true", "yes", "y")
         enable_memory_optimization = os.getenv("JARVIS_ENABLE_MEMORY_OPTIMIZATION", "false").lower() in ("1", "true", "yes", "y")
         enable_training_data_job = os.getenv("JARVIS_ENABLE_TRAINING_DATA_JOB", "false").lower() in ("1", "true", "yes", "y")
 
@@ -99,12 +101,40 @@ class JobScheduler:
                 job_id="web_training_fetch"
             )
 
+        # Fetch Wikipedia summaries (off by default; opt-in). Default cadence: weekly.
+        if enable_wiki_training:
+            try:
+                # Default to hourly for faster knowledge refresh; override via env.
+                interval_seconds = int(os.getenv("JARVIS_WIKI_TRAINING_INTERVAL_SECONDS", str(3600)))
+            except Exception:
+                interval_seconds = 7 * 86400
+            interval_seconds = max(3600, min(interval_seconds, 30 * 86400))
+            self.add_job(
+                fetch_wikipedia_training_data,
+                interval_seconds=interval_seconds,
+                job_id="wiki_training_fetch"
+            )
+
         # Memory optimization every 6 hours (off by default; can be expensive)
         if enable_memory_optimization:
             self.add_job(
                 optimize_memory,
                 interval_seconds=21600,
                 job_id="memory_optimization"
+            )
+
+        # Background analysis/enrichment for stored web knowledge.
+        # Default cadence: every 30 minutes (override via env).
+        if enable_background_analysis:
+            try:
+                interval_seconds = int(os.getenv("JARVIS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS", str(1800)))
+            except Exception:
+                interval_seconds = 1800
+            interval_seconds = max(300, min(interval_seconds, 6 * 3600))
+            self.add_job(
+                background_analyze_web_training_data,
+                interval_seconds=interval_seconds,
+                job_id="background_web_analysis"
             )
 
 
@@ -274,6 +304,198 @@ def fetch_web_training_data():
             )
     except Exception as e:
         print(f"❌ [WEB-TRAINING] Web training data fetch failed: {e}")
+
+
+def fetch_wikipedia_training_data():
+    """Seed compact Wikipedia summaries into web_training_data.
+
+    This is a small, bounded knowledge cache to improve offline synthesis and context.
+    It does NOT mirror full Wikipedia pages.
+
+    Configuration (env):
+    - JARVIS_ENABLE_WIKI_TRAINING_JOB=true
+    - JARVIS_WIKI_TRAINING_TOPICS="topic1,topic2,..." (optional)
+    - JARVIS_WIKI_TRAINING_LANG="en" (optional)
+    - JARVIS_WIKI_TRAINING_MAX_PAGES=2 (optional; capped 1..5)
+    """
+    try:
+        print(f"\n📚 [WIKI-TRAINING] Starting Wikipedia training fetch at {datetime.utcnow().isoformat()}")
+
+        raw_topics = os.getenv("JARVIS_WIKI_TRAINING_TOPICS", "").strip()
+        if raw_topics:
+            topics = [t.strip() for t in raw_topics.split(",") if (t or "").strip()]
+        else:
+            topics = [
+                "human psychology",
+                "cognitive bias",
+                "cognitive dissonance",
+                "confirmation bias",
+                "memory",
+                "attention",
+                "emotion",
+                "motivation",
+                "social psychology",
+                "behavioral economics",
+                "history of science",
+            ]
+
+        try:
+            max_pages = int(os.getenv("JARVIS_WIKI_TRAINING_MAX_PAGES", "2"))
+        except Exception:
+            max_pages = 2
+        max_pages = max(1, min(max_pages, 5))
+
+        lang = (os.getenv("JARVIS_WIKI_TRAINING_LANG", "en") or "en").strip().lower() or "en"
+
+        # Run async fetching (bounded)
+        saved = asyncio.run(_fetch_wikipedia_training_data_async(topics[:30], lang=lang, max_pages=max_pages))
+
+        print(f"✅ [WIKI-TRAINING] Wikipedia training fetch completed (saved: {saved})")
+        if _db_available():
+            db.save_system_event(
+                event_type="wiki_training_fetch",
+                description=f"Fetched Wikipedia summaries (saved: {saved})",
+                status="success",
+                details={"topics": topics[:30], "max_pages": max_pages, "lang": lang},
+            )
+    except Exception as e:
+        print(f"❌ [WIKI-TRAINING] Wikipedia training fetch failed: {e}")
+        if _db_available():
+            db.save_system_event(
+                event_type="wiki_training_error",
+                description=f"Wikipedia training fetch failed: {str(e)}",
+                status="error",
+            )
+
+
+def background_analyze_web_training_data():
+    """Enrich stored web_training_data items with compact tags/insights.
+
+    This is a lightweight, non-LLM job meant to improve retrieval quality and
+    reduce response time. It writes only small derived fields:
+    - analysis_tags: list[str]
+    - analysis_insight: str
+    - analysis_at: datetime
+    - analysis_version: int
+
+    Configuration (env):
+    - JARVIS_ENABLE_BACKGROUND_ANALYSIS_JOB=true
+    - JARVIS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS=1800 (default 30 min)
+    - JARVIS_BACKGROUND_ANALYSIS_BATCH=30
+    """
+    try:
+        print(f"\n🧠 [BG-ANALYSIS] Starting web knowledge analysis at {datetime.utcnow().isoformat()}")
+
+        if not _db_available():
+            print("⚠️  [BG-ANALYSIS] MongoDB not connected; skipping")
+            return
+
+        try:
+            batch = int(os.getenv("JARVIS_BACKGROUND_ANALYSIS_BATCH", "30"))
+        except Exception:
+            batch = 30
+        batch = max(1, min(batch, 200))
+
+        from src.core.background_analysis import analyze_web_training_item
+        from src.core.web_training_schema import WEB_TRAINING_DOC_TYPE, WEB_TRAINING_SCHEMA_VERSION, jarvis_identity
+
+        col = db.db.web_training_data
+        # Analyze docs missing analysis or with old version.
+        query = {"$or": [{"analysis_at": {"$exists": False}}, {"analysis_version": {"$ne": 1}}]}
+        items = list(col.find(query).sort("fetched_at", -1).limit(batch))
+
+        updated = 0
+        ident = jarvis_identity()
+        for it in items:
+            try:
+                topic = (it.get("topic") or "").strip()
+                title = (it.get("title") or "").strip()
+                snippet = (it.get("snippet") or "").strip()
+                summary = (it.get("summary") or "").strip()
+                if not (topic and (summary or snippet or title)):
+                    continue
+
+                payload = analyze_web_training_item(topic=topic, title=title, snippet=snippet, summary=summary)
+                payload = payload or {}
+                payload["analysis_at"] = datetime.utcnow()
+                payload["analysis_version"] = 1
+
+                # Backfill canonical schema/identity fields for older documents.
+                payload.setdefault("doc_type", WEB_TRAINING_DOC_TYPE)
+                payload.setdefault("schema_version", WEB_TRAINING_SCHEMA_VERSION)
+                payload.setdefault("producer_assistant_id", ident.get("assistant_id", "jarvis"))
+                payload.setdefault("producer_instance_id", ident.get("instance_id", "local"))
+                payload["updated_at"] = datetime.utcnow()
+
+                col.update_one({"_id": it.get("_id")}, {"$set": payload})
+                updated += 1
+            except Exception:
+                continue
+
+        print(f"✅ [BG-ANALYSIS] Updated {updated} items")
+        db.save_system_event(
+            event_type="background_web_analysis",
+            description=f"Enriched web_training_data items (updated: {updated})",
+            status="success",
+            details={"updated": updated, "batch": batch},
+        )
+    except Exception as e:
+        print(f"❌ [BG-ANALYSIS] Failed: {e}")
+        if _db_available():
+            db.save_system_event(
+                event_type="background_web_analysis_error",
+                description=f"Background web analysis failed: {str(e)}",
+                status="error",
+            )
+
+
+async def _fetch_wikipedia_training_data_async(topics, *, lang: str = "en", max_pages: int = 2) -> int:
+    """Helper: fetch Wikipedia summaries and store compact items to MongoDB."""
+    try:
+        # Ensure DB connection (best-effort)
+        try:
+            db._ensure_connected()
+        except Exception:
+            pass
+        if getattr(db, "db", None) is None:
+            print("  ⚠️ MongoDB not connected; skipping Wikipedia training store")
+            return 0
+
+        from src.internet.wikipedia_client import wikipedia_topic_summaries
+
+        saved = 0
+        for topic in topics or []:
+            t = (topic or "").strip()
+            if not t:
+                continue
+            try:
+                summaries = await wikipedia_topic_summaries(t, lang=lang, max_pages=max_pages)
+                for s in summaries:
+                    try:
+                        snippet = (s.description or "").strip()
+                        if snippet and s.extract:
+                            snippet = (snippet + ": " + s.extract).strip()
+                        else:
+                            snippet = s.extract
+
+                        db.save_web_training_item(
+                            topic=t,
+                            title=s.title,
+                            snippet=(snippet or "")[:500],
+                            summary=(s.extract or "")[:1200],
+                            url=s.url,
+                            source="wikipedia_api",
+                        )
+                        saved += 1
+                    except Exception:
+                        pass
+                print(f"  ✓ Wikipedia: {t} ({len(summaries)} pages)")
+            except Exception as e:
+                print(f"  ⚠️ Wikipedia fetch failed for '{t}': {e}")
+                continue
+        return saved
+    except Exception:
+        return 0
 
 
 async def _fetch_training_data_async(topics):
