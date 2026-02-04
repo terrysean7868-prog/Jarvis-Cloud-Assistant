@@ -8,6 +8,8 @@ import logging
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
+from src.config.secrets import telegram_secrets
 import json
 from pathlib import Path
 
@@ -15,8 +17,9 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Telegram Bot Configuration
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+_tg = telegram_secrets()
+TELEGRAM_TOKEN = _tg.token
+TELEGRAM_CHAT_ID = _tg.chat_id
 
 # Session storage for Telegram users
 TELEGRAM_SESSIONS_FILE = Path("data/telegram_sessions.json")

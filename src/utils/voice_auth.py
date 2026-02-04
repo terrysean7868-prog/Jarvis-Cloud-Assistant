@@ -15,7 +15,6 @@ This implementation is intentionally simple and file-based for portability. For 
 replace voice hash comparison with real voice biometrics / external service.
 """
 
-import os
 import json
 import hashlib
 import secrets
@@ -24,10 +23,15 @@ import threading
 import time
 import difflib
 import re
+from collections import deque
 from pathlib import Path
 from src.utils.db import db
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
+
+from src.config import runtime_defaults as rd
+
+from src.utils.voice_biometrics import VOICE_BIOMETRICS_MAX_EMBEDS
 
 logger = logging.getLogger("jarvis.voice_auth")
 logger.setLevel(logging.INFO)
@@ -36,13 +40,13 @@ logger.setLevel(logging.INFO)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # go up to project root
 AUTH_FILE = PROJECT_ROOT / "data" / "auth_users.json"
 SESSION_DURATION = timedelta(hours=8)  # sessions valid for 8 hours
-AUTH_USE_DB = os.getenv("AUTH_USE_DB", "true").lower() in ("1", "true", "yes")
+AUTH_USE_DB = bool(rd.AUTH_USE_DB)
 PENDING_QUEUE_FILE = PROJECT_ROOT / "data" / "auth_pending_queue.json"
-QUEUE_FLUSH_INTERVAL = int(os.getenv("AUTH_QUEUE_FLUSH_INTERVAL", "10"))  # seconds
-VOICE_HASH_PREFIX_MATCH = os.getenv("VOICE_HASH_PREFIX_MATCH", "false").lower() in ("1", "true", "yes")
-VOICE_TEXT_SIMILARITY_THRESHOLD = float(os.getenv("VOICE_TEXT_SIMILARITY_THRESHOLD", "0.75"))
-VOICE_MAX_SAMPLES = int(os.getenv("VOICE_MAX_SAMPLES", "5"))
-AUTH_REQUIRE_DB = os.getenv("AUTH_REQUIRE_DB", "false").lower() in ("1", "true", "yes")
+QUEUE_FLUSH_INTERVAL = int(rd.AUTH_QUEUE_FLUSH_INTERVAL)  # seconds
+VOICE_HASH_PREFIX_MATCH = bool(rd.VOICE_HASH_PREFIX_MATCH)
+VOICE_TEXT_SIMILARITY_THRESHOLD = float(rd.VOICE_TEXT_SIMILARITY_THRESHOLD)
+VOICE_MAX_SAMPLES = int(rd.VOICE_MAX_SAMPLES)
+AUTH_REQUIRE_DB = bool(rd.AUTH_REQUIRE_DB)
 
 
 def _norm_text(s: str) -> str:
@@ -86,6 +90,7 @@ class VoiceAuth:
         self.active_sessions = {}  # session_id -> {"username", "expires_at"}
         # pending registrations queued while DB is unavailable
         self._pending_lock = threading.Lock()
+        self._pending_event = threading.Event()
         self._load_pending_queue()
         self._stop_queue_thread = False
         self._queue_thread = threading.Thread(target=self._pending_worker, daemon=True)
@@ -214,6 +219,9 @@ class VoiceAuth:
             # Ensure default assistant name exists
             if not (user.get("assistant_name") or "").strip():
                 user["assistant_name"] = "Jarvis"
+            # Ensure biometrics list exists
+            if not isinstance(user.get("voice_bio_embeddings"), list):
+                user["voice_bio_embeddings"] = list(user.get("voice_bio_embeddings") or [])
             # Upgrade old schema to new list schema
             samples = list(user.get("voice_samples") or [])
             if not samples and user.get("voice_hash"):
@@ -233,6 +241,7 @@ class VoiceAuth:
                 "voice_samples": [sample],
                 "role": role,
                 "assistant_name": "Jarvis",
+                "voice_bio_embeddings": [],
                 "created_at": datetime.utcnow().isoformat(),
             }
 
@@ -374,6 +383,57 @@ class VoiceAuth:
             pass
         return True, session_id
 
+    def add_voice_biometrics_embedding(self, username: str, embedding: list[float]) -> dict:
+        """Store a speaker embedding for the user (most recent N)."""
+        uname = (username or "").strip().lower()
+        if not uname:
+            return {"status": "error", "message": "Username required"}
+        if not embedding or not isinstance(embedding, list):
+            return {"status": "error", "message": "Embedding required"}
+
+        user_doc = self.get_user(uname)
+        if not user_doc:
+            return {"status": "error", "message": "User not found"}
+
+        user_doc = dict(user_doc)
+        lst = user_doc.get("voice_bio_embeddings")
+        if not isinstance(lst, list):
+            lst = []
+
+        lst.append({"vec": embedding, "created_at": datetime.utcnow().isoformat()})
+        user_doc["voice_bio_embeddings"] = lst[-max(1, int(VOICE_BIOMETRICS_MAX_EMBEDS)) :]
+        user_doc["updated_at"] = datetime.utcnow().isoformat()
+
+        self.auth_data.setdefault("users", {})[uname] = user_doc
+        try:
+            if AUTH_USE_DB and getattr(db, "db", None) is not None:
+                col = db.db.auth_users
+                col.create_index([("username", 1)], unique=True)
+                doc = dict(user_doc)
+                doc["username"] = uname
+                col.update_one({"username": uname}, {"$set": doc}, upsert=True)
+            else:
+                self._save()
+        except Exception:
+            pass
+
+        return {"status": "success", "username": uname, "count": len(user_doc.get("voice_bio_embeddings") or [])}
+
+    def get_voice_biometrics_vectors(self, username: str) -> list[list[float]]:
+        u = self.get_user((username or "").strip().lower()) or {}
+        lst = u.get("voice_bio_embeddings")
+        if not isinstance(lst, list):
+            return []
+        out: list[list[float]] = []
+        for item in lst:
+            try:
+                vec = item.get("vec") if isinstance(item, dict) else None
+                if isinstance(vec, list) and vec:
+                    out.append([float(x) for x in vec])
+            except Exception:
+                continue
+        return out
+
     def _create_session(self, username: str) -> str:
         sid = secrets.token_urlsafe(32)
         expires_at = (datetime.utcnow() + SESSION_DURATION).isoformat()
@@ -409,6 +469,96 @@ class VoiceAuth:
         u = self.get_user(username) or {}
         r = (u.get("role") or "user").strip().lower()
         return r if r in ("user", "admin") else "user"
+
+    def get_operational_mode(self, username: str) -> str:
+        """Return the user's preferred operational mode (persisted on the user record)."""
+        u = self.get_user(username) or {}
+        m = (u.get("operational_mode") or "interact").strip().lower()
+        allowed = {"learn", "update", "execute", "analyze", "develop", "creative", "interact"}
+        return m if m in allowed else "interact"
+
+    def get_preferences(self, username: str) -> dict:
+        """Return the user's saved preferences dict (may be empty)."""
+        u = self.get_user(username) or {}
+        prefs = u.get("preferences")
+        return prefs if isinstance(prefs, dict) else {}
+
+    def set_preference(self, username: str, key: str, value) -> dict:
+        """Set a single user preference (stored under user_doc['preferences'])."""
+        uname = (username or "").strip().lower()
+        k = (key or "").strip()
+        if not uname:
+            return {"status": "error", "message": "Username required"}
+        if not k:
+            return {"status": "error", "message": "Preference key required"}
+
+        user_doc = self.get_user(uname)
+        if not user_doc:
+            return {"status": "error", "message": "User not found"}
+
+        user_doc = dict(user_doc)
+        prefs = user_doc.get("preferences")
+        if not isinstance(prefs, dict):
+            prefs = {}
+        prefs[k] = value
+        user_doc["preferences"] = prefs
+        user_doc["updated_at"] = datetime.utcnow().isoformat()
+
+        self.auth_data.setdefault("users", {})[uname] = user_doc
+
+        try:
+            if AUTH_USE_DB and getattr(db, "db", None) is not None:
+                col = db.db.auth_users
+                col.create_index([("username", 1)], unique=True)
+                doc = dict(user_doc)
+                doc["username"] = uname
+                col.update_one({"username": uname}, {"$set": doc}, upsert=True)
+            else:
+                self._save()
+        except Exception:
+            pass
+
+        return {"status": "success", "username": uname, "key": k, "value": value}
+
+    def set_operational_mode(self, username: str, mode: str) -> dict:
+        """Persist the user's preferred operational mode."""
+        uname = (username or "").strip().lower()
+        if not uname:
+            return {"status": "error", "message": "Username required"}
+        allowed = {"learn", "update", "execute", "analyze", "develop", "creative", "interact"}
+        m = (mode or "").strip().lower()
+        if m not in allowed:
+            return {
+                "status": "error",
+                "message": f"Invalid mode '{mode}'. Available: {', '.join(sorted(allowed))}",
+                "available_modes": sorted(allowed),
+            }
+
+        # Ensure user exists in the local cache; refresh from DB if enabled.
+        user_doc = self.get_user(uname)
+        if not user_doc:
+            return {"status": "error", "message": "User not found"}
+
+        user_doc = dict(user_doc)
+        user_doc["operational_mode"] = m
+        user_doc["updated_at"] = datetime.utcnow().isoformat()
+
+        self.auth_data.setdefault("users", {})[uname] = user_doc
+
+        try:
+            if AUTH_USE_DB and getattr(db, "db", None) is not None:
+                col = db.db.auth_users
+                col.create_index([("username", 1)], unique=True)
+                doc = dict(user_doc)
+                doc["username"] = uname
+                col.update_one({"username": uname}, {"$set": doc}, upsert=True)
+            else:
+                self._save()
+        except Exception:
+            # Do not fail the request if persistence is temporarily unavailable.
+            pass
+
+        return {"status": "success", "mode": m, "username": uname}
 
     def update_user(self, username: str, new_username: Optional[str] = None, new_role: Optional[str] = None, assistant_name: Optional[str] = None) -> dict:
         """Update an existing user's username and/or role.
@@ -526,73 +676,109 @@ class VoiceAuth:
                 PENDING_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
             if PENDING_QUEUE_FILE.exists():
                 with open(PENDING_QUEUE_FILE, 'r', encoding='utf-8') as fh:
-                    self._pending_queue = json.load(fh)
+                    data = json.load(fh)
+                    if isinstance(data, list):
+                        self._pending_queue = deque(data)
+                    else:
+                        self._pending_queue = deque()
             else:
-                self._pending_queue = []
+                self._pending_queue = deque()
         except Exception:
-            self._pending_queue = []
+            self._pending_queue = deque()
 
     def _persist_pending_queue(self):
         try:
             with open(PENDING_QUEUE_FILE, 'w', encoding='utf-8') as fh:
-                json.dump(self._pending_queue, fh, indent=2)
+                json.dump(list(self._pending_queue), fh, indent=2)
         except Exception:
             logger.exception("Failed to persist pending auth queue")
 
     def _enqueue_pending(self, item: dict):
         with self._pending_lock:
             self._pending_queue.append(item)
+        # Wake the worker so it can flush immediately if DB is available.
+        try:
+            self._pending_event.set()
+        except Exception:
+            pass
 
     def _dequeue_pending(self):
         with self._pending_lock:
             if not self._pending_queue:
                 return None
-            item = self._pending_queue.pop(0)
-            return item
+            return self._pending_queue.popleft()
 
     def _pending_worker(self):
         """Background worker that flushes pending registrations to DB when available."""
+        backoff_sec = 0.0
         while not getattr(self, '_stop_queue_thread', False):
             try:
-                # Try to flush while DB is available
+                # Wait until either:
+                # - new pending item arrives, OR
+                # - periodic wake interval passes (to detect DB recovery)
+                self._pending_event.wait(timeout=max(1, QUEUE_FLUSH_INTERVAL))
+                self._pending_event.clear()
+
+                # Nothing to do
+                with self._pending_lock:
+                    has_items = bool(self._pending_queue)
+                if not has_items:
+                    backoff_sec = 0.0
+                    continue
+
+                # Ensure DB reconnect process is running
                 if getattr(db, 'db', None) is None:
-                    # Ensure DB reconnect process is running
                     db._ensure_connected()
-                if getattr(db, 'db', None):
-                    # flush all queued items
-                    flushed_any = False
-                    while True:
-                        item = None
-                        with self._pending_lock:
-                            if self._pending_queue:
-                                item = self._pending_queue.pop(0)
-                        if not item:
-                            break
-                        try:
-                            uname = item.get('username')
-                            udoc = dict(item.get('user') or {})
-                            udoc['username'] = uname
-                            users_col = db.db.auth_users
-                            users_col.create_index([('username', 1)], unique=True)
-                            users_col.update_one({'username': uname}, {'$set': udoc}, upsert=True)
-                            logger.info("Flushed pending registration for '%s' to MongoDB", uname)
+
+                if getattr(db, 'db', None) is None:
+                    # DB still unavailable; apply a small backoff to reduce CPU churn.
+                    backoff_sec = min(60.0, (backoff_sec * 1.5) + 0.5) if backoff_sec else 0.5
+                    time.sleep(backoff_sec)
+                    continue
+
+                # DB available: flush queued items in a tight loop
+                users_col = db.db.auth_users
+                try:
+                    users_col.create_index([('username', 1)], unique=True)
+                except Exception:
+                    pass
+
+                flushed_any = False
+                while True:
+                    item = self._dequeue_pending()
+                    if not item:
+                        break
+                    try:
+                        uname = (item.get('username') or '').strip().lower()
+                        if not uname:
                             flushed_any = True
-                        except Exception:
-                            # Put back at front and stop trying for now
-                            with self._pending_lock:
-                                self._pending_queue.insert(0, item)
-                            break
-                    if flushed_any:
-                        # persist queue state
-                        self._persist_pending_queue()
-                # sleep before next attempt
+                            continue
+                        udoc = dict(item.get('user') or {})
+                        udoc['username'] = uname
+                        users_col.update_one({'username': uname}, {'$set': udoc}, upsert=True)
+                        logger.info("Flushed pending registration for '%s' to MongoDB", uname)
+                        flushed_any = True
+                    except Exception:
+                        # Put back at front and stop trying for now.
+                        with self._pending_lock:
+                            self._pending_queue.appendleft(item)
+                        break
+
+                if flushed_any:
+                    self._persist_pending_queue()
+                backoff_sec = 0.0
             except Exception:
                 logger.debug("Pending worker encountered an error; will retry")
-            time.sleep(QUEUE_FLUSH_INTERVAL)
+            # Legacy fallback sleep (kept for safety). Event-driven wake handles most cases.
+            time.sleep(0.1)
 
     def stop(self):
         """Stop background threads (used in shutdown/tests)."""
         self._stop_queue_thread = True
+        try:
+            self._pending_event.set()
+        except Exception:
+            pass
         try:
             if self._queue_thread:
                 self._queue_thread.join(timeout=1)

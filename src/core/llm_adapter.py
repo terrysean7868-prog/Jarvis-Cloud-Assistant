@@ -4,9 +4,19 @@ import json
 import aiohttp
 import re
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+from pathlib import Path
 from src.utils.db import db
+from src.config import runtime_defaults as rd
+from src.config.secrets import llm_secrets
+
+# Import decision-making system
+try:
+    from src.core.decision_maker import ContextAwareDecisionMaker, initialize_decision_maker
+    DECISION_MAKER_AVAILABLE = True
+except Exception:
+    DECISION_MAKER_AVAILABLE = False
 
 load_dotenv()
 
@@ -17,16 +27,26 @@ class LLMAdapter:
     """
 
     def __init__(self):
-        self.primary_model = os.getenv("PRIMARY_MODEL", "gpt-4o-mini")
-        self.primary_key = os.getenv("PRIMARY_API_KEY") or os.getenv("OPENAI_API_KEY")
-        self.primary_endpoint = os.getenv("PRIMARY_ENDPOINT", "https://api.openai.com/v1/chat/completions")
-        self.persona = os.getenv("JARVIS_PERSONA", "formal-gentle")
+        # Primary: OpenAI (ChatGPT). Fallback: Groq (OpenAI-compatible endpoint).
+        self.primary_model = rd.PRIMARY_MODEL
+        # Optional smarter model for hard tasks (routing by heuristic complexity).
+        # Keep PRIMARY_MODEL as a safe default to avoid breaking existing deployments.
+        self.smart_model = (rd.SMART_MODEL or "").strip()
+        self.smart_model_min_complexity = int(rd.SMART_MODEL_MIN_COMPLEXITY)
+        self.primary_key = llm_secrets().primary_api_key
+        self.primary_endpoint = (rd.PRIMARY_ENDPOINT or "").strip()
+
+        # Fallback provider (Groq). If primary fails, we attempt this once.
+        self.backup_model = rd.BACKUP_MODEL
+        self.backup_key = llm_secrets().backup_api_key
+        self.backup_endpoint = (rd.BACKUP_ENDPOINT or "").strip()
+        self.persona = rd.PERSONA
         self.session = None
         self.timeout = aiohttp.ClientTimeout(total=30)
         self.max_retries = 2
         # Default response budget. We dynamically increase for complex queries.
-        self.default_max_tokens = int(os.getenv("JARVIS_LLM_MAX_TOKENS", "450"))
-        self.max_max_tokens = int(os.getenv("JARVIS_LLM_MAX_MAX_TOKENS", "900"))
+        self.default_max_tokens = int(rd.LLM_MAX_TOKENS_DEFAULT)
+        self.max_max_tokens = int(rd.LLM_MAX_TOKENS_MAX)
 
         self.personality = {
             "formal-gentle": {
@@ -42,10 +62,30 @@ class LLMAdapter:
                 "prefix": "Observation"
             }
         }
+        
+        # Advanced decision-making system (optional)
+        self.decision_maker = None
+        if DECISION_MAKER_AVAILABLE:
+            try:
+                self.decision_maker = None  # Will be initialized on first use
+            except Exception:
+                pass
+        self._skills_cache = None
+        self._skills_cache_mtime = 0.0
 
     async def _ensure_session(self):
         if not self.session:
             self.session = aiohttp.ClientSession(timeout=self.timeout)
+    
+    async def _ensure_decision_maker(self):
+        """Initialize decision maker on first use"""
+        if DECISION_MAKER_AVAILABLE and self.decision_maker is None:
+            try:
+                self.decision_maker = ContextAwareDecisionMaker()
+                await self.decision_maker.initialize()
+            except Exception as e:
+                print(f"[LLMAdapter] Decision maker init failed: {e}")
+        return self.decision_maker
 
     async def close(self):
         """Close the underlying HTTP session (best-effort)."""
@@ -55,23 +95,105 @@ class LLMAdapter:
         finally:
             self.session = None
 
-    async def _call_openai(self, messages, *, max_tokens: int, temperature: float):
-        """Call OpenAI API directly."""
+    async def _call_openai(
+        self,
+        messages,
+        *,
+        max_tokens: int,
+        temperature: float,
+        model: str | None = None,
+        endpoint: str | None = None,
+        api_key: str | None = None,
+    ):
+        """Call an OpenAI-compatible Chat Completions endpoint.
+
+        NOTE: Tests monkeypatch this method to simulate model outages. Keep this as
+        the single choke point for model calls.
+        """
+        return await self._call_openai_with_model(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model=model,
+            endpoint=endpoint,
+            api_key=api_key,
+        )
+
+    async def _call_openai_with_model(
+        self,
+        messages,
+        *,
+        max_tokens: int,
+        temperature: float,
+        model: str | None,
+        endpoint: str | None,
+        api_key: str | None,
+    ):
         await self._ensure_session()
+        resolved_key = api_key if api_key is not None else self.primary_key
+        resolved_endpoint = endpoint if endpoint is not None else self.primary_endpoint
+        if not resolved_key:
+            raise Exception(
+                "Missing API key. Set OPENAI_API_KEY/PRIMARY_API_KEY for primary, "
+                "and GROQ_API_KEY/BACKUP_API_KEY for fallback."
+            )
         headers = {
-            "Authorization": f"Bearer {self.primary_key}",
+            "Authorization": f"Bearer {resolved_key}",
             "Content-Type": "application/json"
         }
         payload = {
-            "model": self.primary_model,
+            "model": (model or self.primary_model),
             "messages": messages,
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
         }
-        async with self.session.post(self.primary_endpoint, json=payload, headers=headers) as r:
+        async with self.session.post(resolved_endpoint, json=payload, headers=headers) as r:
             if r.status != 200:
                 raise Exception(f"OpenAI API error: {await r.text()}")
             return await r.json()
+
+    def _choose_model_for_request(self, text: str, mode: str) -> str:
+        """Route to a stronger model for complex tasks when configured."""
+        try:
+            if not self.smart_model:
+                return self.primary_model
+            complexity = self._estimate_complexity(text, mode)
+            if complexity >= self.smart_model_min_complexity:
+                return self.smart_model
+        except Exception:
+            pass
+        return self.primary_model
+
+    @staticmethod
+    def _looks_uncertain(reply_text: str) -> bool:
+        tl = (reply_text or "").strip().lower()
+        if not tl:
+            return False
+        markers = (
+            "i don't know",
+            "i do not know",
+            "i'm not sure",
+            "im not sure",
+            "not sure",
+            "can't say",
+            "cannot say",
+            "uncertain",
+            "i might be wrong",
+            "i may be wrong",
+            "i could be wrong",
+        )
+        return any(m in tl for m in markers)
+
+    @staticmethod
+    def _is_informational_question(user_text: str) -> bool:
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            return False
+        if re.search(r"\b(what|why|how|when|where|which|who)\b", tl):
+            return True
+        if re.search(r"\b(explain|define|meaning|documentation|docs|guide|tutorial)\b", tl):
+            return True
+        return False
 
     def _estimate_complexity(self, text: str, mode: str) -> int:
         """Rough heuristic to scale response budget for harder tasks.
@@ -117,6 +239,28 @@ class LLMAdapter:
         if complexity == 1:
             return min(max(base, 600), self.max_max_tokens), 0.55
         return min(max(base, 800), self.max_max_tokens), 0.5
+
+    def _apply_preference_overrides(self, max_tokens: int, temperature: float, mode: str, user_prefs: dict | None) -> tuple[int, float]:
+        """Adjust generation parameters based on stored user preferences."""
+        if not isinstance(user_prefs, dict) or not user_prefs:
+            return max_tokens, temperature
+
+        v = (user_prefs.get("verbosity") or "").strip().lower()
+        # Voice mode should remain concise regardless.
+        if (mode or "").lower() == "voice":
+            if v in {"high"}:
+                # Allow a bit more, but still keep tight.
+                return min(max_tokens, 450), temperature
+            return min(max_tokens, 320), temperature
+
+        if v in {"low", "short", "brief", "concise"}:
+            max_tokens = min(max_tokens, 400)
+            temperature = min(temperature, 0.55)
+        elif v in {"high", "detailed", "long"}:
+            max_tokens = min(max(self.default_max_tokens, max_tokens, 750), self.max_max_tokens)
+            temperature = max(0.45, min(temperature, 0.6))
+
+        return max_tokens, temperature
 
     @staticmethod
     def _normalize_phrase(s: str) -> str:
@@ -222,6 +366,69 @@ class LLMAdapter:
 
         tl = t.lower().strip()
 
+        # Skill invocation: "run skill X" / "use X skill" / "skill X"
+        try:
+            skill = LLMAdapter._match_skill_command(tl)
+            if skill:
+                return {
+                    "text": f"Running {skill.get('name')}.",
+                    "actions": [{
+                        "type": "n8n_webhook",
+                        "path": skill.get("path"),
+                        "method": "POST",
+                        "payload": {
+                            "skill": skill.get("name"),
+                            "query": t,
+                        },
+                    }],
+                    "source": "deterministic-voice",
+                }
+        except Exception:
+            pass
+
+        # Intent-based skill routing (research/scrape) when skills exist
+        try:
+            skills = LLMAdapter._get_skills_catalog() or []
+            skill_names = {str(s.get("name") or "").strip().lower(): s for s in skills if isinstance(s, dict)}
+
+            if re.search(r"\b(research|market research|analyze market|analysis|report)\b", tl):
+                target = skill_names.get("market_research") or skill_names.get("research")
+                if target:
+                    return {
+                        "text": "Starting research.",
+                        "actions": [{
+                            "type": "n8n_webhook",
+                            "path": target.get("path"),
+                            "method": "POST",
+                            "payload": {
+                                "skill": target.get("name"),
+                                "query": t,
+                            },
+                        }],
+                        "source": "deterministic-voice",
+                    }
+
+            if re.search(r"\b(scrape|extract|crawl)\b", tl):
+                target = skill_names.get("web_scrape") or skill_names.get("scrape")
+                if target:
+                    url_match = re.search(r"https?://\S+", t)
+                    return {
+                        "text": "Starting web scrape.",
+                        "actions": [{
+                            "type": "n8n_webhook",
+                            "path": target.get("path"),
+                            "method": "POST",
+                            "payload": {
+                                "skill": target.get("name"),
+                                "url": url_match.group(0) if url_match else None,
+                                "query": t,
+                            },
+                        }],
+                        "source": "deterministic-voice",
+                    }
+        except Exception:
+            pass
+
         # Avoid hijacking internet/research tasks.
         if re.search(r"\b(latest|today|current|news|download|install|update|documentation|docs|how\s+to)\b", tl):
             return None
@@ -297,6 +504,26 @@ class LLMAdapter:
             except Exception:
                 pass
             try:
+                parsed = LLMAdapter._postprocess_email_clarification_actions(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_ambiguous_type_text_actions(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_missing_value_actions(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_file_action_clarification(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_research_clarification(user_text=t, parsed=parsed)
+            except Exception:
+                pass
+            try:
                 parsed = LLMAdapter._postprocess_system_safety(user_text=t, parsed=parsed)
             except Exception:
                 pass
@@ -321,6 +548,51 @@ class LLMAdapter:
         return None
 
     @staticmethod
+    def _match_skill_command(tl: str) -> dict | None:
+        try:
+            skills = LLMAdapter._get_skills_catalog()
+            if not skills:
+                root = Path(__file__).resolve().parents[2]
+                skills_path = root / "data" / "skills.json"
+                if not skills_path.exists():
+                    return None
+                data = json.loads(skills_path.read_text(encoding="utf-8"))
+                skills = [s for s in (data or []) if isinstance(s, dict) and s.get("enabled", True)]
+            if not skills:
+                return None
+
+            # Normalize skill names for matching
+            names = {str(s.get("name") or "").strip().lower(): s for s in skills}
+            if not names:
+                return None
+
+            patterns = [
+                r"\b(run|use|execute|start)\s+skill\s+([a-z0-9_\- ]{2,50})$",
+                r"\b(skill)\s+([a-z0-9_\- ]{2,50})$",
+                r"\b(run|use|execute|start)\s+([a-z0-9_\- ]{2,50})\s+skill\b",
+            ]
+            target = None
+            for p in patterns:
+                m = re.search(p, tl)
+                if m:
+                    target = (m.group(2) or "").strip().lower()
+                    break
+            if not target:
+                return None
+
+            if target in names:
+                return names[target]
+
+            # Fuzzy match by inclusion
+            for k, v in names.items():
+                if k and k in target:
+                    return v
+
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
     def _is_high_level_analysis_task(user_text: str) -> bool:
         """Return True if the user is asking for high-level informational synthesis.
 
@@ -342,12 +614,26 @@ class LLMAdapter:
         """Best-effort helper: open PC Settings pages safely.
 
         We do NOT directly change OS/security-critical configuration.
-        We only open the relevant Settings page (primarily Windows via ms-settings:)
-        and keep the rest as user-guided steps.
+        For low-risk settings (e.g., brightness / power plan), we may emit a
+        dedicated device action so the PC agent can apply the change.
+        Otherwise we only open the relevant Settings page (primarily Windows via
+        ms-settings:) and keep the rest as user-guided steps.
         """
         actions = parsed.get("actions") or []
         if not isinstance(actions, list):
             actions = []
+
+        def _wrap_device_action(name: str, args: dict | None = None) -> dict:
+            """Universal device action envelope.
+
+            This keeps the LLM-facing action surface small. The PC agent unwraps
+            this and dispatches to the appropriate implementation.
+            """
+            return {
+                "type": "device_action",
+                "name": str(name or "").strip(),
+                "args": (args if isinstance(args, dict) else {}),
+            }
 
         # If the model already emitted a Settings opener, don't add duplicates.
         for a in actions:
@@ -368,7 +654,7 @@ class LLMAdapter:
         # Keep detection broad; mapping below decides whether we can safely auto-open a page.
         wants_settings = bool(
             re.search(
-                r"\b(settings|configuration|configure|setup|set up|wifi|wi-?fi|bluetooth|sound|audio|volume|display|screen|notification|brightness|time|date|language|keyboard|mouse|touchpad|printer|storage|battery|power|privacy|camera|microphone|default apps|apps)\b",
+                r"\b(settings|configuration|configure|setup|set up|wifi|wi-?fi|bluetooth|sound|audio|volume|mute|unmute|display|screen|notification|notifications|do\s+not\s+disturb|dnd|focus\s+assist|quiet\s+hours|brightness|night\s*light|time|date|language|keyboard|mouse|touchpad|printer|storage|battery|power|privacy|camera|microphone|default apps|apps|energy\s*saver|battery\s*saver)\b",
                 t,
             )
         )
@@ -376,13 +662,33 @@ class LLMAdapter:
             parsed["actions"] = actions
             return parsed
 
+        # Energy Saver: prefer an explicit power-plan action over opening Settings.
+        if re.search(r"\b(energy\s*saver|battery\s*saver)\b", t):
+            wants_on = bool(re.search(r"\b(turn\s+on|enable|activate)\b", t))
+            wants_off = bool(re.search(r"\b(turn\s+off|disable|deactivate)\b", t))
+            if wants_on or wants_off:
+                plan = "power saver" if wants_on else "balanced"
+                filtered = []
+                for a in actions:
+                    if not isinstance(a, dict):
+                        continue
+                    if a.get("type") == "execute_command" and "ms-settings:" in str(a.get("command") or "").lower():
+                        continue
+                    filtered.append(a)
+                filtered.append(_wrap_device_action("set_power_plan", {"plan": plan}))
+                parsed["actions"] = filtered
+                base_text = (parsed.get("text") or "").strip()
+                msg = "Turning on Energy Saver (Power saver plan)." if wants_on else "Turning off Energy Saver (Balanced plan)."
+                parsed["text"] = base_text or msg
+                return parsed
+
         # Only auto-open common *low-risk* settings pages.
         # We intentionally avoid updates, recovery, security, firewall, registry, disk, etc.
         # NOTE: ms-settings URIs vary across Windows versions; if a URI is unsupported,
         # Windows will typically fall back to the Settings home.
         settings_catalog = [
             (r"\b(display|resolution|scale|scaling|brightness|screen|night\s*light|hdr|orientation|multiple\s+displays)\b", "ms-settings:display"),
-            (r"\b(sound|audio|volume|speaker|microphone|mic|input|output|headphones)\b", "ms-settings:sound"),
+            (r"\b(sound|audio|volume|mute|unmute|speaker|microphone|mic|input|output|headphones)\b", "ms-settings:sound"),
             (r"\b(notification|notifications|do\s+not\s+disturb|focus|focus\s+assist)\b", "ms-settings:notifications"),
             (r"\b(bluetooth|bt|pair\s+device|pairing)\b", "ms-settings:bluetooth"),
             (r"\b(wi-?fi|wifi|wireless)\b", "ms-settings:network-wifi"),
@@ -407,30 +713,190 @@ class LLMAdapter:
                 break
 
         if ms_uri:
+            # Special-case: brightness and energy saver can be applied automatically
+            # via explicit device actions.
+            if ms_uri == "ms-settings:display" and re.search(r"\bbrightness\b", t):
+                # Try to infer an absolute target (0-100) or a small delta.
+                target = None
+                delta = None
+                m = re.search(r"\bbrightness\b[^\d]{0,15}(\d{1,3})\s*%?\b", t)
+                if m:
+                    try:
+                        target = int(m.group(1))
+                    except Exception:
+                        target = None
+                if target is None:
+                    m2 = re.search(r"\b(\d{1,3})\s*%?\b[^\n]{0,20}\bbrightness\b", t)
+                    if m2:
+                        try:
+                            target = int(m2.group(1))
+                        except Exception:
+                            target = None
+                if target is not None:
+                    target = max(0, min(100, target))
+                else:
+                    if re.search(r"\b(increase|raise|turn\s+up|brighter|up)\b", t):
+                        delta = 10
+                    elif re.search(r"\b(decrease|lower|turn\s+down|dimmer|down)\b", t):
+                        delta = -10
+
+                if target is not None or delta is not None:
+                    # Remove any prior settings openers / brightness shell commands.
+                    filtered = []
+                    for a in actions:
+                        if not isinstance(a, dict):
+                            continue
+                        if a.get("type") != "execute_command":
+                            filtered.append(a)
+                            continue
+                        cmd = str(a.get("command") or "").strip().lower()
+                        if "ms-settings:" in cmd:
+                            continue
+                        if "brightness" in cmd or "nircmd" in cmd:
+                            continue
+                        filtered.append(a)
+                    actions = filtered
+
+                    if target is not None:
+                        actions.append(_wrap_device_action("set_brightness", {"value": target}))
+                        parsed["text"] = (parsed.get("text") or "" ).strip() or f"Setting brightness to {target}%."
+                    else:
+                        actions.append(_wrap_device_action("set_brightness", {"delta": int(delta)}))
+                        parsed["text"] = (parsed.get("text") or "" ).strip() or ("Increasing brightness." if delta > 0 else "Decreasing brightness.")
+
+                    parsed["actions"] = actions
+                    return parsed
+
+            if ms_uri == "ms-settings:sound" and re.search(r"\b(volume|mute|unmute|sound)\b", t):
+                # Volume/mute are low-risk quality-of-life controls; emit explicit device actions.
+                wants_unmute = bool(re.search(r"\b(unmute|sound\s+on|turn\s+on\s+sound)\b", t))
+                wants_mute = bool(re.search(r"\b(mute|silence|turn\s+off\s+sound)\b", t)) and not wants_unmute
+
+                target = None
+                delta = None
+                m = re.search(r"\bvolume\b[^\d]{0,15}(\d{1,3})\s*%?\b", t)
+                if m:
+                    try:
+                        target = int(m.group(1))
+                    except Exception:
+                        target = None
+                if target is None:
+                    m2 = re.search(r"\b(\d{1,3})\s*%?\b[^\n]{0,20}\bvolume\b", t)
+                    if m2:
+                        try:
+                            target = int(m2.group(1))
+                        except Exception:
+                            target = None
+
+                if target is not None:
+                    target = max(0, min(100, target))
+                else:
+                    if re.search(r"\b(increase|raise|turn\s+up|louder|up)\b", t):
+                        delta = 10
+                    elif re.search(r"\b(decrease|lower|turn\s+down|quieter|down)\b", t):
+                        delta = -10
+
+                if wants_mute or wants_unmute or target is not None or delta is not None:
+                    filtered = []
+                    for a in actions:
+                        if not isinstance(a, dict):
+                            continue
+                        if a.get("type") != "execute_command":
+                            filtered.append(a)
+                            continue
+                        cmd = str(a.get("command") or "").strip().lower()
+                        if "ms-settings:" in cmd:
+                            continue
+                        if "volume" in cmd or "nircmd" in cmd:
+                            continue
+                        filtered.append(a)
+                    actions = filtered
+
+                    if wants_mute or wants_unmute:
+                        actions.append(_wrap_device_action("set_mute", {"muted": bool(wants_mute)}))
+                        base_text = (parsed.get("text") or "").strip()
+                        if not base_text:
+                            parsed["text"] = "Muting system volume." if wants_mute else "Unmuting system volume."
+
+                    if target is not None:
+                        actions.append(_wrap_device_action("set_volume", {"value": target}))
+                        parsed["text"] = (parsed.get("text") or "").strip() or f"Setting volume to {target}%."
+                    elif delta is not None:
+                        actions.append(_wrap_device_action("set_volume", {"delta": int(delta)}))
+                        parsed["text"] = (parsed.get("text") or "").strip() or ("Increasing volume." if delta > 0 else "Decreasing volume.")
+
+                    parsed["actions"] = actions
+                    return parsed
+
+            if re.search(r"\b(energy\s*saver|battery\s*saver)\b", t):
+                wants_on = bool(re.search(r"\b(turn\s+on|enable|activate)\b", t))
+                wants_off = bool(re.search(r"\b(turn\s+off|disable|deactivate)\b", t))
+                if wants_on or wants_off:
+                    plan = "power saver" if wants_on else "balanced"
+                    filtered = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "execute_command" and "ms-settings:" in str(a.get("command") or "").lower())]
+                    filtered.append(_wrap_device_action("set_power_plan", {"plan": plan}))
+                    parsed["actions"] = filtered
+                    base_text = (parsed.get("text") or "").strip()
+                    msg = "Turning on Energy Saver (Power saver plan)." if wants_on else "Turning off Energy Saver (Balanced plan)."
+                    parsed["text"] = base_text or msg
+                    return parsed
+
+            # Wi-Fi toggle (best-effort on Windows; agent may fall back to opening Settings).
+            if ms_uri == "ms-settings:network-wifi" and re.search(r"\b(wi-?fi|wifi|wireless)\b", t):
+                wants_on = bool(re.search(r"\b(turn\s+on|enable|connect)\b", t))
+                wants_off = bool(re.search(r"\b(turn\s+off|disable|disconnect)\b", t))
+                if wants_on or wants_off:
+                    filtered = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "execute_command" and "ms-settings:" in str(a.get("command") or "").lower())]
+                    filtered.append(_wrap_device_action("set_wifi", {"enabled": bool(wants_on)}))
+                    parsed["actions"] = filtered
+                    base_text = (parsed.get("text") or "").strip()
+                    parsed["text"] = base_text or ("Turning Wi-Fi on." if wants_on else "Turning Wi-Fi off.")
+                    return parsed
+
+            # Bluetooth toggle (best-effort on Windows; agent may fall back to opening Settings).
+            if ms_uri == "ms-settings:bluetooth" and re.search(r"\b(bluetooth|bt)\b", t):
+                wants_on = bool(re.search(r"\b(turn\s+on|enable)\b", t))
+                wants_off = bool(re.search(r"\b(turn\s+off|disable)\b", t))
+                if wants_on or wants_off:
+                    filtered = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "execute_command" and "ms-settings:" in str(a.get("command") or "").lower())]
+                    filtered.append(_wrap_device_action("set_bluetooth", {"enabled": bool(wants_on)}))
+                    parsed["actions"] = filtered
+                    base_text = (parsed.get("text") or "").strip()
+                    parsed["text"] = base_text or ("Turning Bluetooth on." if wants_on else "Turning Bluetooth off.")
+                    return parsed
+
+            # Night Light: Windows doesn't provide a stable official CLI toggle.
+            # We open Display settings (safe) and can optionally open quick settings for a faster toggle.
+            if ms_uri == "ms-settings:display" and re.search(r"\bnight\s*light\b", t):
+                wants_on = bool(re.search(r"\b(turn\s+on|enable)\b", t))
+                wants_off = bool(re.search(r"\b(turn\s+off|disable)\b", t))
+                if wants_on or wants_off:
+                    filtered = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "execute_command" and "ms-settings:" in str(a.get("command") or "").lower())]
+                    filtered.append(_wrap_device_action("open_settings", {"uri": "ms-settings:display"}))
+                    # Also try opening quick settings (Win+A) to make toggling faster.
+                    filtered.append(_wrap_device_action("open_quick_settings", {}))
+                    parsed["actions"] = filtered
+                    base_text = (parsed.get("text") or "").strip()
+                    parsed["text"] = base_text or "Opening settings to toggle Night light."
+                    return parsed
+
+            # Do Not Disturb / Focus Assist: no stable official CLI toggle across Windows versions.
+            # Open Notifications settings and (optionally) quick settings.
+            if ms_uri == "ms-settings:notifications" and re.search(r"\b(do\s+not\s+disturb|dnd|focus\s+assist|quiet\s+hours)\b", t):
+                wants_on = bool(re.search(r"\b(turn\s+on|enable)\b", t))
+                wants_off = bool(re.search(r"\b(turn\s+off|disable)\b", t))
+                if wants_on or wants_off:
+                    filtered = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "execute_command" and "ms-settings:" in str(a.get("command") or "").lower())]
+                    filtered.append(_wrap_device_action("open_settings", {"uri": "ms-settings:notifications"}))
+                    filtered.append(_wrap_device_action("open_quick_settings", {}))
+                    parsed["actions"] = filtered
+                    base_text = (parsed.get("text") or "").strip()
+                    parsed["text"] = base_text or "Opening settings to toggle Do Not Disturb / Focus Assist."
+                    return parsed
+
+            # Default behavior: open the relevant Settings page.
             # Using cmd's start with an empty title is the most reliable form.
             actions.append({"type": "execute_command", "command": f'start "" "{ms_uri}"', "wait": False})
-            # Special-case: brightness changes are intentionally user-guided. If the model
-            # hallucinated a CLI command like "brightness increase", remove it.
-            if ms_uri == "ms-settings:display" and re.search(r"\bbrightness\b", t):
-                filtered = []
-                for a in actions:
-                    if not isinstance(a, dict):
-                        continue
-                    if a.get("type") != "execute_command":
-                        filtered.append(a)
-                        continue
-                    cmd = str(a.get("command") or "")
-                    cl = cmd.strip().lower()
-                    if "ms-settings:" in cl:
-                        filtered.append(a)
-                        continue
-                    # Drop only brightness-related shell attempts.
-                    if re.search(r"\bbrightness\b", cl):
-                        continue
-                    if re.match(r"^\s*brightness\b", cl):
-                        continue
-                    filtered.append(a)
-                actions = filtered
 
             parsed["actions"] = actions
 
@@ -439,7 +905,7 @@ class LLMAdapter:
             # Keep the assistant honest: opening Settings isn't the same as changing the value.
             wants_toggle = bool(re.search(r"\b(turn\s+on|turn\s+off|enable|disable)\b", t))
             if ms_uri == "ms-settings:display" and re.search(r"\bbrightness\b", t):
-                msg = "Opening Display settings so you can adjust brightness."
+                msg = "Opening Display settings."
             elif wants_toggle:
                 msg = "Opening Settings for that change. Tell me what you see and I’ll guide the safest steps."
             else:
@@ -563,6 +1029,17 @@ class LLMAdapter:
                 continue
             t = (a.get("type") or "").strip()
 
+            # Avoid accidental screenshots unless the user explicitly requested it.
+            # This covers universal device actions like: {"type":"device_action","name":"save_screenshot"}.
+            if t == "device_action":
+                nm = str((a.get("name") or a.get("action") or "")).strip().lower()
+                if nm in ("save_screenshot", "screenshot"):
+                    ut = (user_text or "").strip().lower()
+                    explicit = bool(re.search(r"\b(screenshot|screen\s*shot|capture\s+screen|take\s+(a\s+)?screenshot)\b", ut))
+                    if not explicit:
+                        blocked.append({"type": t, "reason": "screen_capture_not_explicit"})
+                        continue
+
             # Never allow destructive commands.
             if t == "execute_command":
                 cmd = a.get("command") or ""
@@ -606,6 +1083,29 @@ class LLMAdapter:
         return parsed
 
     @staticmethod
+    def _is_research_status_question(user_text: str) -> bool:
+        """Return True when the user is asking about *our* research task status.
+
+        Examples:
+        - "did you finish the research"
+        - "do you completed research" (common voice grammar)
+        - "what's the research status"
+        """
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            return False
+
+        # Avoid accidental web searches for internal state questions.
+        return bool(
+            re.search(
+                r"\b(?:did|do|have|has|are|is)\s+(?:you\s+)?(?:already\s+)?"
+                r"(?:complete|completed|finish|finished|done)\s+(?:the\s+)?research\b",
+                tl,
+            )
+            or re.search(r"\b(?:research)\s+(?:status|progress|update)\b", tl)
+        )
+
+    @staticmethod
     def _should_use_web_lookup(user_text: str) -> bool:
         """Heuristic policy: only use web tools when truly needed.
 
@@ -614,6 +1114,11 @@ class LLMAdapter:
         """
         t = (user_text or "").strip().lower()
         if not t:
+            return False
+
+        # If the user is asking whether *we* completed a research task, this is internal state,
+        # not an internet lookup.
+        if LLMAdapter._is_research_status_question(user_text):
             return False
 
         # High-level analysis doesn't always need web (many prompts are conceptual).
@@ -798,6 +1303,10 @@ class LLMAdapter:
             t = (user_text or "").strip()
             tl = t.lower()
 
+            # Never web-search for internal research task status.
+            if LLMAdapter._is_research_status_question(user_text):
+                return parsed
+
             # This adapter is used both for user prompts and internal orchestration prompts.
             # Never force a new web_search for internal "use provided web context" prompts.
             if tl.startswith("you are ") or ("provided web context" in tl):
@@ -820,6 +1329,17 @@ class LLMAdapter:
 
             query = t
             if query:
+                # If the user explicitly asked to "research X", extract X (avoid searching for the word "research").
+                try:
+                    m = re.search(
+                        r"(?i)\b(?:do\s+research|make\s+research|perform\s+research|deep\s+research|research)\b\s*(?:about|on|regarding)?\s*(.+)$",
+                        query,
+                    )
+                    if m and (m.group(1) or "").strip():
+                        query = (m.group(1) or "").strip()
+                except Exception:
+                    pass
+
                 # Remove common "must look it up online" directives and similar boilerplate.
                 query = re.sub(r"(?i)\byou\s+must\b[\s\S]*$", "", query).strip()
                 query = re.sub(
@@ -848,6 +1368,9 @@ class LLMAdapter:
                     "the","a","an","and","or","to","of","for","in","on","with","this","that","today","now","as","is","are","was","were",
                     "must","please","include","provide","sources","source","links","link","look","up","online","from","internet","summarize","summary",
                     "analyze","analysis","scenarios","scenario","bull","bear","base","current","trend","drivers","risks","assumptions",
+                    # Research-request boilerplate (avoid biasing searches toward "research methodology")
+                    "research","researching","perform","performing","make","making","do","doing","talking","mean","update","yourself","myself","better","version","proper","results","result","notes",
+                    "about","regarding",
                 }
                 toks = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if t and t not in stop]
                 if toks:
@@ -863,7 +1386,7 @@ class LLMAdapter:
         except Exception:
             return parsed
 
-    async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None):
+    async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
         """Generate a rich, humanlike structured response."""
         # Deterministic voice mode: handle simple commands without relying on LLM.
         try:
@@ -894,9 +1417,9 @@ class LLMAdapter:
         # will still run, and backend will synthesize if continuation fails).
         try:
             tl = (text or "").strip().lower()
-            offline_analysis = (os.getenv("JARVIS_OFFLINE_ANALYSIS") or "").strip().lower() in {"1", "true", "yes", "on"}
-            offline_only = (os.getenv("JARVIS_OFFLINE_ONLY") or "").strip().lower() in {"1", "true", "yes", "on"}
-            offline_web_only = (os.getenv("JARVIS_OFFLINE_WEB_ONLY") or "").strip().lower() in {"1", "true", "yes", "on"}
+            offline_analysis = bool(rd.OFFLINE_ANALYSIS)
+            offline_only = bool(rd.OFFLINE_ONLY)
+            offline_web_only = bool(rd.OFFLINE_WEB_ONLY)
 
             is_internal = tl.startswith("you are ") or ("provided web context" in tl)
             if not is_internal:
@@ -913,7 +1436,7 @@ class LLMAdapter:
 
                 # Also bypass OpenAI when there's no key configured, but only for
                 # web-required high-level questions (keeps local automation usable).
-                if (not self.primary_key) and self._should_use_web_lookup(text) and self._is_high_level_analysis_task(text):
+                if (not self.primary_key and not self.backup_key) and self._should_use_web_lookup(text) and self._is_high_level_analysis_task(text):
                     parsed = {"text": "Looking it up online.", "actions": []}
                     try:
                         parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
@@ -926,13 +1449,117 @@ class LLMAdapter:
             # Never break response generation due to offline toggle logic.
             pass
 
-        persona = self.personality.get(self.persona, self.personality["formal-gentle"])
+        # Chat-mode research: when the user explicitly requests research/sources or time-sensitive
+        # info, force the 2-pass web pipeline immediately (avoids answering from memory).
+        try:
+            tl = (text or "").strip().lower()
+            is_internal = tl.startswith("you are ") or ("provided web context" in tl)
+            if not is_internal and (mode or "").lower() != "voice":
+                explicit_research = bool(
+                    re.search(
+                        r"\b(research|do\s+research|make\s+research|with\s+sources|with\s+citations|with\s+links|"
+                        r"sources?|citations?|cite|links?|look\s+up|lookup|online|from\s+the\s+internet|"
+                        r"latest|today|current|as\s+of)\b",
+                        tl,
+                    )
+                )
+                if explicit_research and self._should_use_web_lookup(text):
+                    parsed = {"text": "Researching online.", "actions": []}
+                    try:
+                        parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
+                    except Exception:
+                        pass
+                    if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list) and parsed["actions"]:
+                        parsed["source"] = "pre-web"
+                        return parsed
+        except Exception:
+            pass
+
+        # Persona may be overridden per-user.
+        persona_key = self.persona
+        try:
+            if isinstance(user_prefs, dict):
+                pk = (user_prefs.get("persona") or "").strip()
+                if pk in self.personality:
+                    persona_key = pk
+        except Exception:
+            pass
+
+        persona = self.personality.get(persona_key, self.personality["formal-gentle"])
         prefix = persona["prefix"]
         tone = persona["tone"]
 
         max_tokens, temperature = self._choose_generation_params(text=text, mode=mode)
+        max_tokens, temperature = self._apply_preference_overrides(max_tokens, temperature, mode=mode, user_prefs=user_prefs)
         caps = capabilities or []
         caps_str = ", ".join([str(c) for c in caps if c]) if isinstance(caps, (list, tuple)) else str(caps)
+
+        preferred_language = None
+        preferred_language_code = None
+        try:
+            if isinstance(user_prefs, dict):
+                preferred_language = (user_prefs.get("language") or user_prefs.get("language_name") or "").strip()
+                preferred_language_code = (user_prefs.get("language_code") or "").strip()
+        except Exception:
+            preferred_language = None
+            preferred_language_code = None
+
+        if not preferred_language_code and preferred_language:
+            if re.fullmatch(r"[a-zA-Z]{2}(-[a-zA-Z]{2})?", preferred_language):
+                preferred_language_code = preferred_language
+
+        skills_block = ""
+        try:
+            skills_block = self._skills_prompt_block()
+        except Exception:
+            skills_block = ""
+
+        # Optional: context-aware decision hints (and fast-path for high-confidence voice commands).
+        decision_hint = None
+        try:
+            dm = await self._ensure_decision_maker()
+            if dm is not None:
+                decision = await dm.decide_action(text, context=context or "")
+                if isinstance(decision, dict):
+                    # Keep the hint small; do not leak full PC profile into the prompt.
+                    parsed_intent = (decision.get("parsed_intent") or {}) if isinstance(decision.get("parsed_intent"), dict) else {}
+                    recommended = decision.get("recommended_action") if isinstance(decision.get("recommended_action"), dict) else None
+                    decision_hint = {
+                        "intent": parsed_intent.get("intent"),
+                        "target": parsed_intent.get("target"),
+                        "confidence": float(decision.get("confidence") or 0.0),
+                        "recommended_action": recommended,
+                    }
+
+                    # Fast-path: in voice mode, if the decision maker is very confident and
+                    # the action is safe/obvious, skip the LLM entirely.
+                    if (mode or "").lower() == "voice":
+                        conf = float(decision_hint.get("confidence") or 0.0)
+                        if conf >= float(rd.DECISION_FASTPATH_CONF):
+                            a = decision_hint.get("recommended_action")
+                            if isinstance(a, dict) and a.get("type") in {"open_app", "open_url", "web_search", "fetch_url"}:
+                                return {"text": "Okay.", "actions": [a], "source": "decision-maker"}
+        except Exception:
+            decision_hint = None
+
+        # If the assistant likely lacks knowledge (unknown/low-confidence intent), auto-search the web.
+        # This triggers the existing 2-pass web pipeline (search -> continue with web context).
+        try:
+            auto_unknown = bool(rd.AUTO_WEB_ON_UNKNOWN)
+            if auto_unknown and self._is_informational_question(text):
+                conf = 0.0
+                intent = None
+                if isinstance(decision_hint, dict):
+                    conf = float(decision_hint.get("confidence") or 0.0)
+                    intent = (decision_hint.get("intent") or "").strip().lower() if decision_hint.get("intent") else None
+                if (intent in {None, "", "unknown"} or conf < 0.35) and not self._should_use_web_lookup(text):
+                    parsed = {"text": "Looking it up online.", "actions": []}
+                    parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
+                    if parsed.get("actions"):
+                        parsed["source"] = "auto-web-unknown"
+                        return parsed
+        except Exception:
+            pass
 
         system_prompt = f"""
 You are Jarvis.
@@ -947,6 +1574,13 @@ You must respect strict per-user/device permissions; if a request targets a PC/d
     - If the user asks for *latest/current/today* info OR explicitly says to look it up online/from the internet OR asks for sources/citations/links, you MUST use web_search/fetch_url first and MUST NOT answer from memory.
     - If you do use web_search/fetch_url, do it FIRST (no other actions in the same response).
     - Only ask at most 1 clarifying question, only if it requires private/user-specific info that cannot be searched.
+    - For multi-step workflows, give a short step-by-step plan and ask for confirmation before executing risky steps.
+
+Language:
+- If a preferred language is set, respond in that language (unless the user asks otherwise).
+Preferred language: {preferred_language or '(not set)'}
+
+{skills_block if skills_block else ""}
 
 High-level tasks (analysis/research/strategy/market):
 - When the user asks for analysis, comparison, strategy, roadmap, or market/crypto outlook, prefer web_search/fetch_url first.
@@ -963,6 +1597,29 @@ Output rules:
 - JSON must be an object: {{"text": string, "actions": array}}.
 - If no action is needed, use an empty array.
 
+Device actions (preferred):
+- Prefer a single universal action envelope for PC/device control:
+    {{"type":"device_action","name":"<action_name>","args":{{...}}}}
+- Examples:
+    - Set volume: {{"type":"device_action","name":"set_volume","args":{{"value":30}}}}
+    - Mute: {{"type":"device_action","name":"set_mute","args":{{"muted":true}}}}
+    - Brightness: {{"type":"device_action","name":"set_brightness","args":{{"value":50}}}}
+    - Wi-Fi off: {{"type":"device_action","name":"set_wifi","args":{{"enabled":false}}}}
+    - Lock screen: {{"type":"device_action","name":"lock_screen","args":{{}}}}
+- Common supported device_action names (best-effort, may fall back to opening Settings on failure):
+    set_brightness, set_power_plan, set_volume, set_mute, set_wifi, set_bluetooth,
+    open_url, open_path, get_clipboard, set_clipboard, list_processes, kill_process,
+    show_desktop, open_task_manager, open_run_dialog, open_start_menu,
+    open_quick_settings, open_notification_center,
+    window_snap_left, window_snap_right, window_maximize, window_minimize,
+    media_play_pause, media_next_track, media_prev_track, media_stop,
+    open_settings, lock_screen, alt_tab, find_files, save_screenshot.
+- Destructive power actions MUST include args.confirm=true:
+    shutdown, restart, sleep, hibernate, logoff.
+
+Decision-making hints (non-binding, use if helpful):
+{json.dumps(decision_hint, ensure_ascii=False) if decision_hint else "(none)"}
+
     Current allowed capabilities (soft constraint): {caps_str if caps_str else '(not specified)'}
 
 Allowed action types (only include required fields):
@@ -977,6 +1634,33 @@ Allowed action types (only include required fields):
 - type_text: {{"type":"type_text","text":"...","interval":0.02}}
 - press_key: {{"type":"press_key","key":"enter","presses":1}}
 - hotkey: {{"type":"hotkey","keys":["ctrl","a"]}}
+- n8n_webhook: {{"type":"n8n_webhook","path":"your-webhook","method":"POST","payload":{{"key":"value"}}}}
+
+# Filesystem actions (project-relative paths only; never absolute):
+- read: {{"type":"read","path":"src/..."}}
+- list: {{"type":"list","path":"src/..."}}
+- mkdir: {{"type":"mkdir","path":"src/new_folder"}}
+- write: {{"type":"write","path":"src/file.txt","content":"..."}}
+- edit: {{"type":"edit","path":"src/file.txt","content":"..."}}
+- delete: {{"type":"delete","path":"src/file.txt"}}
+- move: {{"type":"move","path":"src/a.txt","dest":"src/b.txt"}}
+- copy: {{"type":"copy","source":"src/a.txt","destination":"src/b.txt"}}
+- cleanup: {{"type":"cleanup"}}
+
+# Screen actions (must be explicitly requested by the user):
+- capture_screen: {{"type":"capture_screen","region":{{"x":0,"y":0,"width":800,"height":600}}}}
+- screen_navigation: {{"type":"screen_navigation","command":"scroll|click|type_text|press_key|hotkey|read_screen|find_text|move_mouse|get_mouse_position", "text":"...", "x":0, "y":0}}
+
+# Task helpers:
+- create_task: {{"type":"create_task","description":"...","steps":["..."],"priority":5}}
+- stop_task: {{"type":"stop_task"}}
+- check_errors: {{"type":"check_errors"}}
+- fix_errors: {{"type":"fix_errors"}}
+
+# MCP tools (only when explicitly appropriate):
+- mcp_tool: {{"type":"mcp_tool","tool":"...","args":{{}}}}
+
+- set_mode: {{"type":"set_mode","mode":"learn|update|execute|analyze|develop|creative|interact"}}
 
 Safety rules for actions:
 - Prefer fewer actions.
@@ -1013,11 +1697,38 @@ Return ONLY valid JSON matching:
 """
 
         try:
-            start = datetime.utcnow()
-            response = await self._call_openai([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ], max_tokens=max_tokens, temperature=temperature)
+            start = datetime.now(timezone.utc)
+            chosen_model = self._choose_model_for_request(text=text, mode=mode)
+
+            provider_source = "openai"
+            try:
+                response = await self._call_openai(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    model=chosen_model,
+                    endpoint=self.primary_endpoint,
+                    api_key=self.primary_key,
+                )
+            except Exception as e_primary:
+                print(f"[LLM WARN] Primary provider failed: {e_primary}")
+                if not self.backup_key:
+                    raise
+                provider_source = "groq"
+                response = await self._call_openai(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    model=self.backup_model,
+                    endpoint=self.backup_endpoint,
+                    api_key=self.backup_key,
+                )
             content = response["choices"][0]["message"]["content"].strip()
 
             # Attempt to parse JSON safely
@@ -1047,6 +1758,32 @@ Return ONLY valid JSON matching:
             except Exception:
                 # never fail the response due to postprocessing
                 pass
+            try:
+                parsed = self._postprocess_email_clarification_actions(user_text=text, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = self._postprocess_ambiguous_type_text_actions(user_text=text, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = self._postprocess_missing_value_actions(user_text=text, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = self._postprocess_file_action_clarification(user_text=text, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = self._postprocess_research_clarification(user_text=text, parsed=parsed)
+            except Exception:
+                pass
+
+            # Generic clarification for under-specified requests (supports new intents).
+            try:
+                parsed = self._postprocess_generic_clarification(user_text=text, parsed=parsed)
+            except Exception:
+                pass
 
             # Post-process: treat follow-ups as continuations; avoid reopening apps and replace text safely.
             try:
@@ -1073,6 +1810,18 @@ Return ONLY valid JSON matching:
             except Exception:
                 pass
 
+            # Auto web fallback: if the model is uncertain and the user asked an informational question,
+            # trigger web_search so the 2-pass pipeline can answer with real sources.
+            try:
+                auto_web = bool(rd.AUTO_WEB_ON_UNCERTAINTY)
+                if auto_web and isinstance(parsed, dict):
+                    actions = parsed.get("actions")
+                    if (not actions) and self._looks_uncertain(parsed.get("text", "")) and self._is_informational_question(text):
+                        parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
+                        parsed["source"] = parsed.get("source") or "auto-web-uncertainty"
+            except Exception:
+                pass
+
             # Post-process: for common PC settings requests, open the right Settings page safely.
             try:
                 parsed = self._postprocess_pc_settings_actions(user_text=text, parsed=parsed)
@@ -1085,9 +1834,28 @@ Return ONLY valid JSON matching:
             except Exception:
                 pass
 
-            latency = (datetime.utcnow() - start).total_seconds()
+            # Final pass: de-duplicate actions (prevents repeated open_app, etc.).
+            try:
+                parsed["actions"] = self._dedupe_actions(parsed.get("actions") or [])
+            except Exception:
+                pass
+
+            # Attach emotion hint for UI (optional).
+            try:
+                if "emotion" not in parsed:
+                    parsed["emotion"] = self._infer_emotion(parsed.get("text") or text)
+            except Exception:
+                pass
+
+            try:
+                if "language" not in parsed and preferred_language_code:
+                    parsed["language"] = preferred_language_code
+            except Exception:
+                pass
+
+            latency = (datetime.now(timezone.utc) - start).total_seconds()
             parsed["latency"] = f"{latency:.2f}s"
-            parsed["source"] = "openai"
+            parsed["source"] = provider_source
 
             print(f"[LLM] {parsed}")
             return parsed
@@ -1155,6 +1923,26 @@ Return ONLY valid JSON matching:
                 except Exception:
                     pass
                 try:
+                    parsed = self._postprocess_email_clarification_actions(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+                try:
+                    parsed = self._postprocess_ambiguous_type_text_actions(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+                try:
+                    parsed = self._postprocess_missing_value_actions(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+                try:
+                    parsed = self._postprocess_file_action_clarification(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+                try:
+                    parsed = self._postprocess_research_clarification(user_text=text, parsed=parsed)
+                except Exception:
+                    pass
+                try:
                     parsed = self._postprocess_system_safety(user_text=text, parsed=parsed)
                 except Exception:
                     pass
@@ -1178,13 +1966,17 @@ Return ONLY valid JSON matching:
                 pass
 
             # Fallback humanlike reply
-            fallback_replies = [
-                "I'm thinking it through, one moment please.",
-                "Let me process that for you, sir.",
-                "I’m analyzing the best response — hang tight!",
-                "Working on it, boss."
-            ]
-            return {"text": random.choice(fallback_replies), "actions": [], "source": "fallback"}
+            # IMPORTANT: This is returned when the model call/parsing fails.
+            # Avoid "thinking..." style filler that looks like a pending response.
+            return {
+                "text": (
+                    "I couldn't generate a response right now (AI provider unavailable or misconfigured). "
+                    "Please try again in a moment. If this keeps happening, check your API key/network "
+                    "(env: OPENAI_API_KEY/PRIMARY_API_KEY; fallback: GROQ_API_KEY/BACKUP_API_KEY)."
+                ),
+                "actions": [],
+                "source": "fallback",
+            }
 
     @staticmethod
     def _postprocess_open_url_actions(user_text: str, parsed: dict) -> dict:
@@ -1399,6 +2191,26 @@ Return ONLY valid JSON matching:
                 parsed = LLMAdapter._postprocess_write_actions(user_text=user_text, parsed=parsed)
             except Exception:
                 pass
+            try:
+                parsed = LLMAdapter._postprocess_email_clarification_actions(user_text=user_text, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_ambiguous_type_text_actions(user_text=user_text, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_missing_value_actions(user_text=user_text, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_file_action_clarification(user_text=user_text, parsed=parsed)
+            except Exception:
+                pass
+            try:
+                parsed = LLMAdapter._postprocess_research_clarification(user_text=user_text, parsed=parsed)
+            except Exception:
+                pass
             return parsed
 
         if not target:
@@ -1465,6 +2277,15 @@ Return ONLY valid JSON matching:
             parsed["actions"] = actions
             return parsed
 
+        # If email intent is missing key details, ask a single clarifying question
+        # and avoid typing a vague placeholder into the editor.
+        if LLMAdapter._email_intent_needs_details(t_lower):
+            base_text = (parsed.get("text") or "").strip()
+            question = "What should the email be about, and who should it go to? If it’s HR, which company and which role?"
+            parsed["text"] = question if not base_text else (base_text + "\n\n" + question)
+            parsed["actions"] = actions
+            return parsed
+
         # Only do this for simple text editors (typing into UI makes sense).
         app_name = str(open_app.get("app_name") or "").strip().lower()
         is_text_editor = any(k in app_name for k in ("notepad", "wordpad", "textedit", "word", "winword"))
@@ -1478,8 +2299,14 @@ Return ONLY valid JSON matching:
             return parsed
 
         # Show the draft to the user AND type it into the opened app.
-        # Keep interval modest to reduce risk of missed keystrokes.
-        actions.append({"type": "type_text", "text": draft, "interval": 0.02})
+        # Keep interval conservative to reduce risk of missed keystrokes (especially for long drafts).
+        actions.append({
+            "type": "type_text",
+            "text": draft,
+            "interval": 0.05,
+            # Give the OS time to focus the newly opened window before typing.
+            "before_ms": 650,
+        })
         parsed["actions"] = actions
 
         # Ensure the user-facing text includes the draft (so it is visible even if typing fails).
@@ -1488,6 +2315,482 @@ Return ONLY valid JSON matching:
             parsed["text"] = (base_text + "\n\n" + draft).strip() if base_text else draft
 
         return parsed
+
+    @staticmethod
+    def _email_intent_needs_details(tl: str) -> bool:
+        if not re.search(r"\b(email|mail)\b", tl):
+            return False
+        if not re.search(r"\b(write|draft|compose|create|make|send)\b", tl):
+            return False
+
+        # If the user already provided quoted body text, assume sufficient detail.
+        if re.search(r"[\"\u201c\u201d][^\"\u201c\u201d]{8,}[\"\u201c\u201d]", tl):
+            return False
+
+        has_recipient = bool(
+            re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", tl)
+            or re.search(r"\b(to|for)\s+(hr|human\s+resources|recruiter|hiring\s+manager|team|manager|boss)\b", tl)
+        )
+
+        has_purpose = bool(
+            re.search(r"\b(about|regarding|re:|subject)\b", tl)
+            or re.search(
+                r"\b(apply|application|interview|leave|meeting|proposal|complaint|follow\s*up|thank\s*you|"
+                r"introduction|resume|cv|offer|invoice|payment|support|bug|issue|schedule|reschedule|"
+                r"appointment|statement|quotation|quote|estimate|project|partnership|collaboration|"
+                r"job|position|role|feedback)\b",
+                tl,
+            )
+        )
+
+        return not (has_recipient and has_purpose)
+
+    @staticmethod
+    def _postprocess_email_clarification_actions(user_text: str, parsed: dict) -> dict:
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            parsed["actions"] = actions
+            return parsed
+
+        if not LLMAdapter._email_intent_needs_details(tl):
+            parsed["actions"] = actions
+            return parsed
+
+        # Remove email generation/typing actions and ask for missing details.
+        filtered = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            at = str(a.get("type") or "").strip().lower()
+            if at in {"generate_email", "type_text"}:
+                continue
+            filtered.append(a)
+
+        base_text = (parsed.get("text") or "").strip()
+        question = "What should the email be about, and who should it go to? If it’s HR, which company and which role?"
+        parsed["text"] = question if not base_text else (base_text + "\n\n" + question)
+        parsed["actions"] = filtered
+        parsed["clarification"] = {
+            "kind": "email",
+            "question": question,
+            "original_user_text": user_text,
+        }
+        return parsed
+
+    @staticmethod
+    def _postprocess_missing_value_actions(user_text: str, parsed: dict) -> dict:
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+
+        if not actions:
+            parsed["actions"] = actions
+            return parsed
+
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            parsed["actions"] = actions
+            return parsed
+
+        def _ask(question: str, filtered_actions: list[dict]) -> dict:
+            base_text = (parsed.get("text") or "").strip()
+            parsed["text"] = question if not base_text else (base_text + "\n\n" + question)
+            parsed["actions"] = filtered_actions
+            parsed["clarification"] = {
+                "kind": "device_action",
+                "question": question,
+                "original_user_text": user_text,
+            }
+            return parsed
+
+        filtered: list[dict] = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            at = str(a.get("type") or "").strip().lower()
+            if at != "device_action":
+                filtered.append(a)
+                continue
+
+            name = str(a.get("name") or "").strip().lower()
+            args = a.get("args") if isinstance(a.get("args"), dict) else {}
+
+            if name in {"set_brightness", "adjust_brightness", "set_volume", "adjust_volume"}:
+                if "value" not in args:
+                    return _ask("What level should I set it to (0–100)?", filtered)
+            if name in {"set_power_plan", "set_energy_saver"}:
+                if "plan" not in args and "enabled" not in args:
+                    return _ask("Should I turn it on or off?", filtered)
+
+            filtered.append(a)
+
+        parsed["actions"] = filtered
+        return parsed
+
+    @staticmethod
+    def _postprocess_file_action_clarification(user_text: str, parsed: dict) -> dict:
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+
+        if not actions:
+            parsed["actions"] = actions
+            return parsed
+
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            parsed["actions"] = actions
+            return parsed
+
+        file_types = {"read", "list", "mkdir", "write", "edit", "delete", "move", "copy"}
+
+        def _ask(question: str, filtered_actions: list[dict]) -> dict:
+            base_text = (parsed.get("text") or "").strip()
+            parsed["text"] = question if not base_text else (base_text + "\n\n" + question)
+            parsed["actions"] = filtered_actions
+            parsed["clarification"] = {
+                "kind": "file_action",
+                "question": question,
+                "original_user_text": user_text,
+            }
+            return parsed
+
+        filtered: list[dict] = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            at = str(a.get("type") or "").strip().lower()
+            if at not in file_types:
+                filtered.append(a)
+                continue
+
+            path = str(a.get("path") or "").strip()
+            if at == "copy":
+                src = str(a.get("source") or "").strip()
+                dest = str(a.get("destination") or "").strip()
+                if not src or not dest:
+                    return _ask("Which file should I copy, and what is the destination path?", filtered)
+            elif at == "move":
+                dest = str(a.get("dest") or "").strip()
+                if not path or not dest:
+                    return _ask("Which file should I move, and what is the destination path?", filtered)
+            else:
+                if not path:
+                    if at == "list":
+                        return _ask("Which folder should I list?", filtered)
+                    if at == "mkdir":
+                        return _ask("What folder path should I create?", filtered)
+                    if at in {"read", "write", "edit", "delete"}:
+                        return _ask("Which file path should I use?", filtered)
+
+            filtered.append(a)
+
+        parsed["actions"] = filtered
+        return parsed
+
+    @staticmethod
+    def _postprocess_research_clarification(user_text: str, parsed: dict) -> dict:
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+
+        if not actions:
+            parsed["actions"] = actions
+            return parsed
+
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            parsed["actions"] = actions
+            return parsed
+
+        vague_queries = {"research", "market research", "market", "analysis", "summary"}
+
+        def _ask(question: str, filtered_actions: list[dict]) -> dict:
+            base_text = (parsed.get("text") or "").strip()
+            parsed["text"] = question if not base_text else (base_text + "\n\n" + question)
+            parsed["actions"] = filtered_actions
+            parsed["clarification"] = {
+                "kind": "research",
+                "question": question,
+                "original_user_text": user_text,
+            }
+            return parsed
+
+        filtered: list[dict] = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            at = str(a.get("type") or "").strip().lower()
+            if at not in {"web_search", "fetch_url"}:
+                filtered.append(a)
+                continue
+
+            query = ""
+            if at == "web_search":
+                query = str(a.get("query") or "").strip().lower()
+            if at == "fetch_url":
+                query = str(a.get("url") or "").strip().lower()
+
+            if not query or query in vague_queries or len(re.findall(r"[a-z0-9]+", query)) < 3:
+                if re.search(r"\b(research|market research|analysis|summary|report)\b", tl):
+                    return _ask("What topic should I research, and which region or time range?", filtered)
+
+            filtered.append(a)
+
+        parsed["actions"] = filtered
+        return parsed
+
+    @staticmethod
+    def _postprocess_generic_clarification(user_text: str, parsed: dict) -> dict:
+        """Ask one clarifying question when the request is under-specified.
+
+        This is intentionally intent-agnostic so the assistant can support new
+        intents without hard-coding a small list.
+
+        Triggers only when:
+        - no actions are proposed, AND
+        - we don't already have a more specific clarification, AND
+        - the user text looks vague / underspecified.
+        """
+        try:
+            if not isinstance(parsed, dict):
+                return parsed
+
+            # If we already asked something specific, don't override.
+            if isinstance(parsed.get("clarification"), dict):
+                return parsed
+
+            actions = parsed.get("actions") or []
+            if isinstance(actions, list) and actions:
+                return parsed
+
+            t = (user_text or "").strip()
+            tl = t.lower()
+            if not tl:
+                return parsed
+
+            # Avoid triggering on normal informational questions.
+            if re.search(r"\b(what is|define|meaning of|explain)\b", tl):
+                return parsed
+
+            # Common vague phrases (especially from voice).
+            vague = bool(
+                re.fullmatch(r"(do it|do this|do that|same as before|like before|continue|go ahead)\.?", tl)
+                or re.search(r"\b(improve|make it better|make better|optimi[sz]e|enhance|fix it|update it)\b", tl)
+                or re.search(r"\b(improve yourself|better version|be better|give me proper results)\b", tl)
+            )
+
+            # If it's not obviously vague and has decent token content, let it be.
+            if not vague:
+                tok_count = len(re.findall(r"[a-z0-9]+", tl))
+                if tok_count >= 10:
+                    return parsed
+
+            out_text = str(parsed.get("text") or "").strip()
+            # If we already produced a long, concrete response, don't interrupt.
+            if out_text and len(out_text) > 240 and not out_text.endswith("?"):
+                return parsed
+
+            if vague:
+                question = (
+                    "To make sure I do exactly what you want: what is the specific outcome you want, "
+                    "and are there any constraints (time range/region/output format)?"
+                )
+                parsed["text"] = question if not out_text else (out_text + "\n\n" + question)
+                parsed["actions"] = []
+                parsed["clarification"] = {
+                    "kind": "generic",
+                    "question": question,
+                    "original_user_text": user_text,
+                }
+            return parsed
+        except Exception:
+            return parsed
+
+    @staticmethod
+    def _postprocess_ambiguous_type_text_actions(user_text: str, parsed: dict) -> dict:
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+
+        if not actions:
+            parsed["actions"] = actions
+            return parsed
+
+        t = (user_text or "").strip()
+        tl = t.lower()
+        if not tl:
+            parsed["actions"] = actions
+            return parsed
+
+        # If user provided quoted content, assume they gave explicit text.
+        if re.search(r"[\"\u201c\u201d][^\"\u201c\u201d]{3,}[\"\u201c\u201d]", t):
+            parsed["actions"] = actions
+            return parsed
+
+        # If user clearly specified a short literal after type/write, allow it.
+        literal_match = re.search(r"\b(type|write)\b\s+(.+)$", tl)
+        if literal_match:
+            remainder = re.sub(r"[\.!?]+$", "", literal_match.group(2)).strip()
+            words = re.findall(r"[a-z0-9']+", remainder)
+            if 1 <= len(words) <= 3 and not re.search(r"\b(email|report|summary|essay|letter|proposal|resume|cv)\b", remainder):
+                parsed["actions"] = actions
+                return parsed
+
+        # Heuristic: if type_text is just echoing the instruction, ask for details.
+        stop = {"a","an","the","to","for","of","and","or","please","jarvis","hey","write","type","draft","compose","create","make"}
+
+        def _word_set(s: str) -> set[str]:
+            return {w for w in re.findall(r"[a-z0-9']+", s.lower()) if w and w not in stop}
+
+        user_words = _word_set(tl)
+
+        filtered: list[dict] = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            at = str(a.get("type") or "").strip().lower()
+            if at != "type_text":
+                filtered.append(a)
+                continue
+
+            text = str(a.get("text") or "").strip()
+            if not text:
+                continue
+
+            action_words = _word_set(text)
+            overlap = (len(action_words & user_words) / max(1, len(user_words))) if user_words else 0
+
+            looks_instructional = bool(
+                re.search(r"\b(email|report|summary|proposal|letter|resume|cv|application)\b", text.lower())
+                or re.search(r"\b(write|draft|compose|create|make)\b", text.lower())
+            )
+
+            if looks_instructional and (overlap >= 0.6 or len(text) <= 60):
+                return {
+                    **parsed,
+                    "text": ((parsed.get("text") or "").strip() + "\n\n" if parsed.get("text") else "")
+                    + "What should I write exactly? You can dictate the content or share key bullet points.",
+                    "actions": filtered,
+                }
+
+            filtered.append(a)
+
+        parsed["actions"] = filtered
+        return parsed
+
+    @staticmethod
+    def _dedupe_actions(actions: list) -> list:
+        """Remove obvious duplicates while preserving order.
+
+        Primary goal: prevent repeated open_app (e.g., notepad twice) when postprocessors
+        convert/augment actions.
+        """
+        if not isinstance(actions, list) or not actions:
+            return [] if actions is None else (actions if isinstance(actions, list) else [])
+
+        out: list[dict] = []
+        seen: set[tuple] = set()
+
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            t = str(a.get("type") or "").strip().lower()
+            if not t:
+                continue
+
+            # Build a conservative de-dupe key.
+            if t in {"open_app", "close_app", "switch_app"}:
+                key = (t, str(a.get("app_name") or a.get("app") or "").strip().lower())
+            elif t == "open_url":
+                key = (t, str(a.get("url") or a.get("value") or "").strip().lower())
+            elif t == "execute_command":
+                key = (t, str(a.get("command") or "").strip().lower())
+            else:
+                # Do not over-dedupe editing actions; keep them.
+                key = None
+
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+
+            out.append(a)
+
+        return out
+
+    def _load_skills(self) -> list[dict]:
+        """Load skills from MongoDB (preferred) or data/skills.json (cached)."""
+        try:
+            skills = self._get_skills_catalog()
+            if skills:
+                return skills
+        except Exception:
+            pass
+        try:
+            root = Path(__file__).resolve().parents[2]
+            skills_path = root / "data" / "skills.json"
+            if not skills_path.exists():
+                return []
+            mtime = skills_path.stat().st_mtime
+            if self._skills_cache is not None and mtime <= self._skills_cache_mtime:
+                return self._skills_cache
+
+            raw = skills_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            skills = [s for s in (data or []) if isinstance(s, dict) and s.get("enabled", True)]
+            self._skills_cache = skills
+            self._skills_cache_mtime = mtime
+            return skills
+        except Exception:
+            return []
+
+    def _skills_prompt_block(self) -> str:
+        skills = self._load_skills()
+        if not skills:
+            return ""
+        lines = ["Available skills (call via n8n_webhook):"]
+        for s in skills[:12]:
+            name = str(s.get("name") or "").strip()
+            desc = str(s.get("description") or "").strip()
+            path = str(s.get("path") or "").strip()
+            inputs = s.get("inputs") or {}
+            if not name or not path:
+                continue
+            if isinstance(inputs, dict) and inputs:
+                lines.append(f"- {name}: {desc} (path: {path}, inputs: {', '.join(inputs.keys())})")
+            else:
+                lines.append(f"- {name}: {desc} (path: {path})")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _get_skills_catalog() -> list[dict]:
+        try:
+            db._ensure_connected()
+            if db.db is None:
+                return []
+            col = db.db["skills"]
+            skills = list(col.find({"enabled": True}, {"_id": 0}).sort("name", 1))
+            return [s for s in skills if isinstance(s, dict)]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _infer_emotion(text: str) -> str:
+        t = (text or "").lower()
+        if re.search(r"\b(error|fail|cannot|critical|danger|urgent|blocked|forbidden)\b", t):
+            return "critical"
+        if re.search(r"\b(thank|great|awesome|nice|good job|love it)\b", t):
+            return "warm"
+        if re.search(r"\b(analyz|analysis|research|thinking|processing|investigate)\b", t):
+            return "analyzing"
+        if re.search(r"\b(open|launch|execute|run|action|doing|working)\b", t):
+            return "action"
+        return "calm"
 
     @staticmethod
     def _postprocess_followup_edit_actions(user_text: str, context: str, parsed: dict) -> dict:

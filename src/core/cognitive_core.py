@@ -19,7 +19,6 @@ except Exception:
 import queue
 import threading
 from src.utils.db import db
-from src.config.config import Config
 
 class CognitiveMode(Enum):
     DEVELOP = "develop"    # Self-improvement and system development mode

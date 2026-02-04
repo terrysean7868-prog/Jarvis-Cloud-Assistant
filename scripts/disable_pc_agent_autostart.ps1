@@ -12,4 +12,4 @@ if (-not (Test-Path $uninstall)) {
 
 powershell -NoProfile -ExecutionPolicy Bypass -File $uninstall -TaskName $TaskName | Out-Host
 Write-Host "PC agent will NOT auto-start at Windows login." -ForegroundColor Green
-Write-Host "Start it manually with run_pc_agent.bat when needed." -ForegroundColor Green
+Write-Host "Start it manually with dist\JarvisPCAgent.exe (or python pc_agent.py) when needed." -ForegroundColor Green

@@ -1,6 +1,6 @@
 // src/components/AuthModal.jsx
 import React, { useState, useEffect, useRef } from "react";
-import { listenOnce, speak } from "../utils/speech";
+import { listenOnce, speak, recordPcm16Once } from "../utils/speech";
 import { API_URL } from "../utils/api";
 import "./AuthModal.css";
 
@@ -74,9 +74,15 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
       if (audioDataRef.current?.stream) {
         audioDataRef.current.stream.getTracks().forEach(track => track.stop());
       }
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
+      const ctx = audioContextRef.current;
+      audioContextRef.current = null;
+      try {
+        if (ctx && ctx.state !== "closed") {
+          const p = ctx.close();
+          // Some browsers return a Promise; ignore rejections.
+          if (p && typeof p.then === "function") p.catch(() => {});
+        }
+      } catch {}
     };
   }, []);
 
@@ -110,6 +116,16 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
       const duration = 5000; // 5 seconds (more reliable speech-to-text)
       const startTime = Date.now();
       
+      // Capture a PCM16 sample for biometrics (server-side speaker verification).
+      // This is independent from STT/transcript hashing.
+      const pcmPromise = recordPcm16Once({
+        sampleRateHz: 16000,
+        maxMs: 5200,
+        silenceStopMs: 1100,
+        startRms: 0.012,
+        silenceRms: 0.009,
+      });
+
       // Start speech recognition (more stable across sessions than hashing raw audio)
       const transcriptPromise = listenOnce({
         timeout: 12000,
@@ -142,10 +158,16 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
             
             (async () => {
               try {
+                const pcm = await pcmPromise.catch(() => ({ audio_b64: null, sample_rate_hz: 16000 }));
                 const transcript = await transcriptPromise;
                 if (transcript && transcript.trim()) {
                   const hash = await createTextHash(transcript);
-                  resolve({ voice_hash: hash, voice_text: transcript });
+                  resolve({
+                    voice_hash: hash,
+                    voice_text: transcript,
+                    audio_b64: pcm?.audio_b64 || null,
+                    sample_rate_hz: pcm?.sample_rate_hz || 16000,
+                  });
                   return;
                 }
               } catch (e) {
@@ -160,10 +182,22 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
                 const hashBuffer = await crypto.subtle.digest('SHA-256', data);
                 const hashArray = Array.from(new Uint8Array(hashBuffer));
                 const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                resolve({ voice_hash: hash, voice_text: null });
+                const pcm = await pcmPromise.catch(() => ({ audio_b64: null, sample_rate_hz: 16000 }));
+                resolve({
+                  voice_hash: hash,
+                  voice_text: null,
+                  audio_b64: pcm?.audio_b64 || null,
+                  sample_rate_hz: pcm?.sample_rate_hz || 16000,
+                });
               } catch (err) {
                 console.error("Hash creation failed:", err);
-                resolve({ voice_hash: btoa(combined).substring(0, 64), voice_text: null });
+                const pcm = await pcmPromise.catch(() => ({ audio_b64: null, sample_rate_hz: 16000 }));
+                resolve({
+                  voice_hash: btoa(combined).substring(0, 64),
+                  voice_text: null,
+                  audio_b64: pcm?.audio_b64 || null,
+                  sample_rate_hz: pcm?.sample_rate_hz || 16000,
+                });
               }
             })();
           }
@@ -203,6 +237,8 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
           username: username.trim(),
           voice_sample_hash: voiceSample.voice_hash,
           voice_sample_text: voiceSample.voice_text,
+          audio_b64: voiceSample.audio_b64 || null,
+          sample_rate_hz: voiceSample.sample_rate_hz || 16000,
           action: mode,
           ...(role ? { role } : {})
         })

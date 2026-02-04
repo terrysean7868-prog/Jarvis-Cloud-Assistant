@@ -8,14 +8,26 @@ from openai import OpenAI
 from pathlib import Path
 from git import Repo
 
-# Get OpenAI API key from secret environment variable
-OPENAI_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_SECRET_KEY")
+from src.config import env
+from src.config.secrets import llm_secrets
+
+_client = None
 
 # System paths
 ROOT_DIR = Path(__file__).parent.parent
 MODULES_DIR = Path(__file__).parent
 
-client = OpenAI(api_key=OPENAI_KEY)
+def get_openai_client() -> OpenAI:
+    global _client
+    if _client is None:
+        api_key = llm_secrets().primary_api_key or (env.get("OPENAI_SECRET_KEY") or "").strip() or None
+        if not api_key:
+            raise RuntimeError("OpenAI API key not configured")
+        _client = OpenAI(api_key=api_key)
+    return _client
+
+
+client = None
 logger = logging.getLogger("jarvis.auto_update")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,7 +75,7 @@ def self_update(system_description: str) -> bool:
     """
     try:
         # Generate improvement code using AI
-        response = client.chat.completions.create(
+        response = get_openai_client().chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are an expert Python developer helping improve a Jarvis assistant."},
@@ -152,7 +164,7 @@ User request: {prompt}
 """
 
     try:
-        response = client.chat.completions.create(
+        response = get_openai_client().chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a Python code generator for Telegram modules."},

@@ -56,6 +56,12 @@ def test_should_use_web_lookup_true_for_high_level_analysis_with_sources():
     )
 
 
+def test_should_use_web_lookup_false_for_research_status_questions():
+    assert not LLMAdapter._should_use_web_lookup("do you completed research")
+    assert not LLMAdapter._should_use_web_lookup("did you finish the research?")
+    assert not LLMAdapter._should_use_web_lookup("research status")
+
+
 def test_app_manager_executes_ms_settings_via_explorer(monkeypatch):
     import src.utils.app_manager as am
 

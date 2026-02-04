@@ -51,29 +51,50 @@ class WebScraper:
         Returns:
             HTML content or None if fetch fails
         """
-        try:
-            await self.initialize()
-            
-            async with self.session.get(
-                url,
-                headers=self.headers,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-                ssl=False
-            ) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    logger.info(f"✅ Successfully fetched: {url}")
-                    return content
-                else:
-                    logger.warning(f"⚠️ Failed to fetch {url}: Status {response.status}")
+        max_retries = 2
+
+        def _should_retry(status_code: int) -> bool:
+            return status_code in (202, 429, 500, 502, 503, 504)
+
+        for attempt in range(max_retries + 1):
+            try:
+                await self.initialize()
+
+                async with self.session.get(
+                    url,
+                    headers=self.headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    ssl=False,
+                ) as response:
+                    if response.status == 200:
+                        content = await response.text()
+                        logger.info(f"Successfully fetched: {url}")
+                        return content
+
+                    logger.warning(f"Failed to fetch {url}: Status {response.status}")
+                    if attempt < max_retries and _should_retry(int(response.status)):
+                        delay = 0.6 * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
                     return None
-                    
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ Timeout fetching {url}")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Error fetching {url}: {str(e)}")
-            return None
+
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout fetching {url}")
+                if attempt < max_retries:
+                    delay = 0.6 * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                return None
+            except aiohttp.ClientError as e:
+                logger.warning(f"Network error fetching {url}: {str(e)}")
+                if attempt < max_retries:
+                    delay = 0.6 * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                return None
+            except Exception as e:
+                logger.error(f"Error fetching {url}: {str(e)}")
+                return None
     
     async def google_search(self, query: str, num_results: int = 5) -> List[Dict[str, str]]:
         """
@@ -94,6 +115,7 @@ class WebScraper:
             lite_url = f"https://lite.duckduckgo.com/lite/?q={quote(query, safe='')}"
             
             await self.initialize()
+            # Keep search fast; fetch_url already retries transient failures.
             html = await self.fetch_url(search_url, timeout=8)
             used_lite = False
 

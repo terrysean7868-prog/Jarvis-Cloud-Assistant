@@ -13,12 +13,17 @@ import {
   dispatchDeviceActions,
   grantDevicePermissions,
   googleSpeechToText,
+  secureVoiceToText,
   getAgentConfig,
-  API_URL
+  getTasks,
+  getSystemInfo,
+  API_URL,
+  getNotificationsWsUrl,
+  stopTask,
 } from "./utils/api";
 import "./styles/jarvis.css";
 import AuthModal from "./components/AuthModal";
-import AtomicBackground from "./components/AtomicBackground";
+import JarvisDashboard from "./components/JarvisDashboard";
 
 const scheduleIdle = (fn, timeout = 800) => {
   if (typeof window === "undefined") return setTimeout(fn, 0);
@@ -29,7 +34,6 @@ const scheduleIdle = (fn, timeout = 800) => {
 };
 
 // Lazy-load heavy UI pieces
-const HUDLogs = lazy(() => import("./components/HUDLogs"));
 const PermissionModal = lazy(() => import("./components/PermissionModal"));
 
 export default function App() {
@@ -60,13 +64,22 @@ export default function App() {
     }
   }, []);
 
+  const [preferredLanguage, setPreferredLanguage] = useState(() => {
+    try {
+      return localStorage.getItem("jarvis_language") || null;
+    } catch {
+      return null;
+    }
+  });
+
   const voiceLang = useMemo(() => {
     try {
-      return (navigator.language || "en-US").toString();
+      const preferred = (preferredLanguage || "").toString().trim();
+      return preferred || (navigator.language || "en-US").toString();
     } catch {
       return "en-US";
     }
-  }, []);
+  }, [preferredLanguage]);
 
   const googleSttEnabled = useMemo(() => {
     const raw = (typeof process !== "undefined" && process.env && process.env.REACT_APP_GOOGLE_SPEECH_ENABLED)
@@ -75,13 +88,55 @@ export default function App() {
     return ["1", "true", "yes", "y"].includes(raw.toLowerCase());
   }, []);
 
+  // Auto-enable speaker verification when the logged-in user has enrolled biometrics.
+  const [voiceBiometricsEnrolled, setVoiceBiometricsEnrolled] = useState(() => {
+    try {
+      return localStorage.getItem("jarvis_voice_biometrics_enrolled") === "1";
+    } catch {
+      return false;
+    }
+  });
+
+  const voiceBiometricsEnabled = !!voiceBiometricsEnrolled;
+  // Biometrics mode requires the secure server audio path (Google STT).
+  // If the UI hasn't enabled Google STT, gracefully fall back to WebSpeech
+  // instead of becoming unusable.
+  const voiceBiometricsActive = useMemo(() => {
+    return !!voiceBiometricsEnabled && !!googleSttEnabled;
+  }, [voiceBiometricsEnabled, googleSttEnabled]);
+
   // Light state only — avoid large objects in state
   const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
   const [wakePulse, setWakePulse] = useState(false);
-  const [logs, setLogs] = useState([]);
+  const [logs, setLogs] = useState(() => {
+    try {
+      const raw = sessionStorage.getItem("jarvis_logs_cache");
+      const parsed = raw ? JSON.parse(raw) : null;
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
   const [emotion, setEmotion] = useState("calm"); // calm|action|analyzing|critical
   const [volume, setVolume] = useState(0); // 0..1
+
+  const [themeColor, setThemeColor] = useState(() => {
+    try {
+      return localStorage.getItem("jarvis_theme_color") || "#00eaff";
+    } catch {
+      return "#00eaff";
+    }
+  });
+
+  const [tasks, setTasks] = useState([]);
+  const [agentToken, setAgentToken] = useState("");
+  const [agentSharedSecret, setAgentSharedSecret] = useState("");
+  const [agentServerUrl, setAgentServerUrl] = useState("");
+  const [agentWsUrl, setAgentWsUrl] = useState("");
+  const [agentCfgLoaded, setAgentCfgLoaded] = useState(false);
+  const [agentCfgError, setAgentCfgError] = useState(null);
+  const [systemInfo, setSystemInfo] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionId, setSessionId] = useState(null);
   const [username, setUsername] = useState(null);
@@ -91,8 +146,17 @@ export default function App() {
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
 
+  useEffect(() => {
+    const nm = (assistantName || "Jarvis").toString().trim() || "Jarvis";
+    try {
+      document.title = `${nm} - AI Assistant`;
+    } catch {}
+  }, [assistantName]);
+
   const googleSttDisabledUntilRef = useRef(0);
   const lastWakeNoSpeechLogRef = useRef(0);
+  const wakeDisabledUntilRef = useRef(0);
+  const wakePermissionHintedRef = useRef(false);
   const [voiceUnlocked, setVoiceUnlocked] = useState(() => !isMobile);
   const [vizAudioUnlocked, setVizAudioUnlocked] = useState(false);
 
@@ -105,16 +169,279 @@ export default function App() {
   const wakeSessionTimerRef = useRef(null);
   const assistantNameRef = useRef("Jarvis");
   const micStreamRef = useRef(null);
-  const pcAgentLoginPromptedSessionRef = useRef(null);
+  const notificationsWsRef = useRef(null);
+  const notificationsReconnectTimerRef = useRef(null);
+  const latestResearchTaskIdRef = useRef(null);
 
   useEffect(() => {
     speakingRef.current = !!speaking;
   }, [speaking]);
 
+  useEffect(() => {
+    try {
+      window.__jarvisPreferredLang = voiceLang;
+    } catch {}
+  }, [voiceLang]);
+
+  useEffect(() => {
+    const hex = (themeColor || "").toString().trim();
+    if (!/^#([0-9a-f]{6}|[0-9a-f]{3})$/i.test(hex)) return;
+
+    const normalize = (h) => {
+      const v = h.toLowerCase();
+      if (v.length === 4) {
+        return `#${v[1]}${v[1]}${v[2]}${v[2]}${v[3]}${v[3]}`;
+      }
+      return v;
+    };
+
+    const full = normalize(hex);
+    const r = parseInt(full.slice(1, 3), 16);
+    const g = parseInt(full.slice(3, 5), 16);
+    const b = parseInt(full.slice(5, 7), 16);
+    const glow = `rgba(${r}, ${g}, ${b}, 0.45)`;
+
+    try {
+      document.documentElement.style.setProperty("--jarvis-accent", full);
+      document.documentElement.style.setProperty("--jarvis-accent-glow", glow);
+    } catch {}
+
+    try {
+      localStorage.setItem("jarvis_theme_color", full);
+    } catch {}
+  }, [themeColor]);
+
   // Minimal log writer (memoized to avoid re-creating)
   const addLog = useCallback((type, message) => {
     setLogs(prev => [{ type, message, time: new Date().toLocaleTimeString() }, ...prev.slice(0, 12)]);
   }, []);
+
+  useEffect(() => {
+    try {
+      // Keep small, fast cache for refresh (session-only).
+      sessionStorage.setItem("jarvis_logs_cache", JSON.stringify(Array.isArray(logs) ? logs.slice(0, 20) : []));
+    } catch {}
+  }, [logs]);
+
+  // Realtime notifications (research completion, failures, etc.)
+  useEffect(() => {
+    if (!isAuthenticated || !sessionId) return;
+
+    let closedByCleanup = false;
+    let retry = 0;
+
+    const cleanup = () => {
+      closedByCleanup = true;
+      try {
+        if (notificationsReconnectTimerRef.current) {
+          clearTimeout(notificationsReconnectTimerRef.current);
+          notificationsReconnectTimerRef.current = null;
+        }
+      } catch {}
+      try {
+        if (notificationsWsRef.current) {
+          notificationsWsRef.current.onopen = null;
+          notificationsWsRef.current.onmessage = null;
+          notificationsWsRef.current.onerror = null;
+          notificationsWsRef.current.onclose = null;
+          notificationsWsRef.current.close();
+        }
+      } catch {}
+      notificationsWsRef.current = null;
+    };
+
+    const connect = () => {
+      const wsUrl = getNotificationsWsUrl(sessionId);
+      if (!wsUrl) return;
+
+      try {
+        const ws = new WebSocket(wsUrl);
+        notificationsWsRef.current = ws;
+
+        ws.onopen = () => {
+          retry = 0;
+          addLog("system", "Realtime notifications connected.");
+        };
+
+        ws.onmessage = (evt) => {
+          let msg = null;
+          try {
+            msg = JSON.parse(evt.data);
+          } catch {
+            return;
+          }
+
+          const type = (msg?.type || "").toString();
+          if (!type || type === "ping" || type === "ack") return;
+
+          if (type === "research_complete") {
+            const topic = (msg?.topic || "").toString();
+            const summary = (msg?.summary || "").toString();
+            const taskId = (msg?.task_id || "").toString();
+            if (taskId) latestResearchTaskIdRef.current = taskId;
+            addLog("response", `Research complete${topic ? `: ${topic}` : ""}.\n\n${summary}`);
+            return;
+          }
+
+          if (type === "research_failed") {
+            const topic = (msg?.topic || "").toString();
+            const err = (msg?.error || "").toString();
+            const taskId = (msg?.task_id || "").toString();
+            if (taskId) latestResearchTaskIdRef.current = taskId;
+            addLog("error", `Research failed${topic ? `: ${topic}` : ""}. ${err || ""}`.trim());
+            return;
+          }
+
+          if (type === "research_cancelled") {
+            const topic = (msg?.topic || "").toString();
+            addLog("system", `Research cancelled${topic ? `: ${topic}` : ""}.`);
+            return;
+          }
+
+          addLog("system", `${type}: ${JSON.stringify(msg)}`);
+        };
+
+        ws.onclose = (evt) => {
+          if (closedByCleanup) return;
+
+          // 1008 = policy violation (we use this for missing/invalid session_id)
+          if (evt && evt.code === 1008) {
+            addLog("system", "Realtime notifications disconnected (auth required). Please login again.");
+            return;
+          }
+
+          retry += 1;
+          const delay = Math.min(30000, 500 * Math.pow(2, Math.min(retry, 6)));
+          try {
+            if (notificationsReconnectTimerRef.current) clearTimeout(notificationsReconnectTimerRef.current);
+          } catch {}
+          notificationsReconnectTimerRef.current = setTimeout(connect, delay);
+        };
+      } catch {
+        // ignore
+      }
+    };
+
+    connect();
+    return cleanup;
+  }, [isAuthenticated, sessionId, addLog]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !sessionId) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        // Fast-path: hydrate from cache immediately.
+        try {
+          const raw = sessionStorage.getItem(`jarvis_agent_cfg_${sessionId}`);
+          const cached = raw ? JSON.parse(raw) : null;
+          if (cached && typeof cached === "object") {
+            setAgentToken((cached.agent_token || "").toString());
+            setAgentSharedSecret((cached.agent_shared_secret || "").toString());
+            setAgentServerUrl((cached.server_url || "").toString());
+            setAgentWsUrl((cached.ws_url || "").toString());
+          }
+        } catch {}
+
+        setAgentCfgError(null);
+        setAgentCfgLoaded(false);
+
+        // Passing device_id avoids an extra server-side DB lookup (owner -> device).
+        let preferredDeviceId = null;
+        try {
+          preferredDeviceId = localStorage.getItem("jarvis_device_id") || null;
+        } catch {}
+
+        const isAbort = (err) => {
+          const name = (err?.name || "").toString();
+          const msg = (err?.message || "").toString().toLowerCase();
+          return name === "AbortError" || msg.includes("aborted") || msg.includes("abort");
+        };
+
+        let cfg = null;
+        try {
+          cfg = await getAgentConfig(sessionId, preferredDeviceId, 6000);
+        } catch (e) {
+          // If cached device_id is stale/invalid, clear it and retry once without it.
+          if (e?.status === 400 && preferredDeviceId) {
+            try { localStorage.removeItem("jarvis_device_id"); } catch {}
+            cfg = await getAgentConfig(sessionId, null, 6000);
+          } else if (e?.status === 409) {
+            // Common first-run case: no device assigned yet.
+            // For bootstrap, retry against the default device id (matches backend default).
+            cfg = await getAgentConfig(sessionId, "primary", 6000);
+          } else if (isAbort(e)) {
+            // Slow startup / cold backend. Retry once with a longer timeout.
+            cfg = await getAgentConfig(sessionId, preferredDeviceId, 15000);
+          } else {
+            throw e;
+          }
+        }
+        if (cancelled) return;
+
+        const nextToken = (cfg?.agent_token || "").toString();
+        const nextSecret = (cfg?.agent_shared_secret || "").toString();
+        const nextServerUrl = (cfg?.server_url || "").toString();
+        const nextWsUrl = (cfg?.ws_url || "").toString();
+        setAgentToken(nextToken);
+        setAgentSharedSecret(nextSecret);
+        setAgentServerUrl(nextServerUrl);
+        setAgentWsUrl(nextWsUrl);
+        setAgentCfgLoaded(true);
+
+        try {
+          const did = (cfg?.device_id || "").toString().trim();
+          if (did) localStorage.setItem("jarvis_device_id", did);
+        } catch {}
+        try {
+          sessionStorage.setItem(`jarvis_agent_cfg_${sessionId}`, JSON.stringify({ agent_token: nextToken, agent_shared_secret: nextSecret }));
+        } catch {}
+      } catch (e) {
+        if (cancelled) return;
+        // Keep last known values to avoid UI blanking on slow networks.
+        const detailMsg = (typeof e?.detail === "string")
+          ? e.detail
+          : (e?.detail?.message || null);
+        const msg = detailMsg || e?.message || "Failed to load PC agent config";
+        setAgentCfgError(msg);
+
+        // Keep last known URLs if any.
+
+        // One-time, helpful log for common misconfig.
+        if (e?.status === 409) {
+          addLog("system", "PC agent config not ready. Click Connect PC Agent (and make sure JarvisPCAgent.exe (or python pc_agent.py) is running).");
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, sessionId, addLog]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let cancelled = false;
+
+    const load = async () => {
+      try {
+        const res = await getTasks(sessionId);
+        if (cancelled) return;
+        setTasks(Array.isArray(res?.tasks) ? res.tasks : []);
+      } catch {
+        if (cancelled) return;
+        setTasks([]);
+      }
+    };
+
+    load();
+    const id = setInterval(load, 4500);
+    return () => {
+      cancelled = true;
+      try { clearInterval(id); } catch {}
+    };
+  }, [isAuthenticated, sessionId]);
 
   const startWakeSessionWindow = useCallback(() => {
     const until = Date.now() + WAKE_SESSION_MS;
@@ -157,62 +484,68 @@ export default function App() {
     }
   }, []);
 
-  // Required flow:
-  // - On login, ask via popup if PC agent is started.
-  // - If user says Yes: establish connection (bind) if agent is online.
-  // - If user says No: do nothing; user can start agent using the .bat file.
+  const connectPcAgent = useCallback(async () => {
+    const sid = sessionId;
+    if (!sid) {
+      addLog("system", "Login required to connect PC agent.");
+      return;
+    }
+
+    try {
+      addLog("system", "Checking PC agent…");
+      const online = await isPcAgentOnline(sid);
+      if (!online) {
+        addLog("system", "PC agent is offline. Start JarvisPCAgent.exe (or python pc_agent.py), then try again.");
+        return;
+      }
+
+      addLog("system", "PC agent online. Establishing connection…");
+      const resp = await configureMyPc(sid);
+      try {
+        const did = (resp?.device_id || "").toString().trim();
+        if (did) localStorage.setItem("jarvis_device_id", did);
+      } catch {}
+      addLog("system", "PC agent connected.");
+    } catch {
+      addLog("system", "Could not establish connection. Try again.");
+    }
+  }, [sessionId, addLog, isPcAgentOnline]);
+
   useEffect(() => {
-    if (!isAuthenticated || !sessionId) return;
-    if (pcAgentLoginPromptedSessionRef.current === sessionId) return;
-    pcAgentLoginPromptedSessionRef.current = sessionId;
+    if (!isAuthenticated || !sessionId) {
+      setSystemInfo(null);
+      return;
+    }
 
     let cancelled = false;
-    const sid = sessionId;
-    const h = scheduleIdle(() => {
-      if (cancelled) return;
-      // Single popup: include agent token/secret in the SAME prompt so the
-      // user can copy them immediately (no second modal).
-      setPermissionPrompt({
-        title: "PC agent",
-        message: "Is PC agent started?",
-        details: "If Yes, Jarvis will establish connection. If No, start PC agent using run_pc_agent.bat (use the values below).",
-        kind: "pc_agent_login",
-        allowLabel: "Yes",
-        denyLabel: "No",
-        copyFields: [],
-      });
 
-      (async () => {
-        try {
-          if (!sid) return;
-          const cfg = await getAgentConfig(sid);
-          const token = (cfg?.agent_token || "").toString();
-          const shared = (cfg?.agent_shared_secret || "").toString();
-          if (!token && !shared) return;
+    // Fast-path: hydrate from cache immediately.
+    try {
+      const raw = sessionStorage.getItem(`jarvis_system_info_${sessionId}`);
+      const cached = raw ? JSON.parse(raw) : null;
+      if (cached && typeof cached === "object") setSystemInfo(cached);
+    } catch {}
 
-          // Only update if the same prompt is still open.
-          setPermissionPrompt((prev) => {
-            if (!prev || prev.kind !== "pc_agent_login") return prev;
-            return {
-              ...prev,
-              copyFields: [
-                token ? { label: "Agent token", value: token } : null,
-                shared ? { label: "Shared secret", value: shared } : null,
-              ].filter(Boolean),
-            };
-          });
-        } catch {
-          // ignore: popup still works without credentials
+    const poll = async () => {
+      try {
+        const info = await getSystemInfo(sessionId, 2500);
+        if (!cancelled) {
+          setSystemInfo(info);
+          try {
+            sessionStorage.setItem(`jarvis_system_info_${sessionId}`, JSON.stringify(info));
+          } catch {}
         }
-      })();
-    }, 350);
+      } catch {
+        // Local-only endpoint; ignore errors (cloud mode / permissions).
+        // Keep the last known values to avoid UI "blanking".
+      }
+    };
 
+    poll();
+    const t = setInterval(poll, 4000);
     return () => {
       cancelled = true;
-      try {
-        if (h && typeof window.cancelIdleCallback === "function") window.cancelIdleCallback(h);
-        else if (h) clearTimeout(h);
-      } catch {}
+      clearInterval(t);
     };
   }, [isAuthenticated, sessionId]);
 
@@ -376,7 +709,7 @@ export default function App() {
     if (isHandlingCommand.current) return;
     isHandlingCommand.current = true;
     setListening(true);
-    addLog("system", "Capturing command...");
+    addLog("system", voiceBiometricsActive ? "Verifying voice..." : "Capturing command...");
 
     // stop wake recognizer to avoid overlap
     try { wakeRecognizer.current?.stop(); } catch {}
@@ -399,6 +732,13 @@ export default function App() {
           silenceRms: 0.009,
         });
         if (!audio_b64) return null;
+
+        // When voice biometrics is enabled, require server-side verify+STT.
+        if (voiceBiometricsActive) {
+          const resp = await secureVoiceToText(sessionId, audio_b64, voiceLang, sample_rate_hz);
+          return (resp?.text || "").toString().trim() || null;
+        }
+
         const resp = await googleSpeechToText(sessionId, audio_b64, voiceLang, sample_rate_hz);
         return (resp?.text || "").toString().trim() || null;
       } catch (e) {
@@ -422,14 +762,18 @@ export default function App() {
 
     if (webSpeechSupported) {
       try {
-        // During wake-session, allow more time for the user to speak naturally.
-        transcript = await listenOnce({
-          timeout: inWakeSession ? (isMobile ? 20000 : 16000) : (isMobile ? 12000 : 9000),
-          silenceTimeoutMs: isIOS ? 1500 : 1100,
-          interim: false,
-          language: voiceLang,
-          maxAlternatives: 1
-        });
+        // In biometrics mode, we require the secure server audio path so that speaker identity is verified.
+        // WebSpeech doesn't provide raw audio to the backend, so we skip it.
+        if (!voiceBiometricsActive) {
+          // During wake-session, allow more time for the user to speak naturally.
+          transcript = await listenOnce({
+            timeout: inWakeSession ? (isMobile ? 20000 : 16000) : (isMobile ? 12000 : 9000),
+            silenceTimeoutMs: isIOS ? 1500 : 1100,
+            interim: false,
+            language: voiceLang,
+            maxAlternatives: 1
+          });
+        }
       } catch (err) {
         console.warn("listenOnce failed:", err);
       }
@@ -443,7 +787,10 @@ export default function App() {
 
     if (!transcript) {
       addLog("error", "No command received.");
-      if (!webSpeechSupported && !googleSttEnabled) {
+      if (voiceBiometricsEnabled && !voiceBiometricsActive) {
+        addLog("system", "Voice biometrics is enrolled, but secure voice transcription is disabled in the UI config.");
+        addLog("system", "Enable it by setting REACT_APP_GOOGLE_SPEECH_ENABLED=true (and configure Google STT on the server). Or disable biometrics enrollment.");
+      } else if (!webSpeechSupported && !googleSttEnabled) {
         addLog("system", "Speech-to-text is unavailable on this device.");
       }
       try { wakeRecognizer.current?.start(); } catch {}
@@ -451,8 +798,39 @@ export default function App() {
       return;
     }
 
+    // Only start/extend wake-session after we successfully captured a verified command.
+    // This prevents a non-owner speaker from "waking" the UI.
+    if (voiceBiometricsActive) {
+      startWakeSessionWindow();
+    }
+
     addLog("input", transcript);
     const textLower = transcript.toLowerCase();
+
+    // Cancel latest research task
+    if (/\b(cancel|stop)\s+(research|search)\b/i.test(textLower)) {
+      const taskId = latestResearchTaskIdRef.current;
+      if (!taskId) {
+        addLog("system", "No recent research task to cancel.");
+        try { speak("I don't have a recent research task to cancel."); } catch {}
+        try { wakeRecognizer.current?.start(); } catch {}
+        isHandlingCommand.current = false;
+        return;
+      }
+
+      try {
+        await stopTask(sessionId, taskId);
+        addLog("system", `Cancel requested for research task ${taskId}.`);
+        try { speak("Okay. Cancelling the research."); } catch {}
+      } catch (e) {
+        addLog("error", e?.message || String(e));
+        try { speak("I couldn't cancel that task."); } catch {}
+      }
+
+      try { wakeRecognizer.current?.start(); } catch {}
+      isHandlingCommand.current = false;
+      return;
+    }
 
     // End the wake-session early.
     if (/^(sleep|go to sleep|stop listening|stop|cancel|goodbye|bye|thanks\s+jarvis\s+stop)$/i.test(transcript.trim())) {
@@ -586,6 +964,10 @@ export default function App() {
       try {
         await setUserPreferences({ [key]: value }, sessionId, "merge");
         addLog("system", `Preference saved: ${key} = ${value}`);
+        if (key === "language" || key === "language_code") {
+          setPreferredLanguage(value);
+          localStorage.setItem("jarvis_language", value);
+        }
         speak(`Saved. Your ${rawKey} is set.`, () => {
           try { wakeRecognizer.current?.start(); } catch {}
           isHandlingCommand.current = false;
@@ -790,11 +1172,36 @@ export default function App() {
       const res = await sendMessage(transcript, "voice", sessionId);
       addLog("response", res.text || "No text returned.");
 
+      // Track latest research task id for cancellation UX
+      try {
+        if (res?.task_id) {
+          latestResearchTaskIdRef.current = String(res.task_id);
+        } else if (Array.isArray(res?.task_ids) && res.task_ids.length) {
+          latestResearchTaskIdRef.current = String(res.task_ids[res.task_ids.length - 1]);
+        } else if (Array.isArray(res?.action_results)) {
+          const lastWithTask = [...res.action_results].reverse().find(r => r && r.task_id);
+          if (lastWithTask?.task_id) latestResearchTaskIdRef.current = String(lastWithTask.task_id);
+        }
+        const t = (res.text || "").toString();
+        const m = t.match(/\(Task id:\s*(task_\d+)\)/i);
+        if (m && m[1]) latestResearchTaskIdRef.current = m[1];
+      } catch {}
+
       const tLower = (res.text || "").toLowerCase();
-      if (/\b(error|fail|cannot|no connection|critical|danger)\b/.test(tLower)) setEmotion("critical");
+      if (res?.emotion) {
+        setEmotion(String(res.emotion));
+      } else if (/\b(error|fail|cannot|no connection|critical|danger)\b/.test(tLower)) setEmotion("critical");
       else if (/\b(open|launch|execute|run|action)\b/.test(tLower)) setEmotion("action");
       else if (/\b(analyz|thinking|processing|research|search)\b/.test(tLower)) setEmotion("analyzing");
       else setEmotion("calm");
+
+      if (res?.language) {
+        const lang = String(res.language).trim();
+        if (lang) {
+          setPreferredLanguage(lang);
+          localStorage.setItem("jarvis_language", lang);
+        }
+      }
 
       setSpeaking(true);
       speak(res.text || "Done.", () => {
@@ -807,16 +1214,24 @@ export default function App() {
       // run any actions returned
       if (Array.isArray(res.actions) && res.actions.length) {
         const DEVICE_ACTION_TYPES = new Set([
+          "device_action",
           "open_app", "close_app", "switch_app",
           "execute_command",
+          "set_brightness", "adjust_brightness",
+          "set_power_plan", "set_energy_saver",
+          "set_volume", "adjust_volume",
+          "set_mute", "toggle_mute",
+          "capture_screen", "screen_navigation",
           "type_text", "press_key", "hotkey",
           "read", "list", "mkdir",
           "write", "edit", "delete", "move", "copy", "cleanup",
           "self_update", "self_add",
         ]);
 
+        const SERVER_ACTION_TYPES = new Set(["n8n_webhook"]);
+
         const deviceActions = res.actions.filter(a => DEVICE_ACTION_TYPES.has((a || {}).type));
-        const uiActions = res.actions.filter(a => !DEVICE_ACTION_TYPES.has((a || {}).type));
+        const uiActions = res.actions.filter(a => !DEVICE_ACTION_TYPES.has((a || {}).type) && !SERVER_ACTION_TYPES.has((a || {}).type));
 
         // If the backend returned device actions (e.g. open_app) and we're running hosted,
         // dispatch them to the connected PC agent.
@@ -833,16 +1248,21 @@ export default function App() {
             } catch (e) {
               const raw = e?.message || String(e);
 
-              // Try to parse FastAPI JSON error response embedded in the message.
+              // Prefer structured error detail if api.js attached it.
+              const structuredDetail = e?.detail;
+
+              // Fallback: parse FastAPI JSON error response embedded in the message.
               // api.js throws: "HTTP error! status: 403 - {\"detail\":{...}}" or "... - {\"detail\":\"...\"}"
               let parsed = null;
-              try {
-                const parts = raw.split(" - ");
-                const maybeJson = parts.length >= 2 ? parts.slice(1).join(" - ") : null;
-                parsed = maybeJson ? JSON.parse(maybeJson) : null;
-              } catch {}
+              if (!structuredDetail) {
+                try {
+                  const parts = raw.split(" - ");
+                  const maybeJson = parts.length >= 2 ? parts.slice(1).join(" - ") : null;
+                  parsed = maybeJson ? JSON.parse(maybeJson) : null;
+                } catch {}
+              }
 
-              const detail = parsed?.detail;
+              const detail = structuredDetail ?? parsed?.detail;
               const permDetail = (detail && typeof detail === "object") ? detail : null;
               const permMsg = (typeof detail === "string") ? detail : (permDetail?.message || null);
 
@@ -860,7 +1280,7 @@ export default function App() {
                   speak("Permission required. Please approve the popup.");
                 } catch {}
               } else if (permDetail?.message === "Device agent is not connected" || /device agent is not connected/i.test(String(permMsg || raw))) {
-                addLog("system", "PC agent is not connected. Start PC agent using run_pc_agent.bat and login again (then click Yes).");
+                addLog("system", "PC agent is not connected. Start JarvisPCAgent.exe (or python pc_agent.py) and login again (then click Yes).");
                 try { speak("PC agent is not connected. Start it and login again."); } catch {}
               } else if (/no device assigned to this user/i.test(String(permMsg || raw))) {
                 addLog("system", "PC is not configured. Login again and click Yes when asked about PC agent.");
@@ -897,7 +1317,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled]);
+  }, [sessionId, addLog, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow]);
 
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
@@ -916,16 +1336,33 @@ export default function App() {
 
     let active = false;
     let startAttempts = 0;
+    let restartTimer = null;
+
+    const scheduleStart = (ms) => {
+      try {
+        if (restartTimer) clearTimeout(restartTimer);
+      } catch {}
+      restartTimer = setTimeout(safeStart, ms);
+    };
 
     const safeStart = () => {
       if (active) return;
+
+      const disabledUntil = Number(wakeDisabledUntilRef.current || 0);
+      const now = Date.now();
+      if (disabledUntil && now < disabledUntil) {
+        const wait = Math.max(250, Math.min(disabledUntil - now, 60_000));
+        scheduleStart(wait);
+        return;
+      }
+
       try {
         recognizer.start();
         active = true;
         startAttempts = 0;
       } catch (err) {
         startAttempts++;
-        if (startAttempts < 6) setTimeout(safeStart, 400 + startAttempts * 200);
+        if (startAttempts < 6) scheduleStart(400 + startAttempts * 200);
       }
     };
 
@@ -947,13 +1384,16 @@ export default function App() {
           transcript.includes("wakeup");
 
         if (wakeHit) {
+          // In biometrics mode, defer wake-session start and UI pulse until
+          // we successfully capture a verified command.
+          if (!voiceBiometricsActive) {
+            // Start/refresh the wake session window.
+            startWakeSessionWindow();
 
-          // Start/refresh the 15-minute wake session window.
-          startWakeSessionWindow();
-
-          // vibrate UI briefly (visual) and pause auto recognition
-          setWakePulse(true);
-          setTimeout(() => setWakePulse(false), 900);
+            // vibrate UI briefly (visual) and pause auto recognition
+            setWakePulse(true);
+            setTimeout(() => setWakePulse(false), 900);
+          }
 
           // stop recognizer safely so we can do single-shot capture
           try { recognizer.stop(); } catch {}
@@ -981,6 +1421,29 @@ export default function App() {
 
     recognizer.onerror = (ev) => {
       const errName = ev?.error || "unknown";
+
+      // Some errors are not recoverable without user action (permissions / missing mic).
+      // Avoid an infinite restart loop that spams logs in packaged desktop builds.
+      const fatal = new Set(["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"]);
+      if (fatal.has(errName)) {
+        if (!wakePermissionHintedRef.current) {
+          wakePermissionHintedRef.current = true;
+          if (errName === "language-not-supported") {
+            addLog("system", `Wake listener disabled: language not supported (${voiceLang || "en-US"}).`);
+          } else if (errName === "audio-capture") {
+            addLog("system", "Wake listener disabled: microphone not available.");
+          } else {
+            addLog(
+              "system",
+              "Wake listener disabled: microphone permission denied. Enable microphone access for this app/browser, then reload Jarvis."
+            );
+          }
+        }
+        wakeDisabledUntilRef.current = Date.now() + 10 * 60 * 1000;
+        active = false;
+        return;
+      }
+
       // Reduce disruptive log spam; "no-speech" is common and not actionable.
       if (errName !== "no-speech") {
         addLog("system", `Wake listener error: ${errName}`);
@@ -989,26 +1452,30 @@ export default function App() {
         // "no-speech" is extremely common; keep it very quiet.
         if (now - lastWakeNoSpeechLogRef.current > 10 * 60 * 1000) {
           lastWakeNoSpeechLogRef.current = now;
-          addLog("system", "Wake listener: no speech detected");
+          addLog("system", "Wake listener: idle (no speech)");
         }
       }
       active = false;
       // restart with backoff
-      if (isAuthenticated) setTimeout(safeStart, errName === "aborted" ? 700 : 1500);
+      if (isAuthenticated) scheduleStart(errName === "aborted" ? 700 : 1500);
     };
 
     recognizer.onend = () => {
       active = false;
-      if (!isHandlingCommand.current && isAuthenticated) setTimeout(safeStart, 700);
+      if (!isHandlingCommand.current && isAuthenticated) scheduleStart(700);
     };
 
     // Start after a short delay to avoid slowing initial paint
     const startTimer = setTimeout(safeStart, 600);
+    restartTimer = startTimer;
     wakeRecognizer.current = recognizer;
     addLog("system", "Wake-word listener started.");
 
     return () => {
       clearTimeout(startTimer);
+      try {
+        if (restartTimer) clearTimeout(restartTimer);
+      } catch {}
       try {
         recognizer.onresult = null;
         recognizer.onerror = null;
@@ -1020,7 +1487,7 @@ export default function App() {
         if (wakeSessionTimerRef.current) clearTimeout(wakeSessionTimerRef.current);
       } catch {}
     };
-  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow]);
+  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive]);
 
   // Authentication helpers (unchanged, stable)
   const handleAuthSuccess = useCallback((newSessionId, newUsername, newRole, newPermissions) => {
@@ -1050,8 +1517,27 @@ export default function App() {
           setAssistantName(nextName);
           localStorage.setItem("jarvis_assistant_name", nextName);
         }
+
+        const enrolled = !!data?.user?.voice_biometrics_enrolled;
+        setVoiceBiometricsEnrolled(enrolled);
+        try {
+          localStorage.setItem("jarvis_voice_biometrics_enrolled", enrolled ? "1" : "0");
+        } catch {}
       })
       .catch(() => {});
+
+    // Pull preferences (language, etc.) after auth
+    (async () => {
+      try {
+        const resp = await getUserPreferences(newSessionId);
+        const prefs = resp?.preferences || {};
+        const lang = (prefs.language_code || prefs.language || "").toString().trim();
+        if (lang) {
+          setPreferredLanguage(lang);
+          localStorage.setItem("jarvis_language", lang);
+        }
+      } catch {}
+    })();
   }, [addLog]);
 
   // PC agent is started manually (python pc_agent.py).
@@ -1063,6 +1549,24 @@ export default function App() {
     const storedPermissionsRaw = localStorage.getItem("jarvis_permissions");
     const storedAssistantName = localStorage.getItem("jarvis_assistant_name");
 
+    // Restore cached identifiers, but do NOT mark as authenticated until the server validates the session.
+    // This prevents wake-word listening and WS communication from starting for an expired/invalid session.
+    if (storedSession && storedUsername) {
+      setSessionId(storedSession);
+      setUsername(storedUsername);
+      setRole(storedRole || null);
+      const nextName = (storedAssistantName || "Jarvis").toString().trim();
+      setAssistantName(nextName || "Jarvis");
+      try {
+        setPermissions(storedPermissionsRaw ? JSON.parse(storedPermissionsRaw) : null);
+      } catch {
+        setPermissions(null);
+      }
+      // Keep the auth modal hidden while we validate the session in the background.
+      setIsAuthenticated(false);
+      setShowAuthModal(false);
+    }
+
     (async () => {
       if (storedSession && storedUsername) {
         try {
@@ -1073,8 +1577,6 @@ export default function App() {
           });
           const data = await r.json().catch(() => null);
           if (data?.valid) {
-            setSessionId(storedSession);
-            setUsername(storedUsername);
             setRole(data.role || storedRole || null);
             try {
               setPermissions(data.permissions || (storedPermissionsRaw ? JSON.parse(storedPermissionsRaw) : null));
@@ -1085,7 +1587,14 @@ export default function App() {
             const nextName = (nameFromApi || storedAssistantName || "Jarvis").toString().trim();
             setAssistantName(nextName || "Jarvis");
             localStorage.setItem("jarvis_assistant_name", nextName || "Jarvis");
+
+            const enrolled = !!data?.user?.voice_biometrics_enrolled;
+            setVoiceBiometricsEnrolled(enrolled);
+            try {
+              localStorage.setItem("jarvis_voice_biometrics_enrolled", enrolled ? "1" : "0");
+            } catch {}
             setIsAuthenticated(true);
+            setShowAuthModal(false);
             return;
           }
         } catch {
@@ -1094,13 +1603,42 @@ export default function App() {
       }
 
       // Default: show auth modal
+      setIsAuthenticated(false);
+      setSessionId(null);
+      setUsername(null);
+      setVoiceBiometricsEnrolled(false);
+      try {
+        localStorage.setItem("jarvis_voice_biometrics_enrolled", "0");
+      } catch {}
+      setRole(null);
+      setPermissions(null);
       setShowAuthModal(true);
     })();
   }, []);
 
+  useEffect(() => {
+    if (!isAuthenticated || !sessionId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await getUserPreferences(sessionId);
+        if (cancelled) return;
+        const prefs = resp?.preferences || {};
+        const lang = (prefs.language_code || prefs.language || "").toString().trim();
+        if (lang) {
+          setPreferredLanguage(lang);
+          localStorage.setItem("jarvis_language", lang);
+        }
+      } catch {}
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, sessionId]);
+
   // ----------------- RENDER -----------------
   return (
-    <div className="jarvis-root">
+    <div className={`jarvis-root${wakePulse ? " wake-pulse" : ""}`}>
       {showAuthModal && (
         <AuthModal
           onAuthSuccess={handleAuthSuccess}
@@ -1129,48 +1667,11 @@ export default function App() {
             onAllow={async () => {
               const req = permissionPrompt;
               try {
-                if (req.kind === "pc_agent_login") {
-                  if (!sessionId) return;
-                  addLog("system", "Checking PC agent…");
-
-                  const online = await isPcAgentOnline(sessionId);
-                  if (!online) {
-                    addLog("system", "PC agent is offline. Start it with the values shown in the popup, then click Yes.");
-                    setPermissionPrompt((prev) => {
-                      if (!prev || prev.kind !== "pc_agent_login") return prev;
-                      return {
-                        ...prev,
-                        message: "PC agent is offline.",
-                        details: "Start PC agent using run_pc_agent.bat (use the values below), then click Yes.",
-                      };
-                    });
-                    return;
-                  }
-
-                  addLog("system", "PC agent online. Establishing connection…");
-                  try {
-                    await configureMyPc(sessionId);
-                    addLog("system", "PC agent connected.");
-                    setPermissionPrompt(null);
-                  } catch {
-                    addLog("system", "Could not establish connection. Try again.");
-                    setPermissionPrompt((prev) => {
-                      if (!prev || prev.kind !== "pc_agent_login") return prev;
-                      return {
-                        ...prev,
-                        message: "Could not establish connection.",
-                        details: "Make sure pc_agent.py is running and connected, then click Yes again.",
-                      };
-                    });
-                  }
-                  return;
-                }
-
                 // For all other permission prompts, close the modal immediately before proceeding.
                 setPermissionPrompt(null);
                 const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
                 if (grantRes?.offline) {
-                  addLog("system", "Permission saved. Start run_pc_agent.bat and login again (then click Yes).");
+                  addLog("system", "Permission saved. Start JarvisPCAgent.exe (or python pc_agent.py) and login again (then click Yes).");
                   return;
                 }
 
@@ -1184,14 +1685,15 @@ export default function App() {
         )}
       </Suspense>
 
+
       {isAuthenticated && username && (
         <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ width: 8, height: 8, borderRadius: 8, background: "#00ffc8", boxShadow: "0 0 10px rgba(0,255,200,0.6)" }} />
-            <span style={{ color: "#00ffc8", fontSize: 14 }}>
+            <div style={{ width: 8, height: 8, borderRadius: 8, background: "var(--jarvis-accent)", boxShadow: "0 0 10px var(--jarvis-accent-glow)" }} />
+            <span style={{ color: "var(--jarvis-accent)", fontSize: 14 }}>
               {username}{role ? ` (${role})` : ""}
             </span>
-            <span style={{ color: "#00ffc8", fontSize: 14, opacity: 0.9 }}>
+            <span style={{ color: "var(--jarvis-accent)", fontSize: 14, opacity: 0.9 }}>
               Assistant: {assistantName || "Jarvis"}
             </span>
 
@@ -1214,10 +1716,12 @@ export default function App() {
               localStorage.removeItem("jarvis_role");
               localStorage.removeItem("jarvis_permissions");
               localStorage.removeItem("jarvis_assistant_name");
+              localStorage.removeItem("jarvis_voice_biometrics_enrolled");
               setIsAuthenticated(false);
               setSessionId(null);
               setUsername(null);
               setAssistantName("Jarvis");
+              setVoiceBiometricsEnrolled(false);
               setRole(null);
               setPermissions(null);
               setPermissionPrompt(null);
@@ -1231,18 +1735,30 @@ export default function App() {
         </div>
       )}
 
-      <AtomicBackground emotion={emotion} wakePulse={wakePulse} volume={volume} />
-
-      <div style={{ position: "fixed", left: 20, top: 20, zIndex: 10 }}>
-        <Suspense fallback={<div />}>
-          <HUDLogs logs={logs} />
-        </Suspense>
-      </div>
+      <JarvisDashboard
+        isAuthenticated={isAuthenticated}
+        logs={logs}
+        tasks={tasks}
+        emotion={emotion}
+        listening={listening}
+        speaking={speaking}
+        volume={volume}
+        agentToken={agentToken}
+        agentSharedSecret={agentSharedSecret}
+        agentServerUrl={agentServerUrl}
+        agentWsUrl={agentWsUrl}
+        agentCfgLoaded={agentCfgLoaded}
+        agentCfgError={agentCfgError}
+        onConnectPcAgent={connectPcAgent}
+        systemInfo={systemInfo}
+        themeColor={themeColor}
+        onThemeColorChange={setThemeColor}
+      />
 
       {/* Bottom stack: status above the wake prompt */}
       <div style={{ position: "fixed", bottom: 24, left: 0, right: 0, display: "flex", justifyContent: "center", zIndex: 12, pointerEvents: "none" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
-          <div style={{ pointerEvents: "none", background: "rgba(10,10,12,0.28)", color: "rgba(230,238,248,0.92)", padding: "8px 14px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 10, minWidth: 220, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
+          <div style={{ pointerEvents: "none", background: "rgba(10,10,12,0.28)", color: "var(--jarvis-accent)", padding: "8px 14px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 10, minWidth: 220, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
             <div style={{ width: 10, height: 10, borderRadius: 999, background: emotion === "critical" ? "#ff4d4f" : emotion === "analyzing" ? "#ffd24d" : "#00ffc8", boxShadow: emotion === "critical" ? "0 0 10px rgba(255,77,79,0.45)" : emotion === "analyzing" ? "0 0 10px rgba(255,210,77,0.35)" : "0 0 10px rgba(0,255,200,0.45)" }} />
             <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 13, letterSpacing: 0.3 }}>
               {emotion === "calm" && ((listening || speaking) ? "Listening (session)" : "Idle")}
@@ -1251,8 +1767,7 @@ export default function App() {
             </div>
           </div>
 
-          <div style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "white", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
-            <div style={{ width: 12, height: 12, borderRadius: 6, background: listening ? "#00ffc8" : wakePulse ? "#00d4ff" : speaking ? "#ffb86b" : "#6b7280", boxShadow: listening ? "0 0 12px rgba(0,255,200,0.6)" : wakePulse ? "0 0 10px rgba(0,212,255,0.45)" : "" }} />
+          <div style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)" }}>
             <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
               {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to begin`}
             </div>

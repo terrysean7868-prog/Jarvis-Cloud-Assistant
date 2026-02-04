@@ -1,8 +1,10 @@
 # config.py
-import os
 from pathlib import Path
 from typing import Dict, Any
 from dotenv import load_dotenv
+
+from src.config import env
+from src.config.secrets import llm_secrets
 
 load_dotenv()
 
@@ -20,66 +22,70 @@ class Config:
         dir_path.mkdir(exist_ok=True)
     
     # Database settings (defaults to local if not configured)
-    MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/jarvis')
-    MONGODB_DB = os.getenv('MONGODB_DB_NAME', 'jarvis_db')
+    MONGODB_URI = env.get_str('MONGODB_URI', 'mongodb://localhost:27017/jarvis')
+    MONGODB_DB = env.get_str('MONGODB_DB_NAME', 'jarvis_db')
     SQLITE_PATH = DATA_DIR / 'jarvis_memory.db'
     
     # LLM Configuration
+    # Primary: OpenAI (ChatGPT). Fallback: Groq.
+    _PRIMARY_DEFAULT_ENDPOINT = 'https://api.openai.com/v1/chat/completions'
+    _PRIMARY_DEFAULT_MODEL = 'gpt-4o'
+    _PRIMARY_API_KEY = llm_secrets().primary_api_key
     LLM_CONFIG = {
         'primary': {
-            'name': os.getenv('PRIMARY_MODEL', 'gpt-4'),
-            'api_key': os.getenv('PRIMARY_API_KEY'),
-            'endpoint': os.getenv('PRIMARY_ENDPOINT', 'https://api.openai.com/v1/chat/completions')
+            'name': env.get_str('PRIMARY_MODEL', _PRIMARY_DEFAULT_MODEL),
+            'api_key': _PRIMARY_API_KEY,
+            'endpoint': env.get_str('PRIMARY_ENDPOINT', _PRIMARY_DEFAULT_ENDPOINT)
         },
         'backup': {
-            'name': os.getenv('BACKUP_MODEL', 'llama-3.1-8b-instant'),
-            'api_key': os.getenv('BACKUP_API_KEY', os.getenv('GROQ_API_KEY')),
-            'endpoint': os.getenv('BACKUP_ENDPOINT', 'https://api.groq.com/openai/v1/chat/completions')
+            'name': env.get_str('BACKUP_MODEL', 'llama-3.1-8b-instant'),
+            'api_key': llm_secrets().backup_api_key,
+            'endpoint': env.get_str('BACKUP_ENDPOINT', 'https://api.groq.com/openai/v1/chat/completions')
         }
     }
     
     # Voice Recognition Settings
     VOICE_CONFIG = {
-        'offline_model': os.getenv('VOSK_MODEL', 'vosk-model-small-en-us'),
-        'language': os.getenv('VOICE_LANGUAGE', 'en-US'),
+        'offline_model': env.get_str('VOSK_MODEL', 'vosk-model-small-en-us'),
+        'language': env.get_str('VOICE_LANGUAGE', 'en-US'),
         'use_vad': True,
-        'vad_sensitivity': float(os.getenv('VAD_SENSITIVITY', '3')),
-        'silence_duration': float(os.getenv('SILENCE_DURATION', '0.5'))
+        'vad_sensitivity': env.get_float('VAD_SENSITIVITY', 3.0),
+        'silence_duration': env.get_float('SILENCE_DURATION', 0.5)
     }
     
     # Git Configuration
     GIT_CONFIG = {
-        'repository': os.getenv('GITHUB_REPO'),
-        'username': os.getenv('GITHUB_USERNAME'),
-        'token': os.getenv('GITHUB_TOKEN'),
-        'ssh_key': os.getenv('SSH_KEY'),
-        'branch': os.getenv('GIT_BRANCH', 'main'),
-        'auto_sync': os.getenv('GIT_AUTO_SYNC', 'true').lower() == 'true'
+        'repository': env.get('GITHUB_REPO'),
+        'username': env.get('GITHUB_USERNAME'),
+        'token': env.get('GITHUB_TOKEN'),
+        'ssh_key': env.get('SSH_KEY'),
+        'branch': env.get_str('GIT_BRANCH', 'main'),
+        'auto_sync': env.get_bool('GIT_AUTO_SYNC', True)
     }
     
     # System Settings
     SYSTEM_CONFIG = {
-        'debug_mode': os.getenv('DEBUG', 'false').lower() == 'true',
-        'log_level': os.getenv('LOG_LEVEL', 'INFO'),
-        'auto_update': os.getenv('AUTO_UPDATE', 'true').lower() == 'true',
-        'max_retries': int(os.getenv('MAX_RETRIES', '3')),
-        'timeout': int(os.getenv('TIMEOUT', '30'))
+        'debug_mode': env.get_bool('DEBUG', False),
+        'log_level': env.get_str('LOG_LEVEL', 'INFO'),
+        'auto_update': env.get_bool('AUTO_UPDATE', True),
+        'max_retries': env.get_int('MAX_RETRIES', 3),
+        'timeout': env.get_int('TIMEOUT', 30)
     }
     
     # Frontend Configuration
     FRONTEND_CONFIG = {
-        'port': int(os.getenv('PORT', '3000')),
-        'host': os.getenv('HOST', 'localhost'),
-        'api_base_url': os.getenv('API_BASE_URL', '/api'),
-        'ws_base_url': os.getenv('WS_BASE_URL', '/ws')
+        'port': env.get_int('PORT', 3000),
+        'host': env.get_str('HOST', 'localhost'),
+        'api_base_url': env.get_str('API_BASE_URL', '/api'),
+        'ws_base_url': env.get_str('WS_BASE_URL', '/ws')
     }
     
     # Security Configuration
     SECURITY_CONFIG = {
-        'allowed_origins': os.getenv('ALLOWED_ORIGINS', '*').split(','),
-        'jwt_secret': os.getenv('JWT_SECRET', 'your-secret-key'),
-        'jwt_algorithm': os.getenv('JWT_ALGORITHM', 'HS256'),
-        'token_expire_minutes': int(os.getenv('TOKEN_EXPIRE_MINUTES', '1440'))
+        'allowed_origins': env.get_str('ALLOWED_ORIGINS', '*').split(','),
+        'jwt_secret': env.get_str('JWT_SECRET', 'your-secret-key'),
+        'jwt_algorithm': env.get_str('JWT_ALGORITHM', 'HS256'),
+        'token_expire_minutes': env.get_int('TOKEN_EXPIRE_MINUTES', 1440)
     }
     
     # Module Configurations
@@ -98,7 +104,7 @@ class Config:
         'README.md'
     ]
     
-    ALLOWED_PATHS = [p.strip() for p in os.getenv('ALLOWED_PATHS', ','.join(DEFAULT_ALLOWED_PATHS)).split(',')]
+    ALLOWED_PATHS = [p.strip() for p in env.get_str('ALLOWED_PATHS', ','.join(DEFAULT_ALLOWED_PATHS)).split(',')]
     
     @classmethod
     def validate(cls, strict=False) -> bool:
@@ -110,7 +116,7 @@ class Config:
         """
         required_settings = [
             ('MONGODB_URI', cls.MONGODB_URI),
-            ('PRIMARY_API_KEY', cls.LLM_CONFIG['primary']['api_key']),
+            ('LLM_API_KEY', cls.LLM_CONFIG['primary']['api_key']),
             ('GITHUB_REPO', cls.GIT_CONFIG['repository'])
         ]
         

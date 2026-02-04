@@ -1,4 +1,9 @@
 /* === RESPONSIVE JARVIS HUD === */
+:root {
+  --jarvis-accent: #00eaff;
+  --jarvis-accent-glow: rgba(0, 234, 255, 0.45);
+}
+
 /* Jarvis dark base */
 html, body, #root, .jarvis-root {
   margin: 0;
@@ -6,8 +11,24 @@ html, body, #root, .jarvis-root {
   width: 100%;
   height: 100%;
   background: radial-gradient(circle at center, #020607 0%, #000 100%);
-  color: #00eaff;
+  color: var(--jarvis-accent, #00eaff);
   overflow: hidden;
+}
+
+.jarvis-root.wake-pulse {
+  animation: jarvis-wake-pulse 0.9s ease-out 1;
+}
+
+@keyframes jarvis-wake-pulse {
+  0% {
+    filter: none;
+  }
+  25% {
+    filter: drop-shadow(0 0 14px var(--jarvis-accent-glow));
+  }
+  100% {
+    filter: none;
+  }
 }
 
 /* Keep canvas below UI layers */
@@ -46,8 +67,8 @@ html, body, #root, .jarvis-root {
   width: 100%;
   text-align: center;
   font-size: clamp(0.9rem, 2vw, 1.3rem);
-  color: #00ffff;
-  text-shadow: 0 0 8px rgba(0, 255, 255, 0.8);
+  color: var(--jarvis-accent, #00ffff);
+  text-shadow: 0 0 8px var(--jarvis-accent-glow, rgba(0, 255, 255, 0.8));
 }
 
 /* === HUD Logs + Overlays === */
@@ -130,7 +151,7 @@ html, body, #root, .jarvis-root {
 .jarvis-root {
   background: radial-gradient(circle at center, #03090c 0%, #000 100%);
   overflow: hidden;
-  color: #00eaff;
+  color: var(--jarvis-accent, #00eaff);
 }
 
 canvas {

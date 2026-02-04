@@ -23,7 +23,7 @@
 
 .hud-title {
   text-align: center;
-  color: #00ffff;
+  color: var(--jarvis-accent, #00ffff);
   font-size: 1.1em;
   letter-spacing: 2px;
 }

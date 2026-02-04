@@ -9,6 +9,8 @@ import base64
 from typing import Dict, Tuple, Optional, TYPE_CHECKING
 from io import BytesIO
 
+from src.config import env
+
 # Screen capture
 PIL_AVAILABLE = False
 Image = None
@@ -46,12 +48,12 @@ pyautogui = None
 _is_headless = False
 if platform.system() != "Windows":
     # Check if DISPLAY is set (required for X11)
-    if "DISPLAY" not in os.environ:
+    if not env.get("DISPLAY"):
         _is_headless = True
     # Also check for common server environment indicators
     # Render sets PORT, RENDER_SERVICE_ID, or path contains /opt/render
-    if (os.getenv("RENDER") or os.getenv("DYNO") or os.getenv("DOCKER") or 
-        os.getenv("PORT") or "/opt/render" in os.getcwd() or 
+    if (env.get("RENDER") or env.get("DYNO") or env.get("DOCKER") or 
+        env.get("PORT") or "/opt/render" in os.getcwd() or 
         "/opt/render" in str(__file__)):
         _is_headless = True
 
@@ -71,7 +73,7 @@ if not _is_headless:
         PYAUTOGUI_AVAILABLE = False
         pyautogui = None
         # Only log in non-headless environments
-        if platform.system() == "Windows" or os.getenv("DISPLAY"):
+        if platform.system() == "Windows" or env.get("DISPLAY"):
             print(f"pyautogui not available: {e}")
 else:
     # Headless environment - skip import entirely
@@ -113,7 +115,7 @@ class ScreenAccess:
             return None
         
         # Check if we're in a headless environment
-        if not os.getenv("DISPLAY") and platform.system() != "Windows":
+        if not env.get("DISPLAY") and platform.system() != "Windows":
             print("Screen capture not available in headless environment")
             return None
         
@@ -220,6 +222,25 @@ class ScreenAccess:
         if not PYAUTOGUI_AVAILABLE or not pyautogui:
             return False
 
+        try:
+            k = (key or "").strip()
+            if not k:
+                return False
+            presses = int(presses or 1)
+            presses = max(1, min(20, presses))
+            interval = float(interval or 0.1)
+        except Exception:
+            k = (key or "").strip()
+            presses = 1
+            interval = 0.1
+
+        try:
+            pyautogui.press(k, presses=presses, interval=interval)
+            return True
+        except Exception as e:
+            print(f"Key press error: {e}")
+            return False
+
     def hotkey(self, keys) -> bool:
         """Press a keyboard shortcut (e.g., ['ctrl','a'])."""
         if not PYAUTOGUI_AVAILABLE or not pyautogui:
@@ -237,13 +258,6 @@ class ScreenAccess:
             return True
         except Exception as e:
             print(f"Hotkey error: {e}")
-            return False
-        
-        try:
-            pyautogui.press(key, presses=presses, interval=interval)
-            return True
-        except Exception as e:
-            print(f"Key press error: {e}")
             return False
     
     def scroll(self, x: int = 0, y: int = 0, clicks: int = 3) -> bool:

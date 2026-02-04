@@ -52,5 +52,5 @@ if ($StartNow) {
   Write-Host "Done. The agent is running (started on demand)." -ForegroundColor Green
 } else {
   Write-Host "Done. No Windows-login autostart is installed." -ForegroundColor Green
-  Write-Host "Start the agent manually with run_pc_agent.bat when needed." -ForegroundColor Green
+  Write-Host "Start the agent manually with dist\JarvisPCAgent.exe (or python pc_agent.py) when needed." -ForegroundColor Green
 }

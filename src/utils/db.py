@@ -4,6 +4,7 @@ import os
 import sqlite3
 from pathlib import Path
 from dotenv import load_dotenv
+from src.config import env
 import json
 from bson import ObjectId
 from urllib.parse import quote_plus, urlparse
@@ -57,7 +58,7 @@ class Database:
         if self.client is not None:
             return  # Already connected
 
-        uri = os.getenv('MONGODB_URI') or os.getenv('MONGO_URI')
+        uri = env.get('MONGODB_URI') or env.get('MONGO_URI')
         if not uri:
             msg = (
                 "MONGODB_URI not set in environment. "
@@ -96,7 +97,7 @@ class Database:
             # Initialize MongoDB connection
             self.client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
             self.client.admin.command('ping')
-            self.db = self.client[os.getenv('MONGODB_DB_NAME', 'jarvis_db')]
+            self.db = self.client[env.get_str('MONGODB_DB_NAME', 'jarvis_db')]
             self._setup_collections()
             print("[DB] SUCCESS - Connected to MongoDB")
 
@@ -283,8 +284,8 @@ class Database:
             'status': status,
             'details': details or {},
             'metadata': {
-                'hostname': os.environ.get('COMPUTERNAME', 'unknown'),
-                'environment': os.environ.get('ENVIRONMENT', 'development')
+                'hostname': env.get_str('COMPUTERNAME', 'unknown'),
+                'environment': env.get_str('ENVIRONMENT', 'development')
             }
         }
         return collection.insert_one(doc)
@@ -550,8 +551,8 @@ class Database:
             'status': status,
             'details': details or {},
             'metadata': {
-                'branch': os.environ.get('GIT_BRANCH', 'main'),
-                'repository': os.environ.get('GITHUB_REPO', 'unknown')
+                'branch': env.get_str('GIT_BRANCH', 'main'),
+                'repository': env.get_str('GITHUB_REPO', 'unknown')
             }
         }
         return collection.insert_one(doc)

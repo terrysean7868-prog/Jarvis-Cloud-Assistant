@@ -2,17 +2,59 @@
 import React, { useEffect, useMemo, useRef } from "react";
 import "../styles/arcReactor.css";
 
+function normalizeHex(hex) {
+  const s = (hex || "").toString().trim();
+  if (!s) return null;
+  const h = s.startsWith("#") ? s : `#${s}`;
+  if (/^#[0-9a-f]{3}$/i.test(h)) {
+    return `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}`.toLowerCase();
+  }
+  if (/^#[0-9a-f]{6}$/i.test(h)) return h.toLowerCase();
+  return null;
+}
+
+function hexToRgb(hex) {
+  const h = normalizeHex(hex);
+  if (!h) return null;
+  return {
+    r: parseInt(h.slice(1, 3), 16),
+    g: parseInt(h.slice(3, 5), 16),
+    b: parseInt(h.slice(5, 7), 16),
+  };
+}
+
+function mixRgb(a, b, t) {
+  const tt = Math.max(0, Math.min(1, t));
+  return {
+    r: a.r + (b.r - a.r) * tt,
+    g: a.g + (b.g - a.g) * tt,
+    b: a.b + (b.b - a.b) * tt,
+  };
+}
+
+function rgba({ r, g, b }, a) {
+  const aa = Math.max(0, Math.min(1, Number(a) || 0));
+  return `rgba(${Math.round(r)},${Math.round(g)},${Math.round(b)},${aa})`;
+}
+
 export default function ArcReactor({
   active = false,
+  listening = false,
+  speaking = false,
   emotion = "calm",
   size = 340,
   volume = 0,
   showCaption = true,
+  themeColor = null,
 }) {
   const canvasRef = useRef(null);
   const rafRef = useRef(0);
   const timeRef = useRef(0);
   const ampRef = useRef(0);
+  const volumeRef = useRef(0);
+  const speakingRef = useRef(false);
+  const sizeRef = useRef(size);
+  const colorRef = useRef(null);
   const lastFrameTsRef = useRef(0);
   const fpsWindowStartRef = useRef(0);
   const fpsFramesRef = useRef(0);
@@ -22,13 +64,25 @@ export default function ArcReactor({
   const scratchesRef = useRef(null);
 
   const color = useMemo(() => {
+    const base = normalizeHex(themeColor);
+    if (base) {
+      const rgb = hexToRgb(base);
+      const white = { r: 255, g: 255, b: 255 };
+      const core = rgba(mixRgb(rgb, white, 0.35), 1);
+      return { core, ring: base, accent: base, _rgb: rgb };
+    }
+
     const colorMap = {
       calm: { core: "#00ffc8", ring: "#00d4ff", accent: "#00ffc8" },
       analyzing: { core: "#ffd24d", ring: "#ff9f43", accent: "#ffd24d" },
       critical: { core: "#ff4d4f", ring: "#ff6b6b", accent: "#ff4d4f" },
     };
     return colorMap[emotion] || colorMap.calm;
-  }, [emotion]);
+  }, [emotion, themeColor]);
+
+  // Keep latest palette available to the RAF loop without restarting it.
+  // Safe to assign: refs don't trigger rerenders.
+  colorRef.current = color;
 
   const baseFilamentCount = useMemo(() => {
     try {
@@ -41,6 +95,19 @@ export default function ArcReactor({
   }, []);
 
   useEffect(() => {
+    volumeRef.current = Math.max(0, Math.min(1, Number(volume) || 0));
+  }, [volume]);
+
+  useEffect(() => {
+    speakingRef.current = !!speaking;
+  }, [speaking]);
+
+  useEffect(() => {
+    sizeRef.current = size;
+  }, [size]);
+
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -49,7 +116,7 @@ export default function ArcReactor({
 
     const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
     const resize = () => {
-      const cssSize = Math.max(120, Number(size) || 340);
+      const cssSize = Math.max(120, Number(sizeRef.current) || 340);
       canvas.style.width = `${cssSize}px`;
       canvas.style.height = `${cssSize}px`;
       canvas.width = Math.floor(cssSize * dpr);
@@ -112,7 +179,7 @@ export default function ArcReactor({
     }
 
     const draw = (ts) => {
-      const cssSize = Math.max(120, Number(size) || 340);
+      const cssSize = Math.max(120, Number(sizeRef.current) || 340);
       const cx = cssSize / 2;
       const cy = cssSize / 2;
       const scale = cssSize / DESIGN_SIZE;
@@ -143,17 +210,28 @@ export default function ArcReactor({
         qualityRef.current = Math.max(0.35, Math.min(1, dynamicFilamentCountRef.current / maxFilaments));
       }
 
-      // Smooth amp from provided volume.
-      const target = Math.max(0, Math.min(1, Number(volume) || 0));
-      const smooth = ampRef.current * 0.82 + target * 0.18;
+      // Smooth amp from mic volume + (optional) speaking pulse.
+      // This avoids any "blink" tied to request/response state flips.
+      const mic = Math.max(0, Math.min(1, Number(volumeRef.current) || 0));
+      const tts = speakingRef.current
+        ? (0.14 + 0.08 * Math.sin(ts * 0.012) + 0.06 * Math.sin(ts * 0.027 + 1.7))
+        : 0;
+      const target = Math.max(mic, tts);
+      const smooth = ampRef.current * 0.84 + target * 0.16;
       ampRef.current = smooth;
 
       // Gentle motion even when idle.
-      timeRef.current += 0.016;
+      const lastTs = lastFrameTsRef.current || ts;
+      const dt = Math.max(0.008, Math.min(0.05, (ts - lastTs) / 1000));
+      lastFrameTsRef.current = ts;
+      timeRef.current += dt;
       const t = timeRef.current;
       const amp = smooth;
-      const reactiveScale = 1 + amp * (active ? 0.24 : 0.06);
+      // Always drive size from amplitude only (no active toggles).
+      const reactiveScale = 1 + amp * 0.22;
       const q = qualityRef.current;
+
+      const currentColor = colorRef.current;
 
       ctx.clearRect(0, 0, cssSize, cssSize);
 
@@ -213,7 +291,11 @@ export default function ArcReactor({
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
         ctx.stroke();
 
-        ctx.strokeStyle = `rgba(0,212,255,${0.02 + i * 0.012})`;
+        if (currentColor?._rgb) {
+          ctx.strokeStyle = rgba(currentColor._rgb, 0.03 + i * 0.012);
+        } else {
+          ctx.strokeStyle = `rgba(0,212,255,${0.02 + i * 0.012})`;
+        }
         ctx.beginPath();
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
         ctx.stroke();
@@ -224,15 +306,26 @@ export default function ArcReactor({
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
       ctx.lineCap = "round";
+
+      const ringGrad = currentColor?._rgb
+        ? (() => {
+            const g = ctx.createRadialGradient(cx, cy, outerR * 0.2, cx, cy, outerR * 1.05);
+            g.addColorStop(0, rgba(currentColor._rgb, 0.08));
+            g.addColorStop(0.45, rgba(currentColor._rgb, 0.95));
+            g.addColorStop(1, "rgba(255,255,255,0.12)");
+            return g;
+          })()
+        : null;
+
       for (let i = 0; i < baseRadii.length; i++) {
         const r = baseRadii[i] * reactiveScale;
         const rot = (t * (0.25 + i * 0.06)) % (Math.PI * 2);
         const a0 = rot;
         const a1 = rot + (Math.PI * 1.55);
 
-        ctx.shadowColor = color.ring;
+        ctx.shadowColor = currentColor?._rgb ? rgba(currentColor._rgb, 0.9) : currentColor.ring;
         ctx.shadowBlur = (3 + amp * 10) * (0.40 + 0.60 * q);
-        ctx.strokeStyle = color.ring;
+        ctx.strokeStyle = ringGrad || currentColor.ring;
         ctx.globalAlpha = (0.20 + (0.10 * (1 - i / baseRadii.length)) + amp * 0.18) * (0.75 + 0.25 * q);
         ctx.lineWidth = Math.max(0.75, (2 - i * 0.12) * scale);
         ctx.beginPath();
@@ -281,6 +374,18 @@ export default function ArcReactor({
       ctx.globalCompositeOperation = "lighter";
       ctx.lineCap = "round";
       const baseR = baseRadii[2] * reactiveScale;
+
+      const themeRgb = currentColor?._rgb || null;
+      const accentGrad = themeRgb
+        ? (() => {
+            const g = ctx.createRadialGradient(cx, cy, baseR * 0.10, cx, cy, baseR * 1.35);
+            g.addColorStop(0, rgba(themeRgb, 0.15));
+            g.addColorStop(0.35, rgba(themeRgb, 0.95));
+            g.addColorStop(1, "rgba(255,255,255,0.10)");
+            return g;
+          })()
+        : null;
+
       const filamentCount = dynamicFilamentCountRef.current || baseFilamentCount;
       for (let i = 0; i < filamentCount; i++) {
         const ang = (i / filamentCount) * Math.PI * 2 + t * 0.35;
@@ -296,10 +401,10 @@ export default function ArcReactor({
         const my = iy + (oy - iy) * 0.5 + Math.cos(t * 1.7 + i * 0.5) * (2.2 + amp * 4.5);
 
         const alpha = 0.045 + amp * 0.18 + (i % 3) * 0.010;
-        ctx.strokeStyle = color.accent;
+        ctx.strokeStyle = accentGrad || currentColor.accent;
         ctx.globalAlpha = alpha;
         ctx.lineWidth = Math.max(0.6, (0.55 + amp * 1.25) * scale);
-        ctx.shadowColor = color.accent;
+        ctx.shadowColor = themeRgb ? rgba(themeRgb, 0.9) : currentColor.accent;
         ctx.shadowBlur = (4 + amp * 11) * (0.30 + 0.70 * q);
         ctx.beginPath();
         ctx.moveTo(ix, iy);
@@ -312,7 +417,7 @@ export default function ArcReactor({
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
       const coreR = (22 + amp * 10) * reactiveScale;
-      ctx.shadowColor = color.core;
+      ctx.shadowColor = currentColor.core;
       ctx.shadowBlur = (12 + amp * 22) * (0.55 + 0.45 * q);
 
       // Lens reflection sweep (cheap premium look)
@@ -380,7 +485,7 @@ export default function ArcReactor({
 
       const cg = ctx.createRadialGradient(cx, cy, 1, cx, cy, coreR * 2.2);
       cg.addColorStop(0, "rgba(255,255,255,0.65)");
-      cg.addColorStop(0.25, color.core);
+      cg.addColorStop(0.25, currentColor.core);
       cg.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = cg;
       ctx.globalAlpha = 0.85;
@@ -389,7 +494,7 @@ export default function ArcReactor({
       ctx.fill();
 
       ctx.globalAlpha = 0.9;
-      ctx.fillStyle = color.core;
+      ctx.fillStyle = currentColor.core;
       ctx.beginPath();
       ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
       ctx.fill();
@@ -456,7 +561,7 @@ export default function ArcReactor({
       try { cancelAnimationFrame(rafRef.current); } catch {}
       window.removeEventListener("resize", resize);
     };
-  }, [active, baseFilamentCount, color, size, volume]);
+  }, [baseFilamentCount]);
 
   return (
     <div className={`arc-reactor-root ${active ? "active" : "idle"} emotion-${emotion}`} style={{ width: `${size}px`, height: `${size}px` }}>

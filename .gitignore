@@ -47,6 +47,15 @@ voice.wav
 .env.agent.*
 /node_modules
 
+# Build outputs
+/dist/
+/build/
+
+# Runtime data/logs/models (keep local)
+/data/
+/logs/
+/models/
+
 # Frontend deps
 jarvis-frontend/node_modules/
 

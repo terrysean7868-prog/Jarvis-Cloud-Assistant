@@ -11,9 +11,10 @@ from DB, jobs, and API layers.
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from typing import Any
+
+from src.config import env
 
 
 WEB_TRAINING_SCHEMA_VERSION = 1
@@ -42,12 +43,12 @@ def jarvis_identity() -> dict[str, str]:
     - instance_id: machine/app instance identifier (env override)
     """
 
-    assistant_id = (os.getenv("JARVIS_ASSISTANT_ID") or "jarvis").strip() or "jarvis"
+    assistant_id = (env.get("JARVIS_ASSISTANT_ID") or "jarvis").strip() or "jarvis"
 
     instance_id = (
-        os.getenv("JARVIS_INSTANCE_ID")
-        or os.getenv("COMPUTERNAME")  # Windows
-        or os.getenv("HOSTNAME")  # Linux/macOS
+        env.get("JARVIS_INSTANCE_ID")
+        or env.get("COMPUTERNAME")  # Windows
+        or env.get("HOSTNAME")  # Linux/macOS
         or "local"
     )
     instance_id = (instance_id or "local").strip() or "local"

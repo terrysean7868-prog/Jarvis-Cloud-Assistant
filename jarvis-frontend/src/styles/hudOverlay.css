@@ -7,7 +7,7 @@
   align-items: center;
   z-index: 2;
   font-family: "Orbitron", sans-serif;
-  color: #00ffff;
+  color: var(--jarvis-accent, #00ffff);
 }
 
 /* Panels */
@@ -16,8 +16,8 @@
   padding: 20px;
   backdrop-filter: blur(5px);
   background: rgba(0, 40, 60, 0.15);
-  border: 1px solid rgba(0, 255, 255, 0.2);
-  box-shadow: 0 0 20px rgba(0, 255, 255, 0.2);
+  border: 1px solid var(--jarvis-accent-glow, rgba(0, 255, 255, 0.2));
+  box-shadow: 0 0 20px var(--jarvis-accent-glow, rgba(0, 255, 255, 0.2));
 }
 
 .hud-panel.left {
@@ -43,7 +43,7 @@
 }
 .hud-bar-fill {
   height: 100%;
-  background: linear-gradient(90deg, #00ffff, #0066ff);
+  background: linear-gradient(90deg, var(--jarvis-accent, #00ffff), rgba(255,255,255,0.18));
   transition: width 0.3s;
 }
 .hud-bar-fill.net {

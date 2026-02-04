@@ -12,6 +12,8 @@ from pathlib import Path
 from datetime import datetime
 import requests
 
+from src.config.secrets import render_secrets
+
 logger = logging.getLogger("jarvis.error_handler")
 
 
@@ -21,8 +23,9 @@ class ErrorHandler:
     def __init__(self):
         self.error_logs = []
         self.fix_history = []
-        self.render_api_key = os.getenv("RENDER_API_KEY")
-        self.render_service_id = os.getenv("RENDER_SERVICE_ID")
+        s = render_secrets()
+        self.render_api_key = s.api_key
+        self.render_service_id = s.service_id
     
     def check_render_logs(self) -> Dict:
         """Fetch and analyze Render logs"""

@@ -11,6 +11,8 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime
 
+from src.config import env
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -19,6 +21,13 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
     logger.warning("psutil not available")
+
+# Prime psutil CPU sampling so future calls with interval=0 are instantaneous.
+if PSUTIL_AVAILABLE:
+    try:
+        psutil.cpu_percent(interval=None)
+    except Exception:
+        pass
 
 # pyautogui will be imported lazily to avoid DISPLAY requirement on headless servers
 PYAUTOGUI_AVAILABLE = False
@@ -48,12 +57,21 @@ class SystemOperations:
         try:
             if not PSUTIL_AVAILABLE:
                 return {"status": "error", "message": "psutil not available"}
+
+            # psutil.disk_usage('/') is not valid on Windows.
+            disk_root = "/"
+            try:
+                if os.name == "nt":
+                    disk_root = env.get_str("SystemDrive", "C:") + "\\"
+            except Exception:
+                disk_root = "/"
             
             return {
                 "status": "success",
-                "cpu_percent": psutil.cpu_percent(interval=1),
+                # interval=0 returns immediately (uses last sampling window)
+                "cpu_percent": psutil.cpu_percent(interval=0.0),
                 "memory_percent": psutil.virtual_memory().percent,
-                "disk_percent": psutil.disk_usage('/').percent,
+                "disk_percent": psutil.disk_usage(disk_root).percent,
                 "boot_time": datetime.fromtimestamp(psutil.boot_time()).isoformat(),
                 "cpu_count": psutil.cpu_count(),
                 "process_count": len(psutil.pids())

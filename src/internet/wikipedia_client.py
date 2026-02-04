@@ -15,8 +15,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
-import os
 from urllib.parse import quote
+
+from src.config import env
 
 
 WIKI_API_BASE = "https://{lang}.wikipedia.org"
@@ -32,8 +33,8 @@ def _wiki_headers() -> dict[str, str]:
     """
 
     ua = (
-        os.getenv("JARVIS_WIKI_USER_AGENT")
-        or os.getenv("WIKIPEDIA_USER_AGENT")
+        env.get("JARVIS_WIKI_USER_AGENT")
+        or env.get("WIKIPEDIA_USER_AGENT")
         or "Jarvis-Cloud-Assistant/1.0 (https://github.com; contact: admin@example.com)"
     )
     ua = (ua or "").strip() or "Jarvis-Cloud-Assistant/1.0 (https://github.com; contact: admin@example.com)"

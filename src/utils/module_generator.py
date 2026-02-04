@@ -1,11 +1,21 @@
-import os
 from openai import OpenAI
+
+from src.config.secrets import llm_secrets
 
 # the newest OpenAI model is "gpt-5" which was released August 7, 2025.
 # do not change this unless explicitly requested by the user
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+_client = None
+
+
+def get_openai_client() -> OpenAI:
+    global _client
+    if _client is None:
+        api_key = llm_secrets().primary_api_key
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not configured")
+        _client = OpenAI(api_key=api_key)
+    return _client
 
 
 def generate_module(module_name, description=None):
@@ -20,8 +30,7 @@ def generate_module(module_name, description=None):
         tuple: (success: bool, module_code: str, error_message: str)
     """
     try:
-        if not OPENAI_API_KEY:
-            return False, None, "OPENAI_API_KEY not configured"
+        client = get_openai_client()
         
         # Build the prompt for module generation
         prompt = f"""You are an expert Python developer creating a module for the Jarvis Telegram bot.
@@ -56,7 +65,7 @@ def register(dp, services, scheduler):
 
 Generate ONLY the Python code for the module, no explanations or markdown. Make it functional and production-ready."""
 
-        response = openai_client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-5",
             messages=[
                 {"role": "system", "content": "You are an expert Python developer. Generate only clean, working Python code without any markdown formatting or explanations."},

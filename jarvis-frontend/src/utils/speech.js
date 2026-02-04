@@ -25,6 +25,10 @@ export function speak(text, onEnd) {
   synth.cancel();
   
   const utter = new SpeechSynthesisUtterance(text);
+  try {
+    const preferred = (typeof window !== "undefined" && window.__jarvisPreferredLang) ? String(window.__jarvisPreferredLang) : "";
+    if (preferred) utter.lang = preferred;
+  } catch {}
   utter.pitch = 1.1;
   utter.rate = 1.05;
   utter.volume = 1.0;
@@ -316,9 +320,15 @@ export function cleanupAudio() {
     microphone.disconnect();
     microphone = null;
   }
-  if (audioContext && audioContext.state !== "closed") {
-    audioContext.close();
-    audioContext = null;
+  const ctx = audioContext;
+  audioContext = null;
+  if (ctx) {
+    try {
+      if (ctx.state !== "closed") {
+        const p = ctx.close();
+        if (p && typeof p.then === "function") p.catch(() => {});
+      }
+    } catch {}
   }
   analyser = null;
 }
@@ -408,9 +418,17 @@ export async function recordPcm16Once(options = {}) {
       try { stream.getTracks().forEach(t => t.stop()); } catch {}
     };
 
+    let finished = false;
     const done = () => {
+      if (finished) return;
+      finished = true;
       stopAll();
-      try { ctx.close(); } catch {}
+      try {
+        if (ctx && ctx.state !== "closed") {
+          const p = ctx.close();
+          if (p && typeof p.then === "function") p.catch(() => {});
+        }
+      } catch {}
     };
 
     const resultPromise = new Promise((resolve) => {
@@ -484,7 +502,12 @@ export async function recordPcm16Once(options = {}) {
     return await resultPromise;
   } catch {
     try { stream.getTracks().forEach(t => t.stop()); } catch {}
-    try { ctx.close(); } catch {}
+    try {
+      if (ctx && ctx.state !== "closed") {
+        const p = ctx.close();
+        if (p && typeof p.then === "function") p.catch(() => {});
+      }
+    } catch {}
     return { audio_b64: null, sample_rate_hz: sampleRateHz };
   }
 }

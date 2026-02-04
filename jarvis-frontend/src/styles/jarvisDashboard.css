@@ -1,0 +1,434 @@
+:root {
+  --jarvis-accent: #00eaff;
+  --jarvis-accent-glow: rgba(0, 234, 255, 0.45);
+}
+
+.jarvis-dashboard {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-columns: 1fr 1.35fr 1fr;
+  gap: 0;
+  z-index: 11;
+  pointer-events: auto;
+
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(10, 10, 12, 0.22);
+  backdrop-filter: blur(10px);
+}
+
+.jd-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px;
+}
+
+.jd-middle {
+  padding: 12px;
+}
+
+/* Vertical dividers between the 3 columns */
+.jd-col + .jd-col {
+  border-left: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.jd-left .jd-panel,
+.jd-middle .jd-panel {
+  flex: 1;
+  min-height: 0;
+}
+
+.jd-right .jd-panel {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Keep secrets panel tight; give remaining space to picker */
+.jd-right .jd-panel:first-child {
+  flex: 0 0 auto;
+}
+
+.jd-right .jd-panel:first-child .jd-panelBody {
+  flex: 0 0 auto;
+  position: relative;
+}
+
+.jd-right .jd-panel:last-child {
+  flex: 1;
+  min-height: 260px;
+}
+
+/* Centered horizontal dividers inside left/right columns */
+.jd-left .jd-panel + .jd-panel,
+.jd-right .jd-panel + .jd-panel {
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  padding-top: 14px;
+  margin-top: 14px;
+}
+
+.jd-panel {
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  padding: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.jd-panelBody {
+  flex: 1;
+  min-height: 0;
+}
+
+.jd-scroll {
+  overflow: auto;
+  max-height: 100%;
+  padding-right: 6px;
+  display: flex;
+  flex-direction: column;
+
+  /* Transparent + theme-colored scrollbars */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--jarvis-accent) 70%, transparent) transparent;
+}
+
+.jd-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.jd-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.jd-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--jarvis-accent), rgba(255, 255, 255, 0.12));
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  box-shadow: 0 0 10px var(--jarvis-accent-glow);
+}
+
+.jd-scroll::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--jarvis-accent) 85%, white 0%), rgba(255, 255, 255, 0.18));
+}
+
+.jd-empty {
+  font-family: Inter, system-ui, sans-serif;
+  opacity: 0.85;
+  font-size: 13px;
+}
+
+/* HUDLogs overrides so it fills panel */
+.jarvis-dashboard .hud-logs {
+  width: 100%;
+  max-width: none;
+  max-height: none;
+  font-size: 12px;
+  opacity: 1;
+
+  /* Let the parent (.jd-scroll) handle scrolling */
+  overflow: visible;
+}
+
+.jd-progressTrack {
+  width: 100%;
+  height: 9px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.jd-progressFill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--jarvis-accent), rgba(255, 255, 255, 0.3));
+  box-shadow: 0 0 12px var(--jarvis-accent-glow);
+}
+
+.jd-taskList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.jd-task {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.2);
+  padding: 10px;
+}
+
+.jd-taskTop {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+
+.jd-taskTitle {
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.2;
+  color: rgba(230, 238, 248, 0.92);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  line-clamp: 2;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.jd-taskStatus {
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  opacity: 0.9;
+  white-space: nowrap;
+}
+
+.jd-status-pending { color: rgba(255, 255, 255, 0.85); }
+.jd-status-in_progress { color: var(--jarvis-accent); }
+.jd-status-paused { color: #ffd24d; }
+
+.jd-taskMeta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 12px;
+  opacity: 0.85;
+  margin-bottom: 8px;
+}
+
+.jd-characterBody {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  padding-top: 0;
+}
+
+/* Centered, but slightly higher than true center */
+.jd-characterBody > * {
+  transform: translateY(-34px);
+}
+
+.jd-copyRow {
+  display: grid;
+  grid-template-columns: 110px 1fr 76px;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 0;
+}
+
+.jd-copyLabel {
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 12px;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+.jd-copyValue {
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 11px;
+  opacity: 0.95;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jd-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid var(--jarvis-accent);
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--jarvis-accent);
+  cursor: pointer;
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 12px;
+  box-shadow: 0 0 0 rgba(0,0,0,0);
+}
+
+.jd-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  border-color: rgba(255, 255, 255, 0.14);
+  color: rgba(230, 238, 248, 0.75);
+}
+
+.jd-btn:hover:not(:disabled) {
+  border-color: var(--jarvis-accent);
+  box-shadow: 0 0 14px var(--jarvis-accent-glow);
+}
+
+.jd-connectBtn {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.jd-toast {
+  /* Fixed overlay so it doesn't push content and stays bottom-right on screen */
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  left: auto;
+  transform: none;
+  z-index: 9999;
+
+  margin: 0;
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 12px;
+  color: var(--jarvis-accent);
+  background: rgba(10, 10, 12, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 999px;
+  padding: 6px 10px;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 0 18px var(--jarvis-accent-glow);
+  pointer-events: none;
+}
+
+.jd-emptyCentered {
+  text-align: center;
+  margin: auto;
+}
+
+.jd-colorPicker {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  height: 100%;
+}
+
+.jd-right .jd-panel:last-child .jd-panelBody {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.jd-hexPickerWrap {
+  width: 190px;
+  max-width: 100%;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.jd-metricsGrid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.jd-metricBarTrack {
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  margin-top: 8px;
+}
+
+.jd-metricBarFill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--jarvis-accent), rgba(255, 255, 255, 0.22));
+  box-shadow: 0 0 10px var(--jarvis-accent-glow);
+}
+
+.jd-metric {
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 12px;
+  padding: 10px;
+  min-width: 0;
+}
+
+.jd-metricWide {
+  grid-column: 1 / -1;
+}
+
+.jd-metricLabel {
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 11px;
+  opacity: 0.95;
+  margin-bottom: 6px;
+  color: var(--jarvis-accent);
+}
+
+.jd-metricValue {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  color: rgba(230, 238, 248, 0.92);
+  opacity: 0.82;
+}
+
+.jd-metricValueAccent {
+  color: var(--jarvis-accent);
+  opacity: 0.95;
+}
+
+.jd-metricTrunc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (min-width: 1025px) {
+  /* Keep right-side content from sitting under the fixed user/logout header */
+  .jd-right .jd-panel:first-child {
+    margin-top: 62px;
+  }
+}
+
+@media (max-width: 1024px) {
+  .jarvis-dashboard {
+    grid-template-columns: 1fr;
+  }
+
+  .jd-col + .jd-col {
+    border-left: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.10);
+  }
+}
+
+@media (max-width: 520px) {
+  .jd-copyRow {
+    grid-template-columns: 1fr 76px;
+    grid-template-areas:
+      "label btn"
+      "value btn";
+    row-gap: 6px;
+  }
+
+  .jd-copyLabel { grid-area: label; }
+  .jd-copyValue { grid-area: value; }
+  .jd-copyRow .jd-btn { grid-area: btn; }
+
+  .jd-metricsGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .jd-metricWide {
+    grid-column: auto;
+  }
+}

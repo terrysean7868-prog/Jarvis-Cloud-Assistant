@@ -5,6 +5,7 @@ Handles user sessions with browser storage, auto-reconnect on reload, and expiry
 
 import os
 import json
+import os
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -183,6 +184,12 @@ _cleanup_scheduler = None
 def start_session_cleanup_task():
     """Start background task to clean expired sessions"""
     global _cleanup_scheduler
+
+    # Desktop optimization: allow disabling this background scheduler.
+    # Default is enabled for server deployments.
+    flag = (os.getenv("JARVIS_ENABLE_SESSION_CLEANUP", "true") or "true").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return
     
     if _cleanup_scheduler is not None:
         return  # Already running

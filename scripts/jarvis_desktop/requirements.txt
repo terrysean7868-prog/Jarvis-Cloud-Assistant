@@ -1,0 +1,3 @@
+PySide6
+pywebview>=4.4
+requests

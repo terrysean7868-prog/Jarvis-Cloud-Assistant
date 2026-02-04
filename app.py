@@ -3,10 +3,12 @@ import asyncio
 from pathlib import Path
 import time
 import re
+import uuid
 from datetime import datetime
 import base64
 import secrets
 from datetime import timedelta, timezone
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,9 +18,13 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import List, Optional, Any, Dict
 
+from src.config import env
+
 from src.core.llm_adapter import LLMAdapter
 from src.core.jarvis_brain import JarvisBrain
 from src.core.executor import ActionExecutor
+from src.core.chat_orchestrator import ChatOrchestrator
+from src.core.notification_hub import notification_hub
 from src.utils.git_sync import git_sync, setup_ssh_trust
 
 # Self-update is optional and may pull in extra dependencies. Keep API boot resilient.
@@ -64,7 +70,50 @@ except (ImportError, KeyError, Exception) as e:
 # =========================================================
 # FastAPI Initialization
 # =========================================================
-app = FastAPI(title="Jarvis Cloud Assistant")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Startup
+    print("[OK] Jarvis server startup (lifespan)")
+    try:
+        database._ensure_connected()
+        print("[DB] Connection check complete")
+    except Exception as e:
+        print(f"[INFO] DB error during startup (will retry): {e}")
+
+    try:
+        start_session_cleanup_task()
+        print("[OK] Session cleanup task started")
+    except Exception as e:
+        print(f"[INFO] Could not start session cleanup (already running): {e}")
+
+    if ENABLE_SCHEDULER and SCHEDULER_AVAILABLE and initialize_scheduler:
+        try:
+            initialize_scheduler()
+        except Exception as e:
+            print(f"[INFO] Scheduler failed to start: {e}")
+
+    print("[OK] Jarvis server started.")
+
+    try:
+        yield
+    finally:
+        # Shutdown
+        if SCHEDULER_AVAILABLE and shutdown_scheduler:
+            try:
+                shutdown_scheduler()
+            except Exception:
+                pass
+
+        # Best-effort cleanup for async HTTP sessions.
+        try:
+            await _shutdown_cleanup()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="Jarvis Cloud Assistant", lifespan=lifespan)
 load_dotenv()
 
 START_TS = time.time()
@@ -73,7 +122,7 @@ START_TS = time.time()
 FRONTEND_BUILD_DIR = Path(__file__).resolve().parent / "jarvis-frontend" / "build"
 
 # Enable/disable background scheduler via env
-ENABLE_SCHEDULER = os.getenv("JARVIS_ENABLE_SCHEDULER", "true").lower() in ("1", "true", "yes", "y")
+ENABLE_SCHEDULER = env.get_bool("JARVIS_ENABLE_SCHEDULER", True)
 
 # =========================================================
 # Runtime Mode / Security
@@ -81,20 +130,102 @@ ENABLE_SCHEDULER = os.getenv("JARVIS_ENABLE_SCHEDULER", "true").lower() in ("1",
 # Cloud mode is intended for hosted deployments (e.g., Render). In this mode we:
 # - Require an authenticated session for chat + internet endpoints (to prevent public abuse)
 # - Disable local/PC control and local filesystem endpoints (these are unsafe + meaningless in cloud)
-CLOUD_MODE = os.getenv("JARVIS_CLOUD_MODE", "false").lower() in ("1", "true", "yes", "y")
-AGENT_SHARED_SECRET = os.getenv("JARVIS_AGENT_SHARED_SECRET", "")
-EXPOSE_AGENT_SHARED_SECRET = os.getenv("JARVIS_EXPOSE_AGENT_SHARED_SECRET", "false").lower() in ("1", "true", "yes", "y")
-DEFAULT_DEVICE_ID = os.getenv("JARVIS_DEFAULT_DEVICE_ID", "primary")
-DEVICE_OWNER_USERNAME = os.getenv("JARVIS_DEVICE_OWNER_USERNAME", "")
-ADMIN_USERNAME = (os.getenv("JARVIS_ADMIN_USERNAME", "admin") or "admin").strip().lower()
-ADMIN_BOOTSTRAP_SECRET = os.getenv("JARVIS_ADMIN_BOOTSTRAP_SECRET", "")
+CLOUD_MODE = env.get_bool("JARVIS_CLOUD_MODE", False)
+VOICE_ONLY_MODE = env.get_bool("JARVIS_VOICE_ONLY", True)
+PC_AGENT_ENABLED = env.get_bool("JARVIS_ENABLE_PC_AGENT", True)
+AGENT_SHARED_SECRET = env.get_str("JARVIS_AGENT_SHARED_SECRET", "")
+EXPOSE_AGENT_SHARED_SECRET = env.get_bool("JARVIS_EXPOSE_AGENT_SHARED_SECRET", False)
+DEFAULT_DEVICE_ID = env.get_str("JARVIS_DEFAULT_DEVICE_ID", "primary")
+DEVICE_OWNER_USERNAME = env.get_str("JARVIS_DEVICE_OWNER_USERNAME", "")
+LOCAL_DEFAULT_DEVICE_FALLBACK = env.get_bool("JARVIS_LOCAL_DEFAULT_DEVICE_FALLBACK", True)
+ADMIN_USERNAME = (env.get_str("JARVIS_ADMIN_USERNAME", "admin") or "admin").strip().lower()
+ADMIN_BOOTSTRAP_SECRET = env.get_str("JARVIS_ADMIN_BOOTSTRAP_SECRET", "")
+
+# =========================================================
+# Small in-memory caches for hot paths
+# =========================================================
+# These are intentionally tiny + short-lived to reduce DB/file churn on endpoints
+# like /api/agent/config that are called frequently by the UI.
+import time
+
+_ROLE_CACHE_TTL_S = 30
+_ROLE_CACHE: dict[str, tuple[float, str]] = {}
+
+_DEVICE_LOOKUP_CACHE_TTL_S = 60
+_OWNER_TO_DEVICE_CACHE: dict[str, tuple[float, str | None]] = {}
+_DEVICE_TO_OWNER_CACHE: dict[str, tuple[float, str | None]] = {}
+
+_AGENT_CONFIG_CACHE_TTL_S = 120
+_AGENT_CONFIG_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+
+_DEVICE_REGISTRY_INDEX_READY = False
+_DEVICE_PERMISSIONS_INDEX_READY = False
+_AGENT_CONFIG_INDEX_READY = False
 
 
-device_hub = DeviceHub(shared_secret=AGENT_SHARED_SECRET)
+def _require_pc_agent_enabled() -> None:
+    if not PC_AGENT_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "PC agent features are disabled in this runtime",
+                "hint": "This is expected for the desktop app. For web/cloud remote control, enable JARVIS_ENABLE_PC_AGENT=true.",
+            },
+        )
+
+
+class _DisabledDeviceHub:
+    async def send_job(self, device_id: str, job: dict) -> None:
+        raise PermissionError("PC agent disabled")
+
+    async def register_token(self, device_id: str, websocket: WebSocket, capabilities: dict) -> None:
+        raise PermissionError("PC agent disabled")
+
+    async def register(self, device_id: str, secret: str, websocket: WebSocket, capabilities: dict) -> None:
+        raise PermissionError("PC agent disabled")
+
+    async def unregister(self, device_id: str) -> None:
+        return None
+
+    async def touch(self, device_id: str) -> None:
+        return None
+
+    async def update_capabilities(self, device_id: str, capabilities: dict) -> None:
+        return None
+
+    async def get_agent(self, device_id: str):
+        return None
+
+    async def list_agents(self) -> dict:
+        return {}
+
+    async def is_connected(self, device_id: str) -> bool:
+        return False
+
+
+# Local/dev convenience: if no shared secret is configured, generate one so the UI
+# can display it and legacy agent auth can still work. (Token auth is preferred.)
+# Note: in the desktop app we disable PC-agent features by default.
+if PC_AGENT_ENABLED and (not CLOUD_MODE) and (not AGENT_SHARED_SECRET):
+    try:
+        AGENT_SHARED_SECRET = secrets.token_urlsafe(32)
+    except Exception:
+        AGENT_SHARED_SECRET = os.urandom(32).hex()
+
+device_hub = DeviceHub(shared_secret=AGENT_SHARED_SECRET) if PC_AGENT_ENABLED else _DisabledDeviceHub()
+# Local/dev convenience: agent token issuance requires JARVIS_JWT_SECRET.
+# In cloud mode this must be explicitly configured; in local mode we can
+# generate a per-run secret so PC agent pairing works out of the box.
+if (not CLOUD_MODE) and (not (os.getenv("JARVIS_JWT_SECRET") or "").strip()):
+    try:
+        os.environ["JARVIS_JWT_SECRET"] = secrets.token_urlsafe(48)
+    except Exception:
+        os.environ["JARVIS_JWT_SECRET"] = os.urandom(48).hex()
+
 auth_tokens = AuthTokens()
 
-PUBLIC_SERVER_URL = (os.getenv("JARVIS_PUBLIC_SERVER_URL") or "https://jarvis-cloud-assistant.onrender.com").strip().rstrip("/")
-AGENT_TOKEN_TTL_SECONDS = int(os.getenv("JARVIS_AGENT_TOKEN_TTL_SECONDS", "2592000"))  # 30d
+PUBLIC_SERVER_URL = (env.get_str("JARVIS_PUBLIC_SERVER_URL", "https://jarvis-cloud-assistant.onrender.com") or "https://jarvis-cloud-assistant.onrender.com").strip().rstrip("/")
+AGENT_TOKEN_TTL_SECONDS = env.get_int("JARVIS_AGENT_TOKEN_TTL_SECONDS", 2592000)  # 30d
 
 def _get_principal(session_id: str | None) -> dict:
     """Return principal dict: {username, role, auth_type}.
@@ -113,10 +244,18 @@ def _get_principal(session_id: str | None) -> dict:
                 detail="Invalid or expired session. Please login again.",
             )
         # Prefer authoritative role from the user store (MongoDB/file), so role changes apply immediately.
-        # Fallback to the role embedded in the token if the store is unavailable.
+        # Cache briefly to avoid repeated file/DB reads on hot endpoints.
         role = None
         try:
-            role = voice_auth.get_role(username)
+            u = (username or "").strip().lower()
+            now = time.time()
+            cached = _ROLE_CACHE.get(u)
+            if cached and (now - cached[0]) < _ROLE_CACHE_TTL_S:
+                role = cached[1]
+            else:
+                role = voice_auth.get_role(username)
+                if role:
+                    _ROLE_CACHE[u] = (now, str(role).strip().lower())
         except Exception:
             role = None
         if not role:
@@ -194,12 +333,18 @@ ADMIN_ONLY_ACTION_TYPES = {
     # Local/PC control
     "open_app", "close_app", "switch_app",
     "execute_command",
+    "set_brightness", "adjust_brightness",
+    "set_power_plan", "set_energy_saver",
+    "set_volume", "adjust_volume",
+    "set_mute", "toggle_mute",
     "capture_screen", "screen_navigation",
     # Filesystem
     "read", "list", "mkdir",
     "write", "edit", "delete", "move", "copy", "cleanup",
     # Self-modifying
     "self_update", "self_add",
+    # Universal envelope
+    "device_action",
 }
 
 
@@ -342,14 +487,17 @@ def _device_registry_collection():
     if database.db is None:
         return None
     col = database.db["device_registry"]
-    try:
-        col.create_index("device_id", unique=True)
-    except Exception:
-        pass
-    try:
-        col.create_index("owner_username", unique=True, sparse=True)
-    except Exception:
-        pass
+    global _DEVICE_REGISTRY_INDEX_READY
+    if not _DEVICE_REGISTRY_INDEX_READY:
+        try:
+            col.create_index("device_id", unique=True)
+        except Exception:
+            pass
+        try:
+            col.create_index("owner_username", unique=True, sparse=True)
+        except Exception:
+            pass
+        _DEVICE_REGISTRY_INDEX_READY = True
     return col
 
 
@@ -369,14 +517,17 @@ def _device_permissions_collection():
     if database.db is None:
         return None
     col = database.db["device_permissions"]
-    try:
-        col.create_index("device_id", unique=True)
-    except Exception:
-        pass
-    try:
-        col.create_index("owner_username")
-    except Exception:
-        pass
+    global _DEVICE_PERMISSIONS_INDEX_READY
+    if not _DEVICE_PERMISSIONS_INDEX_READY:
+        try:
+            col.create_index("device_id", unique=True)
+        except Exception:
+            pass
+        try:
+            col.create_index("owner_username")
+        except Exception:
+            pass
+        _DEVICE_PERMISSIONS_INDEX_READY = True
     return col
 
 
@@ -396,12 +547,30 @@ def _agent_config_collection():
     if database.db is None:
         return None
     col = database.db["agent_configs"]
+    global _AGENT_CONFIG_INDEX_READY
+    if not _AGENT_CONFIG_INDEX_READY:
+        try:
+            col.create_index("device_id", unique=True)
+        except Exception:
+            pass
+        try:
+            col.create_index("owner_username")
+        except Exception:
+            pass
+        _AGENT_CONFIG_INDEX_READY = True
+    return col
+
+
+def _skills_collection():
     try:
-        col.create_index("device_id", unique=True)
+        database._ensure_connected()
     except Exception:
         pass
+    if database.db is None:
+        return None
+    col = database.db["skills"]
     try:
-        col.create_index("owner_username")
+        col.create_index([("owner", 1), ("name", 1)], unique=True)
     except Exception:
         pass
     return col
@@ -470,26 +639,50 @@ def _normalize_device_id(device_id: str | None) -> str:
 
 def _get_owner_device_id(owner_username: str | None) -> str | None:
     """Return the device_id owned by the given user (or None)."""
-    col = _device_registry_collection()
-    if col is None:
-        return None
     owner = (owner_username or "").strip().lower()
     if not owner:
         return None
+
+    now = time.time()
+    cached = _OWNER_TO_DEVICE_CACHE.get(owner)
+    if cached and (now - cached[0]) < _DEVICE_LOOKUP_CACHE_TTL_S:
+        return cached[1]
+
+    col = _device_registry_collection()
+    if col is None:
+        _OWNER_TO_DEVICE_CACHE[owner] = (now, None)
+        return None
     doc = col.find_one({"owner_username": owner}, {"_id": 0, "device_id": 1})
-    return (doc or {}).get("device_id")
+    did = (doc or {}).get("device_id")
+    did = _normalize_device_id(did) or None
+    _OWNER_TO_DEVICE_CACHE[owner] = (now, did)
+    if did:
+        _DEVICE_TO_OWNER_CACHE[did] = (now, owner)
+    return did
 
 
 def _get_device_owner(device_id: str | None) -> str | None:
     """Return the owner_username for a device_id (or None)."""
-    col = _device_registry_collection()
-    if col is None:
-        return None
     did = _normalize_device_id(device_id)
     if not did:
         return None
+
+    now = time.time()
+    cached = _DEVICE_TO_OWNER_CACHE.get(did)
+    if cached and (now - cached[0]) < _DEVICE_LOOKUP_CACHE_TTL_S:
+        return cached[1]
+
+    col = _device_registry_collection()
+    if col is None:
+        _DEVICE_TO_OWNER_CACHE[did] = (now, None)
+        return None
     doc = col.find_one({"device_id": did}, {"_id": 0, "owner_username": 1})
-    return (doc or {}).get("owner_username")
+    owner = (doc or {}).get("owner_username")
+    owner = (owner or "").strip().lower() or None
+    _DEVICE_TO_OWNER_CACHE[did] = (now, owner)
+    if owner:
+        _OWNER_TO_DEVICE_CACHE[owner] = (now, did)
+    return owner
 
 
 def _set_device_owner(device_id: str, owner_username: str | None, updated_by: str | None = None):
@@ -569,10 +762,18 @@ def _public_user_profile(username: str | None) -> dict | None:
         assistant_name = " ".join(assistant_name.split())[:24]
         if not assistant_name:
             assistant_name = "Jarvis"
+
+        # Auto-detect whether biometrics are enrolled (no env flags required on frontend).
+        try:
+            embeds = u.get("voice_bio_embeddings")
+            voice_bio_enrolled = isinstance(embeds, list) and len(embeds) > 0
+        except Exception:
+            voice_bio_enrolled = False
         return {
             "username": (u.get("username") or username).strip().lower(),
             "role": (u.get("role") or voice_auth.get_role(username) or "user").strip().lower(),
             "assistant_name": assistant_name,
+            "voice_biometrics_enrolled": bool(voice_bio_enrolled),
             "created_at": u.get("created_at"),
             "last_login": u.get("last_login"),
             "updated_at": u.get("updated_at"),
@@ -786,8 +987,13 @@ def _is_remote_device_action(a: dict) -> bool:
     """Actions that are meaningful on the user's PC but unsafe/meaningless on Render."""
     t = (a or {}).get("type")
     return t in {
+        "device_action",
         "open_app", "close_app", "switch_app",
         "execute_command",
+        "set_brightness", "adjust_brightness",
+        "set_power_plan", "set_energy_saver",
+        "set_volume", "adjust_volume",
+        "set_mute", "toggle_mute",
         "capture_screen", "screen_navigation",
         # Filesystem actions should run on the user's machine (agent), not on Render.
         "read", "list", "mkdir",
@@ -797,6 +1003,7 @@ def _is_remote_device_action(a: dict) -> bool:
 
 async def _dispatch_actions_to_device(device_id: str, username: str, actions: list[dict], source_text: str):
     """Forward actions to a connected local agent."""
+    _require_pc_agent_enabled()
     job = {
         "job_id": f"job_{os.urandom(8).hex()}",
         "device_id": device_id,
@@ -814,6 +1021,21 @@ async def _dispatch_actions_to_device(device_id: str, username: str, actions: li
 @app.websocket("/ws/agent")
 async def agent_ws(ws: WebSocket):
     await ws.accept()
+
+    if not PC_AGENT_ENABLED:
+        # Desktop mode: do not accept agent connections.
+        try:
+            # Keep payload shape consistent with _auth_fail so clients can show
+            # a specific error reason.
+            await ws.send_json({"type": "error", "error": "auth_failed", "reason": "pc_agent_disabled"})
+        except Exception:
+            pass
+        try:
+            await ws.close(code=1008)
+        except Exception:
+            pass
+        return
+
     device_id: str | None = None
 
     async def _auth_fail(reason: str):
@@ -940,12 +1162,13 @@ class AgentConfigRequest(BaseModel):
 
 
 @app.post("/api/agent/config")
-async def agent_config(req: AgentConfigRequest):
+async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTasks):
     """Return agent connection config stored in MongoDB.
 
     This avoids keeping secrets in local .env files. The server issues a JWT agent token
     that the PC agent can present over /ws/agent.
     """
+    _require_pc_agent_enabled()
     p = _require_authenticated_session(req.session_id)
     username = (p.get("username") or "").strip().lower()
     role = (p.get("role") or "user").strip().lower()
@@ -975,10 +1198,22 @@ async def agent_config(req: AgentConfigRequest):
         if owned and _normalize_device_id(owned) != _normalize_device_id(did):
             raise HTTPException(status_code=403, detail="Users cannot request agent config for another device")
 
+    # Fast-path: return a recent cached config (avoids repeated DB lookups and token re-issuance).
+    try:
+        cache_key = (req.session_id, _normalize_device_id(did))
+        cached = _AGENT_CONFIG_CACHE.get(cache_key)
+        if cached and (time.time() - cached[0]) < _AGENT_CONFIG_CACHE_TTL_S:
+            return cached[1]
+    except Exception:
+        pass
+
     # Record config in MongoDB (no secrets stored).
-    col = _agent_config_collection()
-    if col is not None:
+    # Do this in a background task so the UI gets the token immediately.
+    def _persist_agent_cfg():
         try:
+            col = _agent_config_collection()
+            if col is None:
+                return
             col.update_one(
                 {"device_id": did},
                 {
@@ -994,7 +1229,12 @@ async def agent_config(req: AgentConfigRequest):
                 upsert=True,
             )
         except Exception:
-            pass
+            return
+
+    try:
+        background_tasks.add_task(_persist_agent_cfg)
+    except Exception:
+        pass
 
     token = _issue_agent_token(device_id=did, owner_username=username)
     ws_url = ("wss://" + PUBLIC_SERVER_URL[len("https://"):] + "/ws/agent") if PUBLIC_SERVER_URL.startswith("https://") else ("ws://" + PUBLIC_SERVER_URL[len("http://"):] + "/ws/agent")
@@ -1014,6 +1254,12 @@ async def agent_config(req: AgentConfigRequest):
         if (not CLOUD_MODE) or (role == "admin"):
             payload["agent_shared_secret"] = AGENT_SHARED_SECRET
 
+    # Cache briefly to make refresh/login feel instant.
+    try:
+        _AGENT_CONFIG_CACHE[(req.session_id, _normalize_device_id(did))] = (time.time(), payload)
+    except Exception:
+        pass
+
     return payload
 
 
@@ -1021,10 +1267,10 @@ async def agent_config(req: AgentConfigRequest):
 # Speech-to-Text (Mobile fallback)
 # =========================================================
 
-GOOGLE_SPEECH_ENABLED = os.getenv("GOOGLE_SPEECH_ENABLED", "false").lower() in ("1", "true", "yes")
-GOOGLE_SPEECH_LANGUAGE_DEFAULT = os.getenv("GOOGLE_SPEECH_LANGUAGE_DEFAULT", "en-US")
-GOOGLE_SPEECH_CREDENTIALS_JSON = os.getenv("GOOGLE_SPEECH_CREDENTIALS_JSON", "").strip()
-GOOGLE_SPEECH_CREDENTIALS_B64 = os.getenv("GOOGLE_SPEECH_CREDENTIALS_B64", "").strip()
+GOOGLE_SPEECH_ENABLED = env.get_bool("GOOGLE_SPEECH_ENABLED", False)
+GOOGLE_SPEECH_LANGUAGE_DEFAULT = env.get_str("GOOGLE_SPEECH_LANGUAGE_DEFAULT", "en-US")
+GOOGLE_SPEECH_CREDENTIALS_JSON = env.get_str("GOOGLE_SPEECH_CREDENTIALS_JSON", "").strip()
+GOOGLE_SPEECH_CREDENTIALS_B64 = env.get_str("GOOGLE_SPEECH_CREDENTIALS_B64", "").strip()
 
 
 def _get_google_speech_client_and_creds():
@@ -1205,6 +1451,7 @@ async def user_configure_device(req: UserDeviceConfigureRequest):
       - If exactly one unowned agent is connected, claim it.
       - If multiple candidates exist, ask the user to specify a device_id.
     """
+    _require_pc_agent_enabled()
     p = _require_authenticated_session(req.session_id)
     user_id = (p.get("username") or "").strip().lower()
 
@@ -1324,6 +1571,7 @@ async def device_dispatch(req: DeviceDispatchRequest):
 
     This is only meaningful in cloud mode.
     """
+    _require_pc_agent_enabled()
     p = _require_authenticated_session(req.session_id)
     username = (p.get("username") or "").strip().lower()
     role = (p.get("role") or "user").strip().lower()
@@ -1360,30 +1608,113 @@ async def device_dispatch(req: DeviceDispatchRequest):
             "hint": "Start pc_agent.py on the target PC and ensure JARVIS_SERVER_URL and JARVIS_AGENT_SHARED_SECRET match the server.",
         })
 
+    actions = req.actions or []
+    if not isinstance(actions, list):
+        raise HTTPException(status_code=400, detail={
+            "message": "Invalid actions payload",
+            "hint": "actions must be a JSON array of objects like {type: 'open_app', ...}",
+        })
+
+    # Validate action objects early so we fail fast with a helpful message.
+    for i, a in enumerate(actions):
+        if not isinstance(a, dict):
+            raise HTTPException(status_code=400, detail={
+                "message": "Invalid action",
+                "index": i,
+                "hint": "Each action must be an object with at least a 'type' field.",
+            })
+        t = (a.get("type") or "").strip()
+        if not t:
+            raise HTTPException(status_code=400, detail={
+                "message": "Invalid action",
+                "index": i,
+                "hint": "Each action must include a non-empty 'type'.",
+            })
+
     agent = await device_hub.get_agent(did)
     caps = (agent or {}).get("capabilities") or None
     if not caps:
-        raise HTTPException(status_code=409, detail="Agent is connected but did not report capabilities. Update pc_agent.py and restart the agent.")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Agent is connected but did not report capabilities",
+                "action": "update_pc_agent",
+                "hint": "Update pc_agent.py and restart the agent so it reports capabilities on connect.",
+                "device_id": did,
+            },
+        )
 
     saved_perms = _get_saved_device_permissions(did) or {}
 
     def _capability_requirement(action_type: str):
         t = (action_type or "").strip()
+        if t == "device_action":
+            # Capability is derived from the nested action name.
+            return None
         if t in ("open_app", "close_app", "switch_app"):
             return ("allow_app_control", "JARVIS_AGENT_ALLOW_APP_CONTROL")
-        if t == "execute_command":
+        if t in (
+            "execute_command",
+            "set_brightness", "adjust_brightness",
+            "set_power_plan", "set_energy_saver",
+            "set_volume", "adjust_volume",
+            "set_mute", "toggle_mute",
+            # Universal device actions (names)
+            "lock_screen",
+            "sleep",
+            "hibernate",
+            "shutdown",
+            "restart",
+            "logoff",
+            "open_url",
+            "open_path",
+            "get_clipboard",
+            "set_clipboard",
+            "list_processes",
+            "kill_process",
+            "set_wifi",
+            "set_bluetooth",
+            "set_airplane_mode",
+        ):
             return ("allow_execute_command", "JARVIS_AGENT_ALLOW_EXECUTE_COMMAND")
         if t in ("capture_screen", "screen_navigation", "type_text", "press_key", "hotkey"):
             return ("allow_screen", "JARVIS_AGENT_ALLOW_SCREEN")
+        # Universal device actions (names) that operate by keystrokes/UI automation.
+        if t in (
+            "show_desktop",
+            "open_task_manager",
+            "open_run_dialog",
+            "open_start_menu",
+            "open_quick_settings",
+            "open_notification_center",
+            "window_snap_left",
+            "window_snap_right",
+            "window_maximize",
+            "window_minimize",
+            "media_play_pause",
+            "media_next_track",
+            "media_prev_track",
+            "media_stop",
+            "alt_tab",
+            "save_screenshot",
+        ):
+            return ("allow_screen", "JARVIS_AGENT_ALLOW_SCREEN")
+        if t in (
+            "find_files",
+        ):
+            return ("allow_file_ops", "JARVIS_AGENT_ALLOW_FILE_OPS")
         if t in ("read", "write", "edit", "delete", "move", "copy", "list", "mkdir", "cleanup"):
             return ("allow_file_ops", "JARVIS_AGENT_ALLOW_FILE_OPS")
         if t in ("self_update", "self_add"):
             return ("allow_self_update", "JARVIS_AGENT_ALLOW_SELF_UPDATE")
         return None
 
-    for a in (req.actions or []):
+    for a in actions:
         at = (a or {}).get("type") or ""
         req_cap = _capability_requirement(at)
+        if at == "device_action":
+            nm = (a or {}).get("name") or (a or {}).get("action") or ""
+            req_cap = _capability_requirement(str(nm))
         if not req_cap:
             continue
         key, env_name = req_cap
@@ -1409,8 +1740,168 @@ async def device_dispatch(req: DeviceDispatchRequest):
                 "suggestion": f"Enable {env_name}=true on the PC agent.",
             })
 
-    job = await _dispatch_actions_to_device(did, username=username or "user", actions=req.actions, source_text=req.source_text or "")
-    return {"status": "queued", "job": job}
+    job = await _dispatch_actions_to_device(did, username=username or "user", actions=actions, source_text=req.source_text or "")
+    return {"status": "queued", "job": job, "request_id": f"disp_{uuid.uuid4().hex[:12]}"}
+
+
+# =========================================================
+# Skills API
+# =========================================================
+class SkillUpsertRequest(BaseModel):
+    session_id: str
+    name: str
+    description: str | None = None
+    type: str | None = "n8n"
+    path: str | None = None
+    enabled: bool | None = True
+    version: str | None = "1.0"
+    tags: List[str] | None = None
+    inputs: Dict[str, Any] | None = None
+    outputs: Dict[str, Any] | None = None
+    trigger_phrases: List[str] | None = None
+    n8n_workflow_id: str | None = None
+
+
+class SkillUpdateRequest(BaseModel):
+    session_id: str
+    name: str
+    updates: Dict[str, Any]
+
+
+def _slugify_skill(name: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9_\- ]+", "", name or "").strip().lower()
+    s = re.sub(r"\s+", "-", s)
+    return s[:60] if s else "skill"
+
+
+async def _maybe_create_n8n_webhook_workflow(name: str, path: str) -> str | None:
+    """Best-effort N8N workflow creation when credentials are configured."""
+    api_base = (env.get_str("N8N_API_URL", "") or "").strip().rstrip("/")
+    api_key = (env.get_str("N8N_API_KEY", "") or "").strip()
+    auto_create = env.get_bool("JARVIS_N8N_AUTO_CREATE_SKILL_WEBHOOK", False)
+    if not api_base or not api_key or not auto_create:
+        return None
+
+    try:
+        import aiohttp
+        headers = {"Content-Type": "application/json", "X-N8N-API-KEY": api_key}
+        workflow = {
+            "name": f"Jarvis Skill: {name}",
+            "nodes": [
+                {
+                    "parameters": {
+                        "httpMethod": "POST",
+                        "path": path,
+                        "responseMode": "onReceived"
+                    },
+                    "id": "webhook",
+                    "name": "Webhook",
+                    "type": "n8n-nodes-base.webhook",
+                    "typeVersion": 1,
+                    "position": [240, 300]
+                }
+            ],
+            "connections": {}
+        }
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.post(f"{api_base}/workflows", headers=headers, json=workflow) as resp:
+                data = await resp.json()
+                if resp.status >= 200 and resp.status < 300:
+                    return str(data.get("id") or "") or None
+    except Exception:
+        return None
+    return None
+
+
+@app.post("/api/skills/list")
+async def skills_list(req: dict):
+    """List skills for the authenticated user."""
+    session_id = (req or {}).get("session_id")
+    p = _require_authenticated_session(session_id)
+    col = _skills_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    items = list(col.find({"owner": _normalize_user_id(p.get("username"))}, {"_id": 0}).sort("name", 1))
+    return {"status": "success", "skills": items}
+
+
+@app.post("/api/skills/add")
+async def skills_add(req: SkillUpsertRequest):
+    p = _require_authenticated_session(req.session_id)
+    role = (p.get("role") or "user").strip().lower()
+    write_role = (env.get_str("JARVIS_SKILLS_WRITE_ROLE", "user") or "user").strip().lower()
+    if write_role == "admin" and role != "admin":
+        raise HTTPException(status_code=403, detail="Admin required to add skills")
+
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Skill name required")
+
+    path = (req.path or "").strip()
+    if not path:
+        path = f"skills/{_slugify_skill(name)}"
+
+    owner = _normalize_user_id(p.get("username"))
+    skill = {
+        "owner": owner,
+        "name": name,
+        "description": (req.description or "").strip() or None,
+        "type": (req.type or "n8n").strip().lower(),
+        "path": path or None,
+        "enabled": bool(req.enabled) if req.enabled is not None else True,
+        "version": (req.version or "1.0").strip(),
+        "tags": req.tags or [],
+        "inputs": req.inputs or {"query": "string"},
+        "outputs": req.outputs or {"result": "string"},
+        "trigger_phrases": req.trigger_phrases or [f"run skill {name}"],
+        "n8n_workflow_id": (req.n8n_workflow_id or "").strip() or None,
+        "updated_at": datetime.utcnow(),
+    }
+
+    # Optional auto-create N8N webhook workflow
+    if skill.get("type") == "n8n" and not skill.get("n8n_workflow_id"):
+        wf_id = await _maybe_create_n8n_webhook_workflow(name=name, path=path)
+        if wf_id:
+            skill["n8n_workflow_id"] = wf_id
+
+    col = _skills_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    col.update_one(
+        {"owner": owner, "name": name},
+        {"$set": skill, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    return {"status": "success", "skill": skill}
+
+
+@app.post("/api/skills/update")
+async def skills_update(req: SkillUpdateRequest):
+    p = _require_authenticated_session(req.session_id)
+    role = (p.get("role") or "user").strip().lower()
+    write_role = (env.get_str("JARVIS_SKILLS_WRITE_ROLE", "user") or "user").strip().lower()
+    if write_role == "admin" and role != "admin":
+        raise HTTPException(status_code=403, detail="Admin required to update skills")
+
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Skill name required")
+    if not isinstance(req.updates, dict) or not req.updates:
+        raise HTTPException(status_code=400, detail="updates must be an object")
+
+    owner = _normalize_user_id(p.get("username"))
+    allowed = {"description", "type", "path", "enabled", "version", "tags", "inputs", "outputs", "trigger_phrases", "n8n_workflow_id"}
+    updates = {k: v for k, v in req.updates.items() if k in allowed}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid update fields")
+    updates["updated_at"] = datetime.utcnow()
+
+    col = _skills_collection()
+    if col is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    col.update_one({"owner": owner, "name": name}, {"$set": updates})
+    return {"status": "success"}
 
 
 class DevicePermissionsGrantRequest(BaseModel):
@@ -1427,6 +1918,7 @@ async def device_permissions_get(session_id: str, device_id: str | None = None, 
     Used by the frontend to determine whether the user has already granted permissions
     (so the UI can prompt/attempt agent start appropriately).
     """
+    _require_pc_agent_enabled()
     p = _require_authenticated_session(session_id)
     username = (p.get("username") or "").strip().lower()
     role = (p.get("role") or "user").strip().lower()
@@ -1472,6 +1964,7 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
     This is used by the frontend permission popup. It only affects the running agent
     process (no env change) and requires that the device is connected.
     """
+    _require_pc_agent_enabled()
     p = _require_authenticated_session(req.session_id)
     username = (p.get("username") or "").strip().lower()
     role = (p.get("role") or "user").strip().lower()
@@ -1540,6 +2033,7 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
 
 @app.get("/api/device/status")
 async def device_status(session_id: str):
+    _require_pc_agent_enabled()
     p = _require_authenticated_session(session_id)
     username = (p.get("username") or "").strip().lower()
     role = (p.get("role") or "user").strip().lower()
@@ -1549,6 +2043,11 @@ async def device_status(session_id: str):
 
     did = _get_owner_device_id(username)
     if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
+        did = DEFAULT_DEVICE_ID
+
+    # Local/dev convenience: allow issuing a token for the default device even before
+    # the user has explicitly configured a device binding.
+    if not did and (not CLOUD_MODE) and LOCAL_DEFAULT_DEVICE_FALLBACK and DEFAULT_DEVICE_ID:
         did = DEFAULT_DEVICE_ID
     if not did:
         return {"status": "success", "agents": [], "default_device_id": DEFAULT_DEVICE_ID}
@@ -1854,7 +2353,7 @@ cors_origins = [
 
 # Allow extra origins via env (comma-separated), e.g. for custom domains.
 try:
-    extra = os.getenv("JARVIS_CORS_ORIGINS", "")
+    extra = env.get_str("JARVIS_CORS_ORIGINS", "")
     if extra:
         for o in [x.strip() for x in extra.split(",")]:
             if o and o not in cors_origins:
@@ -1878,7 +2377,6 @@ brain = JarvisBrain(llm=llm)
 executor = ActionExecutor(brain=brain)
 
 
-@app.on_event("shutdown")
 async def _shutdown_cleanup():
     """Best-effort cleanup for async HTTP sessions.
 
@@ -2172,6 +2670,82 @@ async def _continue_user_using_web_context(user_text: str, web_context: str, mod
     except Exception:
         return None
 
+
+# =========================================================
+# Chat Orchestrator (keeps routes thin)
+# =========================================================
+chat_orchestrator = ChatOrchestrator(
+    brain=brain,
+    executor=executor,
+    cloud_mode=CLOUD_MODE,
+    admin_only_action_types=ADMIN_ONLY_ACTION_TYPES,
+    user_explicitly_requested_screen_capture=_user_explicitly_requested_screen_capture,
+    can_control_device=_can_control_device,
+    is_remote_device_action=_is_remote_device_action,
+    build_web_context_from_action_results=_build_web_context_from_action_results,
+    persist_web_context_items=_persist_web_context_items,
+    web_lookup_found=_web_lookup_found,
+    continue_user_using_web_context=_continue_user_using_web_context,
+    fallback_answer_from_web_results=(
+        lambda user_text, tool_results, found: _fallback_answer_from_web_results(
+            user_text, tool_results, found=found
+        )
+    ),
+    user_explicitly_requested_research_open=_user_explicitly_requested_research_open,
+    pick_best_source_url=_pick_best_source_url,
+    notify=notification_hub.publish,
+)
+
+
+# =========================================================
+# Realtime Notifications (WebSocket)
+# =========================================================
+@app.websocket("/ws/notifications")
+async def notifications_ws(ws: WebSocket):
+    """Push server events (e.g., research completion) to the authenticated user.
+
+    Client should connect with `?session_id=...` (voice-auth session).
+    """
+    await ws.accept()
+    try:
+        session_id = (ws.query_params.get("session_id") or "").strip()
+        if not session_id:
+            await ws.send_json({"type": "error", "error": "missing_session_id"})
+            await ws.close(code=1008)
+            return
+
+        username = _require_voice_session(session_id)
+        if not username:
+            await ws.send_json({"type": "error", "error": "auth_failed"})
+            await ws.close(code=1008)
+            return
+
+        q = await notification_hub.register(username)
+        await ws.send_json({"type": "ack", "user": username})
+
+        try:
+            while True:
+                # Wait for a server event; send periodic keepalives.
+                try:
+                    payload = await asyncio.wait_for(q.get(), timeout=30)
+                    await ws.send_json(payload)
+                except asyncio.TimeoutError:
+                    await ws.send_json({"type": "ping"})
+        finally:
+            await notification_hub.unregister(username, q)
+
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        try:
+            await ws.send_json({"type": "error", "error": "server_error", "message": str(e)})
+        except Exception:
+            pass
+        try:
+            await ws.close(code=1011)
+        except Exception:
+            pass
+
 class MessageIn(BaseModel):
     user: str | None = "user"
     text: str
@@ -2183,9 +2757,24 @@ class VoiceAuthRequest(BaseModel):
     username: str
     voice_sample_hash: str | None = None
     voice_sample_text: str | None = None
+    audio_b64: str | None = None
+    sample_rate_hz: int | None = None
     password: str | None = None
     action: str  # "register" or "login"
     role: str | None = None  # optional: 'admin' or 'user'
+
+
+class VoiceBiometricsRequest(BaseModel):
+    session_id: str
+    audio_b64: str
+    sample_rate_hz: int = 16000
+
+
+class SecureVoiceTranscribeRequest(BaseModel):
+    session_id: str
+    audio_b64: str
+    sample_rate_hz: int = 16000
+    language: str | None = None
 
 # =========================================================
 # Voice Authentication Endpoints
@@ -2194,6 +2783,15 @@ class VoiceAuthRequest(BaseModel):
 async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
     """Handle voice-based authentication"""
     try:
+        from src.utils.voice_biometrics import (
+            VOICE_BIOMETRICS_ENABLED,
+            VOICE_BIOMETRICS_THRESHOLD,
+            _decode_pcm16_b64,
+            compute_embedding_from_pcm16,
+            should_accept,
+            to_jsonable_embedding,
+        )
+
         if auth_req.action == "register":
             if not auth_req.voice_sample_hash:
                 return {"status": "error", "message": "Voice sample required for registration"}
@@ -2218,6 +2816,19 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
                 role=role,
                 voice_sample_text=auth_req.voice_sample_text,
             )
+
+            # Optional: enroll voice biometrics from provided PCM sample.
+            if VOICE_BIOMETRICS_ENABLED and auth_req.audio_b64:
+                try:
+                    audio_bytes = _decode_pcm16_b64(auth_req.audio_b64)
+                    emb = compute_embedding_from_pcm16(audio_bytes, int(auth_req.sample_rate_hz or 16000))
+                    if emb is not None:
+                        voice_auth.add_voice_biometrics_embedding(uname, to_jsonable_embedding(emb))
+                        result["biometrics"] = {"enrolled": True}
+                    else:
+                        result["biometrics"] = {"enrolled": False, "message": "Could not extract a stable voice embedding"}
+                except Exception as e:
+                    result["biometrics"] = {"enrolled": False, "message": f"Biometrics enrollment failed: {e}"}
             # On successful registration, also create a session for UX.
             if result.get("status") in ("success", "queued"):
                 if auth_tokens.secret:
@@ -2254,6 +2865,7 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
         elif auth_req.action == "login":
             if not auth_req.voice_sample_hash:
                 return {"status": "error", "message": "Voice sample required for login"}
+
             is_valid, session_or_error = voice_auth.authenticate_by_voice(
                 auth_req.username,
                 auth_req.voice_sample_hash,
@@ -2262,6 +2874,41 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
             )
             if is_valid:
                 uname = auth_req.username.strip().lower()
+
+                # If biometrics is enabled and the account has stored embeddings, require a match.
+                if VOICE_BIOMETRICS_ENABLED:
+                    stored_vecs = voice_auth.get_voice_biometrics_vectors(uname)
+                    if stored_vecs:
+                        if not auth_req.audio_b64:
+                            return {
+                                "status": "error",
+                                "message": "Voice biometrics is enabled. Please allow mic access and try again.",
+                                "code": "biometrics_audio_required",
+                            }
+                        try:
+                            audio_bytes = _decode_pcm16_b64(auth_req.audio_b64)
+                            emb = compute_embedding_from_pcm16(audio_bytes, int(auth_req.sample_rate_hz or 16000))
+                            if emb is None:
+                                return {
+                                    "status": "error",
+                                    "message": "Could not extract voice biometrics from this sample. Try again.",
+                                    "code": "biometrics_extract_failed",
+                                }
+                            ok, score = should_accept(emb, stored_vecs, threshold=VOICE_BIOMETRICS_THRESHOLD)
+                            if not ok:
+                                return {
+                                    "status": "error",
+                                    "message": "Voice biometrics did not match this account.",
+                                    "code": "biometrics_mismatch",
+                                    "score": score,
+                                }
+                        except Exception:
+                            return {
+                                "status": "error",
+                                "message": "Voice biometrics verification failed.",
+                                "code": "biometrics_verify_failed",
+                            }
+
                 u = voice_auth.get_user(uname) or {}
                 role = u.get("role", "user")
                 session_id = None
@@ -2291,6 +2938,105 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
         return {"status": "error", "message": str(e)}
 
 
+@app.post("/api/voice-biometrics/enroll")
+async def voice_biometrics_enroll(req: VoiceBiometricsRequest):
+    """Enroll an embedding for the authenticated user."""
+    principal = _require_authenticated_session(req.session_id)
+    username = (principal.get("username") or "").strip().lower()
+
+    from src.utils.voice_biometrics import (
+        VOICE_BIOMETRICS_ENABLED,
+        _decode_pcm16_b64,
+        compute_embedding_from_pcm16,
+        to_jsonable_embedding,
+    )
+    if not VOICE_BIOMETRICS_ENABLED:
+        raise HTTPException(status_code=501, detail="VOICE_BIOMETRICS_ENABLED is false")
+
+    if not req.audio_b64 or len(req.audio_b64) > 6_000_000:
+        raise HTTPException(status_code=413, detail="Audio payload too large")
+
+    audio_bytes = _decode_pcm16_b64(req.audio_b64)
+    emb = compute_embedding_from_pcm16(audio_bytes, int(req.sample_rate_hz or 16000))
+    if emb is None:
+        raise HTTPException(status_code=400, detail="Could not extract a stable voice embedding")
+
+    out = voice_auth.add_voice_biometrics_embedding(username, to_jsonable_embedding(emb))
+    return {"status": "success", "username": username, **out}
+
+
+@app.post("/api/voice/secure-transcribe")
+async def voice_secure_transcribe(req: SecureVoiceTranscribeRequest):
+    """Verify speaker identity and then transcribe the audio.
+
+    This is used by the frontend when voice biometrics is enabled, so voice
+    commands are only accepted from the logged-in user's voice.
+    """
+    principal = _require_authenticated_session(req.session_id)
+    username = (principal.get("username") or "").strip().lower()
+
+    from src.utils.voice_biometrics import (
+        VOICE_BIOMETRICS_ENABLED,
+        VOICE_BIOMETRICS_THRESHOLD,
+        _decode_pcm16_b64,
+        compute_embedding_from_pcm16,
+        should_accept,
+    )
+
+    if not VOICE_BIOMETRICS_ENABLED:
+        raise HTTPException(status_code=501, detail="VOICE_BIOMETRICS_ENABLED is false")
+
+    if not req.audio_b64 or len(req.audio_b64) > 6_000_000:
+        raise HTTPException(status_code=413, detail="Audio payload too large")
+
+    audio_bytes = _decode_pcm16_b64(req.audio_b64)
+
+    stored_vecs = voice_auth.get_voice_biometrics_vectors(username)
+    if not stored_vecs:
+        raise HTTPException(status_code=409, detail="No voice biometrics enrolled for this account")
+    emb = compute_embedding_from_pcm16(audio_bytes, int(req.sample_rate_hz or 16000))
+    if emb is None:
+        raise HTTPException(status_code=400, detail="Could not extract voice biometrics")
+    ok, score = should_accept(emb, stored_vecs, threshold=VOICE_BIOMETRICS_THRESHOLD)
+    if not ok:
+        raise HTTPException(status_code=403, detail={"message": "Voice biometrics mismatch", "score": score})
+
+    # Transcribe using the existing Google STT helper.
+    # (We keep this intentionally strict so the command path doesn't silently fall back.)
+    speech, client = _get_google_speech_client_and_creds()
+    if req.sample_rate_hz < 8000 or req.sample_rate_hz > 48000:
+        raise HTTPException(status_code=400, detail="sample_rate_hz must be between 8000 and 48000")
+
+    language_code = (req.language or GOOGLE_SPEECH_LANGUAGE_DEFAULT or "en-US").strip() or "en-US"
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=int(req.sample_rate_hz),
+        language_code=language_code,
+        enable_automatic_punctuation=True,
+        model="latest_short",
+    )
+    audio = speech.RecognitionAudio(content=audio_bytes)
+    try:
+        response = client.recognize(config=config, audio=audio)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Google STT failed: {e}")
+
+    text = ""
+    try:
+        for result in response.results:
+            if result.alternatives:
+                text += (result.alternatives[0].transcript or "")
+    except Exception:
+        text = ""
+
+    return {
+        "status": "success",
+        "text": (text or "").strip(),
+        "language": language_code,
+        "sample_rate_hz": int(req.sample_rate_hz),
+    }
+
+
 # Simple health endpoint used by local startup checks
 @app.get("/health")
 async def health_check(check_db: int = 0):
@@ -2299,7 +3045,7 @@ async def health_check(check_db: int = 0):
     - Always returns 200 when the API process is alive.
     - `check_db=1` performs a best-effort DB ping with a short timeout.
     """
-    db_uri = os.getenv("MONGODB_URI") or os.getenv("MONGO_URI")
+    db_uri = env.get("MONGODB_URI") or env.get("MONGO_URI")
     db_configured = bool(db_uri)
     # PyMongo Database objects do not support truthiness checks.
     db_connected = (getattr(database, "client", None) is not None) and (getattr(database, "db", None) is not None)
@@ -2346,6 +3092,7 @@ async def health_check(check_db: int = 0):
     }
 
     return JSONResponse(payload, status_code=200)
+
 
 @app.post("/api/validate-session")
 async def validate_session_endpoint(session_id: dict):
@@ -2496,6 +3243,11 @@ async def telegram_logout(req: dict):
 @app.post("/api/telegram/chat")
 async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
     """Handle chat message from Telegram user"""
+    if VOICE_ONLY_MODE:
+        return {
+            "status": "error",
+            "message": "Voice-only mode is enabled on this assistant.",
+        }
     user_id = req.get("user_id")
     text = req.get("text")
     
@@ -2545,13 +3297,13 @@ async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
             continued_actions = None
             try:
                 tool_results = await executor.process_actions(immediate_actions, (username or "user"))
-                if os.getenv("JARVIS_RETURN_ACTION_RESULTS", "false").lower() in ("1", "true", "yes", "y"):
+                if env.get_bool("JARVIS_RETURN_ACTION_RESULTS", False):
                     response["action_results"] = tool_results
                 mode = (response.get("mode") or "chat")
                 web_ctx = _build_web_context_from_action_results(tool_results)
                 _persist_web_context_items(topic=text, action_results=tool_results)
                 found = _web_lookup_found(tool_results)
-                if os.getenv("JARVIS_WEB_RESULTS_MODE", "answer").lower() in ("append", "both"):
+                if env.get_str("JARVIS_WEB_RESULTS_MODE", "answer").lower() in ("append", "both"):
                     # Legacy/debug mode: append raw results.
                     response["text"] = (response.get("text") or "")
                 else:
@@ -2583,6 +3335,19 @@ async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
 # =========================================================
 @app.post("/api/chat")
 async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
+    if VOICE_ONLY_MODE:
+        incoming_mode = (msg.mode or "").strip().lower()
+        if incoming_mode != "voice":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Voice-only mode is enabled on this assistant.",
+            )
+        if not msg.session_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Voice authentication is required in voice-only mode.",
+            )
+    request_id = f"chat_{uuid.uuid4().hex[:12]}"
     principal = _get_principal(msg.session_id) if msg.session_id else {"username": None, "role": "anonymous"}
     username = None
     role = principal.get("role", "anonymous")
@@ -2592,21 +3357,15 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         msg.user = username
     
     # Bind learning/training memory to the authenticated principal when available.
-    response = await brain.handle_message(
-        msg.text,
-        mode=msg.mode,
+    response, actions = await chat_orchestrator.run_chat(
+        text=msg.text,
+        mode=(msg.mode or "chat"),
+        principal=principal,
+        role=role,
+        acting_user=(msg.user or username or "user"),
+        background_tasks=background_tasks,
         user_id=((username or msg.user) if (username or msg.user) else None),
     )
-    actions = response.get("actions", [])
-
-    # Avoid accidental screen capture which can degrade UX.
-    if actions and not _user_explicitly_requested_screen_capture(msg.text):
-        actions = [
-            a
-            for a in actions
-            if (a or {}).get("type") not in ("capture_screen",)
-        ]
-        response["actions"] = actions
 
     # Persist voice command telemetry (MongoDB)
     try:
@@ -2627,169 +3386,47 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         # never break chat flow on telemetry
         pass
 
-    # Enforce permissions on actions
-    if actions:
-        if CLOUD_MODE:
-            # In cloud mode, only forward device actions for the configured device owner (or admin).
-            if not _can_control_device(principal):
-                blocked = [a for a in actions if _is_remote_device_action(a)]
-                actions = [a for a in actions if not _is_remote_device_action(a)]
-                response["actions"] = actions
-                if blocked:
-                    response["text"] = (response.get("text") or "") + "\n\n(Device actions are not permitted for this account.)"
-        else:
-            # Local mode: admin-only actions require admin role.
-            if role != "admin":
-                blocked = [a for a in actions if (a or {}).get("type") in ADMIN_ONLY_ACTION_TYPES]
-                actions = [a for a in actions if (a or {}).get("type") not in ADMIN_ONLY_ACTION_TYPES]
-                response["actions"] = actions
-                if blocked:
-                    response["text"] = (response.get("text") or "") + "\n\n(Some actions require admin privileges and were skipped.)"
-
-    # If the model requested web lookups, execute them inline so the user actually sees results.
-    # (Otherwise they would run in a background task and never be reflected in the response.)
-    if actions:
-        immediate_types = {"web_search", "fetch_url", "search"}
-        immediate_actions = [a for a in actions if (a or {}).get("type") in immediate_types]
-        deferred_actions = [a for a in actions if (a or {}).get("type") not in immediate_types]
-        if immediate_actions:
-            continued_actions = None
-            try:
-                tool_results = await executor.process_actions(immediate_actions, (msg.user or username or "user"))
-                if os.getenv("JARVIS_RETURN_ACTION_RESULTS", "false").lower() in ("1", "true", "yes", "y"):
-                    response["action_results"] = tool_results
-                web_ctx = _build_web_context_from_action_results(tool_results)
-                mode = (msg.mode or response.get("mode") or "chat")
-                mode = str(mode)
-                web_mode = os.getenv("JARVIS_WEB_RESULTS_MODE", "answer").lower()
-                if web_mode in ("append", "both"):
-                    # Keep response text as-is; (optional) UI can render action_results.
-                    response["text"] = (response.get("text") or "")
-                else:
-                    _persist_web_context_items(topic=msg.text, action_results=tool_results)
-                    found = _web_lookup_found(tool_results)
-
-                    offline_analysis = os.getenv("JARVIS_OFFLINE_ANALYSIS", "false").lower() in ("1", "true", "yes", "y")
-                    offline_only = os.getenv("JARVIS_OFFLINE_ONLY", "false").lower() in ("1", "true", "yes", "y")
-
-                    def _needs_offline_drilldown(prompt: str) -> bool:
-                        tl = (prompt or "").strip().lower()
-                        if not tl:
-                            return False
-                        return bool(
-                            re.search(
-                                r"\b(latest|current|as\s+of\s+today|as\s+of\s+now|today)\b", tl
-                            )
-                            and re.search(
-                                r"\b(version|release|price|rate|market\s+cap|marketcap|cap|value|"
-                                r"release\s+date|released\s+on|when\s+was|announced|published|"
-                                r"eol|end\s+of\s+life|end\-of\-life|supported\s+until|support\s+ends|"
-                                r"compatible|compatibility|requirements?|minimum|supported\s+versions?)\b",
-                                tl,
-                            )
-                        )
-
-                    def _pick_best_fetch_url(action_results: list[dict]) -> str | None:
-                        # Prefer official/primary sources when available.
-                        prefer = (
-                            "nodejs.org",
-                            "github.com",
-                            "docs.",
-                            "developer.",
-                            "support.",
-                            "learn.",
-                            "openai.com",
-                            "microsoft.com",
-                            "mozilla.org",
-                            "python.org",
-                            "wikipedia.org",
-                            "w3schools.com",
-                        )
-                        urls: list[str] = []
-                        for r in action_results or []:
-                            if not isinstance(r, dict):
-                                continue
-                            if (r.get("status") or "").lower() != "success":
-                                continue
-                            action = (r.get("action") or r.get("action_type") or "").lower()
-                            if action not in {"web_search", "search"}:
-                                continue
-                            for item in (r.get("results") or [])[:5]:
-                                if not isinstance(item, dict):
-                                    continue
-                                u = str(item.get("url") or "").strip()
-                                if u:
-                                    urls.append(u)
-                        if not urls:
-                            return None
-                        for p in prefer:
-                            for u in urls:
-                                if p in u.lower():
-                                    return u
-                        return urls[0]
-
-                    # If OpenAI is rate-limited (or intentionally disabled), avoid calling it and
-                    # synthesize from web results locally.
-                    if offline_only or offline_analysis:
-                        # Optional offline drilldown: for queries that need a specific "current/latest" value,
-                        # fetch the top primary source page and let the offline engine extract concrete data points.
-                        try:
-                            if found and _needs_offline_drilldown(msg.text):
-                                fetch_url = _pick_best_fetch_url(tool_results)
-                                if fetch_url:
-                                    more = await executor.process_actions(
-                                        [{"type": "fetch_url", "url": fetch_url}],
-                                        (msg.user or username or "user"),
-                                    )
-                                    if isinstance(more, list) and more:
-                                        tool_results.extend(more)
-                                        if os.getenv("JARVIS_RETURN_ACTION_RESULTS", "false").lower() in ("1", "true", "yes", "y"):
-                                            response["action_results"] = tool_results
-                        except Exception:
-                            pass
-
-                        response["text"] = _fallback_answer_from_web_results(msg.text, tool_results, found=found)
-                        continued_actions = []
-                    else:
-                        continued = await _continue_user_using_web_context(msg.text, web_ctx, mode=mode, found=found)
-                        if continued:
-                            response["text"] = (continued.get("text") or response.get("text") or "")
-                            continued_actions = continued.get("actions") or []
-                        else:
-                            # Continuation failed (often rate limits). Provide a deterministic fallback.
-                            response["text"] = _fallback_answer_from_web_results(msg.text, tool_results, found=found)
-                            continued_actions = []
-
-                    # If the user explicitly asked for research + opening the source, add an open_url
-                    # action AFTER we have web-backed text (2-pass pipeline). This enables "open in new tab".
-                    try:
-                        if found and _user_explicitly_requested_research_open(msg.text):
-                            best = _pick_best_source_url(tool_results)
-                            if best:
-                                if not isinstance(continued_actions, list):
-                                    continued_actions = []
-                                if not any(isinstance(a, dict) and a.get("type") == "open_url" for a in continued_actions):
-                                    continued_actions = list(continued_actions) + [{"type": "open_url", "url": best}]
-                    except Exception:
-                        pass
-            except Exception as e:
-                response["text"] = (response.get("text") or "") + f"\n\n(Web lookup failed: {e})"
-            actions = deferred_actions
-            if isinstance(continued_actions, list) and continued_actions:
-                actions = continued_actions
-            response["actions"] = actions
-
     # In cloud mode, forward any PC/device actions to the connected local agent.
     if CLOUD_MODE:
-        # In cloud mode we DO NOT execute or dispatch device actions from here.
-        # The frontend is responsible for dispatching device actions via /api/device/dispatch
-        # so it can show permission/start-agent UX.
-        response["actions"] = actions or []
+        # In cloud mode we do NOT execute device actions from here.
+        # The frontend dispatches device actions via /api/device/dispatch so it can show
+        # permission/start-agent UX. However, we *do* execute safe server-side actions
+        # (e.g., task creation, email drafting) so they aren't silently ignored by the UI.
+
+        safe_server_action_types = {"create_task", "stop_task", "generate_email", "n8n_webhook"}
+        actions = actions or []
+        server_actions = [a for a in actions if isinstance(a, dict) and (a.get("type") in safe_server_action_types)]
+        remaining_actions = [a for a in actions if not (isinstance(a, dict) and (a.get("type") in safe_server_action_types))]
+
+        if server_actions:
+            try:
+                server_results = await executor.process_actions(server_actions, (username or "user"))
+                # Surface created task_id(s) for better cancellation UX.
+                try:
+                    task_ids = []
+                    for r in server_results or []:
+                        if isinstance(r, dict) and r.get("task_id"):
+                            task_ids.append(str(r.get("task_id")))
+                    if task_ids:
+                        response["task_id"] = task_ids[-1]
+                        response["task_ids"] = task_ids
+                except Exception:
+                    pass
+
+                if env.get_bool("JARVIS_RETURN_ACTION_RESULTS", False):
+                    response["action_results"] = server_results
+            except Exception as e:
+                response["text"] = (response.get("text") or "") + f"\n\n(Server action execution failed: {e})"
+
+        response["actions"] = remaining_actions
+        response["request_id"] = request_id
         return response
 
-    # Local mode: execute actions directly on this machine.
-    if actions:
-        background_tasks.add_task(executor.process_actions, actions, msg.user)
+    # Local mode
+    try:
+        response["request_id"] = request_id
+    except Exception:
+        pass
     return response
 
 # Alias for backward compatibility
@@ -3171,32 +3808,117 @@ class CreateTaskRequest(BaseModel):
     description: str
     steps: List[dict]
     priority: int = 5
+    session_id: str | None = None
 
 @app.post("/api/create-task")
 async def create_task_endpoint(request: CreateTaskRequest):
     """Create a new task"""
-    task_id = task_manager.create_task(request.description, request.steps, request.priority)
+    # Cloud: require auth and bind task to user.
+    meta = {}
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(request.session_id)
+        meta = {"user_id": principal.get("username")}
+    else:
+        # Local: tasks can be powerful; require admin if a session_id was provided.
+        # (If no auth system is in use locally, preserve legacy behavior.)
+        if request.session_id:
+            _require_admin_session(request.session_id)
+
+    task_id = task_manager.create_task(request.description, request.steps, request.priority, meta=meta)
     return {"status": "success", "task_id": task_id}
 
+class StopTaskRequest(BaseModel):
+    task_id: str | None = None
+    session_id: str | None = None
+    reason: str | None = None
+
 @app.post("/api/stop-task")
-async def stop_task_endpoint():
-    """Stop current task"""
+async def stop_task_endpoint(request: StopTaskRequest | None = None):
+    """Stop current task or request cancellation for a specific task.
+
+    Backward compatible:
+    - If called with no body (or no task_id), stops the current task.
+    - If task_id is provided, marks that task as cancel_requested (cooperative cancellation).
+    """
+    # Cancel a specific task (used for async research jobs)
+    if request and request.task_id:
+        principal = _require_authenticated_session(request.session_id)
+        username = (principal.get("username") or "").strip().lower()
+        is_admin = (principal.get("role") == "admin")
+
+        task = None
+        try:
+            task = task_manager.get_task(request.task_id)
+        except Exception:
+            task = None
+
+        if not task:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+        owner = None
+        try:
+            meta = task.get("meta")
+            if isinstance(meta, dict):
+                owner = (meta.get("user_id") or "").strip().lower() or None
+        except Exception:
+            owner = None
+
+        # Only allow task owner to cancel, unless admin.
+        if owner and owner != username and not is_admin:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to cancel this task")
+
+        try:
+            return task_manager.request_cancel(request.task_id, reason=request.reason)
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    # Default legacy behavior: stop current task
+    # In cloud mode, require a task_id to avoid global stop of unrelated work.
+    if CLOUD_MODE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="task_id is required in cloud mode",
+        )
     return task_manager.stop_current_task()
 
 @app.get("/api/current-task")
-async def get_current_task():
+async def get_current_task(session_id: str | None = None):
     """Get current task"""
+    if CLOUD_MODE:
+        _require_authenticated_session(session_id)
     task = task_manager.get_current_task()
     return {"task": task} if task else {"task": None}
 
 @app.get("/api/tasks")
-async def get_all_tasks():
+async def get_all_tasks(session_id: str | None = None):
     """Get all tasks"""
-    return {"tasks": task_manager.get_all_tasks()}
+    tasks = task_manager.get_all_tasks()
+
+    if not CLOUD_MODE:
+        return {"tasks": tasks}
+
+    principal = _require_authenticated_session(session_id)
+    username = (principal.get("username") or "").strip().lower()
+    is_admin = (principal.get("role") == "admin")
+    if is_admin:
+        return {"tasks": tasks}
+
+    filtered = []
+    for t in tasks:
+        try:
+            meta = t.get("meta") if isinstance(t, dict) else None
+            owner = (meta.get("user_id") or "").strip().lower() if isinstance(meta, dict) else ""
+            if owner and owner == username:
+                filtered.append(t)
+        except Exception:
+            continue
+    return {"tasks": filtered}
 
 @app.get("/api/wakeup-context")
-async def get_wakeup_context():
+async def get_wakeup_context(session_id: str | None = None):
     """Get wakeup context mapping"""
+    if CLOUD_MODE:
+        _require_authenticated_session(session_id)
     return {"context": task_manager.get_wakeup_context()}
 
 # =========================================================
@@ -3559,7 +4281,6 @@ async def get_session_stats():
 # Startup Event
 # =========================================================
 
-@app.on_event("startup")
 async def startup_event():
     print("[OK] Jarvis server startup event running")
     try:
@@ -3585,7 +4306,6 @@ async def startup_event():
     print("[OK] Jarvis server started and git-sync initialized.")
 
 
-@app.on_event("shutdown")
 async def shutdown_event():
     if SCHEDULER_AVAILABLE and shutdown_scheduler:
         try:

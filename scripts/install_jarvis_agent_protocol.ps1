@@ -4,7 +4,7 @@ Param(
 )
 
 # Registers a custom URL protocol so the browser UI can start the agent on-demand.
-# After install, opening `jarvis-agent://start` will run run_pc_agent.bat.
+# After install, opening `jarvis-agent://start` will run dist\JarvisPCAgent.exe.
 
 $ErrorActionPreference = "Stop"
 
@@ -14,9 +14,9 @@ if ([string]::IsNullOrWhiteSpace($RepoPath)) {
   $RepoPath = (Resolve-Path $RepoPath)
 }
 
-$bat = Join-Path $RepoPath "run_pc_agent.bat"
-if (-not (Test-Path $bat)) {
-  throw "run_pc_agent.bat not found at $bat"
+$exe = Join-Path $RepoPath "dist\JarvisPCAgent.exe"
+if (-not (Test-Path $exe)) {
+  throw "JarvisPCAgent.exe not found at $exe (build it first)"
 }
 
 $baseKey = "HKCU:\Software\Classes\$Protocol"
@@ -26,11 +26,11 @@ New-ItemProperty -Path $baseKey -Name "URL Protocol" -Value "" -PropertyType Str
 
 $iconKey = Join-Path $baseKey "DefaultIcon"
 New-Item -Path $iconKey -Force | Out-Null
-New-ItemProperty -Path $iconKey -Name "(Default)" -Value "$bat,0" -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $iconKey -Name "(Default)" -Value "$exe,0" -PropertyType String -Force | Out-Null
 
 $cmdKey = Join-Path $baseKey "shell\open\command"
 New-Item -Path $cmdKey -Force | Out-Null
 # %1 is the URL; we ignore it for now and just start the agent.
-New-ItemProperty -Path $cmdKey -Name "(Default)" -Value "\"$bat\"" -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $cmdKey -Name "(Default)" -Value "\"$exe\" --daemon" -PropertyType String -Force | Out-Null
 
 Write-Host "Installed protocol '$Protocol'. Test by running: start ${Protocol}://start" -ForegroundColor Green

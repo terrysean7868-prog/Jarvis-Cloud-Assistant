@@ -29,14 +29,14 @@ class JobScheduler:
         if not self.is_running:
             self.scheduler.start()
             self.is_running = True
-            print("✅ Background Job Scheduler started")
+            print("[OK] Background Job Scheduler started")
 
     def stop(self):
         """Stop the background scheduler"""
         if self.is_running:
             self.scheduler.shutdown()
             self.is_running = False
-            print("⛔ Background Job Scheduler stopped")
+            print("[OK] Background Job Scheduler stopped")
 
     def add_job(self, func: Callable, interval_seconds: int = 300, job_id: str = None):
         """
@@ -55,19 +55,20 @@ class JobScheduler:
                 id=job_id,
                 replace_existing=True
             )
-            print(f"✅ Job '{job_id}' scheduled every {interval_seconds}s")
+            print(f"[OK] Job '{job_id}' scheduled every {interval_seconds}s")
         except Exception as e:
-            print(f"❌ Error adding job: {e}")
+            print(f"[ERR] Error adding job: {e}")
 
     def register_default_jobs(self):
         """Register all default background jobs"""
-        enable_git_sync = os.getenv("JARVIS_AUTO_GIT_SYNC", "false").lower() in ("1", "true", "yes", "y")
-        enable_db_maintenance = os.getenv("JARVIS_ENABLE_DB_MAINTENANCE", "true").lower() in ("1", "true", "yes", "y")
-        enable_web_training = os.getenv("JARVIS_ENABLE_WEB_TRAINING_JOB", "true").lower() in ("1", "true", "yes", "y")
-        enable_wiki_training = os.getenv("JARVIS_ENABLE_WIKI_TRAINING_JOB", "false").lower() in ("1", "true", "yes", "y")
-        enable_background_analysis = os.getenv("JARVIS_ENABLE_BACKGROUND_ANALYSIS_JOB", "true").lower() in ("1", "true", "yes", "y")
-        enable_memory_optimization = os.getenv("JARVIS_ENABLE_MEMORY_OPTIMIZATION", "false").lower() in ("1", "true", "yes", "y")
-        enable_training_data_job = os.getenv("JARVIS_ENABLE_TRAINING_DATA_JOB", "false").lower() in ("1", "true", "yes", "y")
+        from src.config import runtime_defaults as rd
+        enable_git_sync = bool(rd.AUTO_GIT_SYNC)
+        enable_db_maintenance = bool(rd.ENABLE_DB_MAINTENANCE)
+        enable_web_training = bool(rd.ENABLE_WEB_TRAINING_JOB)
+        enable_wiki_training = bool(rd.ENABLE_WIKI_TRAINING_JOB)
+        enable_background_analysis = bool(rd.ENABLE_BACKGROUND_ANALYSIS_JOB)
+        enable_memory_optimization = bool(rd.ENABLE_MEMORY_OPTIMIZATION)
+        enable_training_data_job = bool(rd.ENABLE_TRAINING_DATA_JOB)
 
         # GitHub auto-sync every 5 minutes (off by default for hosted deploys)
         if enable_git_sync:
@@ -104,8 +105,7 @@ class JobScheduler:
         # Fetch Wikipedia summaries (off by default; opt-in). Default cadence: weekly.
         if enable_wiki_training:
             try:
-                # Default to hourly for faster knowledge refresh; override via env.
-                interval_seconds = int(os.getenv("JARVIS_WIKI_TRAINING_INTERVAL_SECONDS", str(3600)))
+                interval_seconds = int(rd.WIKI_TRAINING_INTERVAL_SECONDS)
             except Exception:
                 interval_seconds = 7 * 86400
             interval_seconds = max(3600, min(interval_seconds, 30 * 86400))
@@ -127,7 +127,7 @@ class JobScheduler:
         # Default cadence: every 30 minutes (override via env).
         if enable_background_analysis:
             try:
-                interval_seconds = int(os.getenv("JARVIS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS", str(1800)))
+                interval_seconds = int(rd.BACKGROUND_ANALYSIS_INTERVAL_SECONDS)
             except Exception:
                 interval_seconds = 1800
             interval_seconds = max(300, min(interval_seconds, 6 * 3600))
@@ -312,16 +312,15 @@ def fetch_wikipedia_training_data():
     This is a small, bounded knowledge cache to improve offline synthesis and context.
     It does NOT mirror full Wikipedia pages.
 
-    Configuration (env):
-    - JARVIS_ENABLE_WIKI_TRAINING_JOB=true
-    - JARVIS_WIKI_TRAINING_TOPICS="topic1,topic2,..." (optional)
-    - JARVIS_WIKI_TRAINING_LANG="en" (optional)
-    - JARVIS_WIKI_TRAINING_MAX_PAGES=2 (optional; capped 1..5)
+    Configuration:
+    - Controlled via in-code defaults in src/config/runtime_defaults.py
     """
     try:
         print(f"\n📚 [WIKI-TRAINING] Starting Wikipedia training fetch at {datetime.utcnow().isoformat()}")
 
-        raw_topics = os.getenv("JARVIS_WIKI_TRAINING_TOPICS", "").strip()
+        from src.config import runtime_defaults as rd
+
+        raw_topics = (rd.WIKI_TRAINING_TOPICS or "").strip()
         if raw_topics:
             topics = [t.strip() for t in raw_topics.split(",") if (t or "").strip()]
         else:
@@ -339,13 +338,10 @@ def fetch_wikipedia_training_data():
                 "history of science",
             ]
 
-        try:
-            max_pages = int(os.getenv("JARVIS_WIKI_TRAINING_MAX_PAGES", "2"))
-        except Exception:
-            max_pages = 2
+        max_pages = int(rd.WIKI_TRAINING_MAX_PAGES)
         max_pages = max(1, min(max_pages, 5))
 
-        lang = (os.getenv("JARVIS_WIKI_TRAINING_LANG", "en") or "en").strip().lower() or "en"
+        lang = (rd.WIKI_TRAINING_LANG or "en").strip().lower() or "en"
 
         # Run async fetching (bounded)
         saved = asyncio.run(_fetch_wikipedia_training_data_async(topics[:30], lang=lang, max_pages=max_pages))
@@ -378,10 +374,8 @@ def background_analyze_web_training_data():
     - analysis_at: datetime
     - analysis_version: int
 
-    Configuration (env):
-    - JARVIS_ENABLE_BACKGROUND_ANALYSIS_JOB=true
-    - JARVIS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS=1800 (default 30 min)
-    - JARVIS_BACKGROUND_ANALYSIS_BATCH=30
+    Configuration:
+    - Controlled via in-code defaults in src/config/runtime_defaults.py
     """
     try:
         print(f"\n🧠 [BG-ANALYSIS] Starting web knowledge analysis at {datetime.utcnow().isoformat()}")
@@ -390,10 +384,9 @@ def background_analyze_web_training_data():
             print("⚠️  [BG-ANALYSIS] MongoDB not connected; skipping")
             return
 
-        try:
-            batch = int(os.getenv("JARVIS_BACKGROUND_ANALYSIS_BATCH", "30"))
-        except Exception:
-            batch = 30
+        from src.config import runtime_defaults as rd
+
+        batch = int(rd.BACKGROUND_ANALYSIS_BATCH)
         batch = max(1, min(batch, 200))
 
         from src.core.background_analysis import analyze_web_training_item

@@ -33,6 +33,22 @@ function timeoutFetch(url, opts = {}, timeout = DEFAULT_TIMEOUT) {
     .finally(() => clearTimeout(id));
 }
 
+async function throwHttpError(res) {
+  let bodyText = await res.text().catch(() => `HTTP ${res.status}`);
+  let bodyJson = null;
+  try {
+    bodyJson = bodyText ? JSON.parse(bodyText) : null;
+  } catch {
+    bodyJson = null;
+  }
+  const err = new Error(`HTTP error! status: ${res.status} - ${bodyText}`);
+  err.status = res.status;
+  if (bodyJson && typeof bodyJson === "object") {
+    err.detail = bodyJson.detail ?? bodyJson;
+  }
+  throw err;
+}
+
 export async function sendMessage(text, mode = "chat", sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
   try {
     const res = await timeoutFetch(`${API_URL}/api/chat`, {
@@ -42,19 +58,28 @@ export async function sendMessage(text, mode = "chat", sessionId = null, timeout
     }, timeoutMs);
 
     if (!res.ok) {
-      // Try to parse error body for better messaging
-      let errText = await res.text().catch(() => `HTTP ${res.status}`);
-      throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+      await throwHttpError(res);
     }
     const data = await res.json();
     return data;
   } catch (err) {
     console.error("sendMessage error:", err);
-    // return consistent error structure for UI to handle
-    return { status: "error", message: err.name === 'AbortError' ? "request_timeout" : err.message };
+    const isTimeout = err && err.name === "AbortError";
+    const message = isTimeout
+      ? "Request timed out. Please try again."
+      : (err?.message || "Request failed. Please try again.");
+
+    // Return a consistent structure so callers can always render something.
+    return {
+      status: "error",
+      message,
+      text: message,
+      actions: [],
+    };
   }
 }
 
+// (Capabilities endpoint removed)
 export async function addLearningExample(prompt, completion, sessionId, tags = [], timeoutMs = DEFAULT_TIMEOUT) {
   const res = await timeoutFetch(`${API_URL}/api/learning/add`, {
     method: "POST",
@@ -63,8 +88,7 @@ export async function addLearningExample(prompt, completion, sessionId, tags = [
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -77,8 +101,7 @@ export async function setAssistantName(assistantName, sessionId, timeoutMs = DEF
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -91,8 +114,7 @@ export async function getUserPreferences(sessionId, timeoutMs = DEFAULT_TIMEOUT)
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -105,8 +127,7 @@ export async function setUserPreferences(preferences, sessionId, mode = "merge",
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -119,8 +140,7 @@ export async function getUserDevice(sessionId, timeoutMs = DEFAULT_TIMEOUT) {
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -133,8 +153,7 @@ export async function setUserDevice(deviceId, sessionId, timeoutMs = DEFAULT_TIM
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -150,8 +169,7 @@ export async function configureMyPc(sessionId, deviceId = null, timeoutMs = DEFA
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -172,8 +190,7 @@ export async function dispatchDeviceActions(actions, sessionId, sourceText = "",
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -189,8 +206,22 @@ export async function getAgentConfig(sessionId, deviceId = null, timeoutMs = DEF
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getSystemInfo(sessionId, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  qs.set("session_id", sessionId);
+
+  const res = await timeoutFetch(`${API_URL}/api/system/info?${qs.toString()}`,
+    { method: "GET" },
+    timeoutMs
+  );
+
+  if (!res.ok) {
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -210,8 +241,7 @@ export async function grantDevicePermissions(sessionId, permissions, deviceId = 
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -228,8 +258,7 @@ export async function getSavedDevicePermissions(sessionId, deviceId = null, owne
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
   }
   return await res.json();
 }
@@ -249,8 +278,91 @@ export async function googleSpeechToText(sessionId, audioBase64, language = null
   }, timeoutMs);
 
   if (!res.ok) {
-    let errText = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`HTTP error! status: ${res.status} - ${errText}`);
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function secureVoiceToText(sessionId, audioBase64, language = null, sampleRateHz = 16000, timeoutMs = 45000) {
+  const body = {
+    session_id: sessionId,
+    audio_b64: audioBase64,
+    sample_rate_hz: sampleRateHz,
+  };
+  if (language) body.language = language;
+
+  const res = await timeoutFetch(`${API_URL}/api/voice/secure-transcribe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export function getNotificationsWsUrl(sessionId) {
+  const sid = (sessionId || "").toString();
+  if (!sid) return null;
+
+  try {
+    const origin = (API_URL && API_URL.startsWith("http"))
+      ? API_URL
+      : (typeof window !== "undefined" && window.location && window.location.origin)
+        ? window.location.origin
+        : "";
+
+    const u = new URL(origin);
+    const wsProto = u.protocol === "https:" ? "wss:" : "ws:";
+    return `${wsProto}//${u.host}/ws/notifications?session_id=${encodeURIComponent(sid)}`;
+  } catch (e) {
+    // If URL parsing fails (e.g. API_URL is relative in dev), fallback to current origin.
+    try {
+      const origin = (typeof window !== "undefined" && window.location && window.location.origin)
+        ? window.location.origin
+        : "";
+      if (!origin) return null;
+      const u = new URL(origin);
+      const wsProto = u.protocol === "https:" ? "wss:" : "ws:";
+      return `${wsProto}//${u.host}/ws/notifications?session_id=${encodeURIComponent(sid)}`;
+    } catch {
+      return null;
+    }
+  }
+}
+
+export async function stopTask(sessionId = null, taskId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = {};
+  if (sessionId) body.session_id = sessionId;
+  if (taskId) body.task_id = taskId;
+
+  const res = await timeoutFetch(`${API_URL}/api/stop-task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // Keep backward compatible: if no body fields, still send an empty JSON object.
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getTasks(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  if (sessionId) qs.set("session_id", String(sessionId));
+
+  const url = `${API_URL}/api/tasks${qs.toString() ? `?${qs.toString()}` : ""}`;
+  const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
   }
   return await res.json();
 }

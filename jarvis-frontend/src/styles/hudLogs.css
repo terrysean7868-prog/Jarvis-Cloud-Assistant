@@ -4,10 +4,10 @@
   max-width: min(320px, 80vw);
   max-height: 40vh;
   overflow: auto;
-  color: #00ffff;
+  color: var(--jarvis-accent, #00ffff);
   font-family: "Orbitron", sans-serif;
   font-size: 0.9rem;
-  text-shadow: 0 0 4px rgba(0,255,255,0.8);
+  text-shadow: 0 0 4px var(--jarvis-accent-glow, rgba(0,255,255,0.8));
   opacity: 0.9;
 }
 
@@ -24,7 +24,7 @@
   border-left: 2px solid rgba(0,255,255,0.4);
 }
 
-.log-item.system { color: #00ffff; }
+.log-item.system { color: var(--jarvis-accent, #00ffff); }
 .log-item.wake { color: #6ff; }
 .log-item.input { color: #aaffaa; }
 .log-item.response { color: #ffaa88; }
@@ -32,7 +32,7 @@
 .log-item.action { color: #ffd966; }
 
 .time {
-  color: #00cccc;
+  color: color-mix(in srgb, var(--jarvis-accent, #00cccc) 70%, white 0%);
   font-size: 0.8em;
   margin-right: 4px;
 }

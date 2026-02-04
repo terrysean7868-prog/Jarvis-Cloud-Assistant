@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 from src.utils.git_sync import git_sync
-from src.config.config import Config
+from src.config.secrets import llm_secrets
 
 logger = logging.getLogger("jarvis.self_update")
 
@@ -29,7 +29,7 @@ def get_openai_client():
             from openai import OpenAI
         except Exception as e:
             raise RuntimeError(f"OpenAI SDK not available: {e}")
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("PRIMARY_API_KEY")
+        api_key = llm_secrets().primary_api_key
         if not api_key:
             raise RuntimeError("OpenAI API key not found in OPENAI_API_KEY or PRIMARY_API_KEY")
         _client = OpenAI(api_key=api_key)

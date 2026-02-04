@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Jarvis PC Agent</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+            color: #eaf2ff;
+            background: #0b1220;
+        }
+        .bg {
+            min-height: 100vh;
+            background:
+                radial-gradient(1200px 900px at 20% 0%, rgba(0,194,255,0.18), transparent 60%),
+                radial-gradient(1000px 800px at 90% 10%, rgba(47,224,134,0.10), transparent 55%),
+                #0b1220;
+        }
+        .wrap { max-width: 1140px; margin: 0 auto; padding: 18px; }
+        .topbar { display: -ms-flexbox; display: flex; -ms-flex-align: center; align-items: center; -ms-flex-pack: justify; justify-content: space-between; }
+        .topbar > * { margin-right: 12px; }
+        .topbar > *:last-child { margin-right: 0; }
+        .title { font-size: 20px; font-weight: 700; letter-spacing: 0.2px; }
+        .subtitle { font-size: 12px; color: rgba(234,242,255,0.72); margin-top: 2px; }
+        .badge { padding: 6px 10px; border: 1px solid rgba(255,255,255,0.10); border-radius: 999px; background: rgba(255,255,255,0.04); font-size: 12px; }
+
+        .cols { margin-top: 14px; display: -ms-flexbox; display: flex; -ms-flex-wrap: wrap; flex-wrap: wrap; }
+        .col { -ms-flex: 1 1 520px; flex: 1 1 520px; min-width: 360px; }
+        .col + .col { margin-left: 14px; }
+        @media (max-width: 980px) { .col + .col { margin-left: 0; margin-top: 14px; } }
+
+        .card { border: 1px solid rgba(255,255,255,0.10); background: rgba(255,255,255,0.06); border-radius: 14px; padding: 14px; }
+        .card h3 { margin: 0 0 10px 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.12em; color: rgba(234,242,255,0.72); }
+        .row { display: block; margin-top: 10px; }
+        .row:first-child { margin-top: 0; }
+        label { font-size: 12px; color: rgba(234,242,255,0.72); display: block; margin-bottom: 5px; }
+        input[type=text], input[type=password] {
+            width: 100%; padding: 10px 10px; border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(0,0,0,0.20);
+            color: #eaf2ff;
+            outline: none;
+        }
+        input[type=text]:focus, input[type=password]:focus { border-color: rgba(0,194,255,0.45); box-shadow: 0 0 0 3px rgba(0,194,255,0.12); }
+        .btn {
+            padding: 10px 12px; border-radius: 10px; cursor: pointer;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(0,0,0,0.18);
+            color: #eaf2ff; font-weight: 600;
+        }
+        .btn.primary { background: linear-gradient(180deg, rgba(0,194,255,0.22), rgba(0,194,255,0.08)); border-color: rgba(0,194,255,0.35); }
+        .btn.good { background: linear-gradient(180deg, rgba(47,224,134,0.22), rgba(47,224,134,0.08)); border-color: rgba(47,224,134,0.35); }
+        .btn.bad { background: linear-gradient(180deg, rgba(255,90,122,0.22), rgba(255,90,122,0.08)); border-color: rgba(255,90,122,0.35); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .pill { padding: 6px 10px; border-radius: 999px; font-size: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.14); }
+        .pill.good { border-color: rgba(47,224,134,0.35); color: #b9ffd9; }
+        .pill.bad { border-color: rgba(255,90,122,0.35); color: #ffd0da; }
+        .muted { color: rgba(234,242,255,0.72); font-size: 12px; }
+        .logs {
+            height: 370px; overflow: auto; border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(0,0,0,0.22); padding: 10px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 12px; white-space: pre-wrap;
+        }
+        .kv { margin-top: 8px; }
+        .kv-row { display: -ms-flexbox; display: flex; -ms-flex-align: center; align-items: center; margin-top: 6px; }
+        .kv-row:first-child { margin-top: 0; }
+        .k { width: 130px; min-width: 130px; color: rgba(234,242,255,0.72); font-size: 12px; }
+        .v { font-size: 12px; }
+        .toolbar { margin-top: 12px; display: -ms-flexbox; display: flex; -ms-flex-align: center; align-items: center; }
+        .toolbar .btn { margin-right: 8px; }
+        .toolbar .btn:last-child { margin-right: 0; }
+        .toolbar .spacer { -ms-flex: 1 1 auto; flex: 1 1 auto; }
+        .checkboxes label { display: inline-block; margin-right: 12px; }
+        .notice { margin-top: 10px; padding: 10px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.10); background: rgba(0,0,0,0.18); }
+
+        .toast {
+            position: fixed;
+            left: 50%;
+            bottom: 18px;
+            transform: translateX(-50%);
+            max-width: 92vw;
+            padding: 10px 14px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.14);
+            background: rgba(0,0,0,0.55);
+            color: #eaf2ff;
+            font-size: 13px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+            display: none;
+            z-index: 9999;
+        }
+        .toast.good { border-color: rgba(47,224,134,0.45); }
+        .toast.bad { border-color: rgba(255,90,122,0.55); }
+        .toast.warn { border-color: rgba(255,210,77,0.55); }
+    </style>
+</head>
+<body>
+    <div class="bg">
+        <div class="wrap">
+            <div class="topbar">
+                <div>
+                    <div class="title">Jarvis PC Agent</div>
+                    <div class="subtitle">Companion agent for cloud/web remote actions</div>
+                </div>
+                <div class="badge" id="build">Desktop</div>
+            </div>
+
+            <noscript>
+                <div class="notice" style="margin-top:12px; border-color: rgba(255,90,122,0.35)">
+                    <div style="font-weight:600; margin-bottom:4px">JavaScript is disabled</div>
+                    <div class="muted">This UI requires JavaScript. If you're on a managed PC, a policy may be disabling JavaScript in WebView2. Try installing/updating Microsoft Edge WebView2 Runtime, or use the fallback UI.</div>
+                </div>
+            </noscript>
+
+            <div class="cols">
+                <div class="col">
+                    <div class="card">
+                        <h3>Configuration</h3>
+                        <div class="row">
+                            <label for="server">Server URL</label>
+                            <input id="server" type="text" placeholder="https://jarvis-cloud-assistant.onrender.com" />
+                        </div>
+                        <div class="row">
+                            <label for="device">Device ID</label>
+                            <input id="device" type="text" placeholder="my-pc" />
+                        </div>
+                        <div class="row">
+                            <label for="token">Agent Token</label>
+                            <input id="token" type="password" placeholder="Paste agent token" />
+                            <div class="muted" style="margin-top:6px">From Jarvis UI (Desktop/Web): PC agent panel → Copy Agent token.</div>
+                        </div>
+                        <div class="row">
+                            <label for="secret">Shared Secret (optional)</label>
+                            <input id="secret" type="password" placeholder="Paste shared secret (local desktop)" />
+                            <div class="muted" style="margin-top:6px">For local Jarvis Desktop you can use Shared secret instead of token.</div>
+                        </div>
+                        <div class="row checkboxes">
+                            <label><input id="loop" type="checkbox" /> Loop mode (auto-restart)</label>
+                            <label><input id="auto" type="checkbox" /> Auto-start</label>
+                        </div>
+                        <div class="toolbar">
+                            <button class="btn primary" id="save">Save</button>
+                            <button class="btn good" id="start">Start</button>
+                            <button class="btn bad" id="stop">Stop</button>
+                            <span class="spacer"></span>
+                            <button class="btn" id="refresh">Refresh</button>
+                            <button class="btn" id="findLocal">Find Local Jarvis</button>
+                        </div>
+                        <div class="notice" id="engineNotice" style="display:none">
+                            <div style="font-weight:600; margin-bottom:4px">Limited UI mode</div>
+                            <div class="muted">Install Microsoft Edge WebView2 Runtime for the best Jarvis PC Agent UI.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="col">
+                    <div class="card">
+                        <h3>Status</h3>
+                        <div class="toolbar" style="margin-top:0">
+                            <div id="statusPill" class="pill bad">Not running</div>
+                            <span class="spacer"></span>
+                            <div class="muted" id="pid">PID: —</div>
+                        </div>
+                        <div class="kv" id="perms"></div>
+                        <div class="muted" style="margin-top:12px">Permissions are set from the cloud UI per device.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card" style="margin-top:14px">
+                <h3>Logs</h3>
+                <div id="logs" class="logs"></div>
+                <div class="toolbar">
+                    <button class="btn" id="clear">Clear</button>
+                    <span class="spacer"></span>
+                    <div class="muted" id="last">—</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <script>
+        (function () {
+            function $(id) { return document.getElementById(id); }
+
+            function trimStr(x) {
+                var s = String(x == null ? '' : x);
+                // Avoid backslash-s regex to keep the embedded HTML string safe and predictable.
+                return s.replace(/^[ \t\r\n]+/, '').replace(/[ \t\r\n]+$/, '');
+            }
+
+            var logSeq = 0;
+            var refreshInFlight = false;
+            var pollTimer = null;
+            var isReady = false;
+            var toastTimer = null;
+            var lastToastSig = '';
+
+            function toast(msg, kind, ms) {
+                try {
+                    var el = $('toast');
+                    if (!el) return;
+                    el.className = 'toast ' + (kind || 'good');
+                    el.textContent = String(msg || '');
+                    el.style.display = 'block';
+                    if (toastTimer) clearTimeout(toastTimer);
+                    toastTimer = setTimeout(function () { el.style.display = 'none'; }, (ms || 2200));
+                } catch (e) { }
+            }
+
+            function toastForRejectReason(reason) {
+                var r = trimStr(reason || '');
+                if (!r) return null;
+                if (r === 'pc_agent_disabled') return { msg: 'PC agent disabled on server', kind: 'bad', ms: 3600 };
+                if (r === 'invalid_shared_secret') return { msg: 'Invalid shared secret (copy it from Jarvis Desktop)', kind: 'bad', ms: 3600 };
+                if (r === 'invalid_agent_token') return { msg: 'Invalid agent token (use the Agent token, not login JWT)', kind: 'bad', ms: 3600 };
+                if (r === 'server_missing_jwt_secret') return { msg: 'Server missing JWT secret (restart Jarvis Desktop)', kind: 'bad', ms: 3600 };
+                if (r === 'expected_auth') return { msg: 'Server expected auth message', kind: 'bad', ms: 3600 };
+                if (r === 'invalid_json') return { msg: 'Invalid auth payload (bad JSON)', kind: 'bad', ms: 3600 };
+                if (r === 'missing_device_id') return { msg: 'Missing device_id', kind: 'bad', ms: 3200 };
+                if (r === 'device_not_authorized') return { msg: 'Device not authorized for this token', kind: 'bad', ms: 3600 };
+                return { msg: 'Server rejected connection: ' + r, kind: 'bad', ms: 3600 };
+            }
+
+            function extractRejectReasonFromLine(line) {
+                var s = String(line || '');
+                var marker = 'Server rejected connection:';
+                var idx = s.indexOf(marker);
+                if (idx === -1) return '';
+                var rest = s.slice(idx + marker.length);
+                rest = trimStr(rest);
+                // Strip trailing hint in parentheses.
+                var hintIdx = rest.indexOf(' (Hint:');
+                if (hintIdx !== -1) rest = trimStr(rest.slice(0, hintIdx));
+                return rest;
+            }
+
+            function setStatus(running, pid) {
+                var pill = $('statusPill');
+                pill.textContent = running ? 'Running' : 'Not running';
+                pill.className = 'pill ' + (running ? 'good' : 'bad');
+                $('pid').textContent = 'PID: ' + (pid || '—');
+                $('start').disabled = !!running;
+                $('stop').disabled = !running;
+            }
+
+            function renderPerms(p) {
+                var el = $('perms');
+                el.innerHTML = '';
+                var items = [
+                    ['App control', !!(p && p.allow_app_control)],
+                    ['Execute command', !!(p && p.allow_execute_command)],
+                    ['File ops', !!(p && p.allow_file_ops)],
+                    ['Screen', !!(p && p.allow_screen)],
+                    ['Self-update', !!(p && p.allow_self_update)]
+                ];
+                for (var i = 0; i < items.length; i++) {
+                    var k = items[i][0];
+                    var v = items[i][1];
+                    var row = document.createElement('div');
+                    row.className = 'kv-row';
+                    var kEl = document.createElement('div');
+                    kEl.className = 'k';
+                    kEl.textContent = k;
+                    var vEl = document.createElement('div');
+                    vEl.className = 'v';
+                    vEl.textContent = v ? 'Enabled' : 'Disabled';
+                    vEl.style.color = v ? '#b9ffd9' : '#ffd0da';
+                    row.appendChild(kEl);
+                    row.appendChild(vEl);
+                    el.appendChild(row);
+                }
+            }
+
+            function loadConfig() {
+                return window.pywebview.api.load_config().then(function (cfg) {
+                    $('server').value = (cfg && cfg.server_url) ? cfg.server_url : '';
+                    $('device').value = (cfg && cfg.device_id) ? cfg.device_id : '';
+                    $('token').value = (cfg && cfg.agent_token) ? cfg.agent_token : '';
+                    $('secret').value = (cfg && cfg.shared_secret) ? cfg.shared_secret : '';
+                    $('loop').checked = !!(cfg && cfg.loop_mode);
+                    $('auto').checked = !!(cfg && cfg.auto_start);
+                    return cfg;
+                });
+            }
+
+            function currentCfg() {
+                return {
+                    server_url: $('server').value,
+                    device_id: $('device').value,
+                    agent_token: $('token').value,
+                    shared_secret: $('secret').value,
+                    loop_mode: $('loop').checked,
+                    auto_start: $('auto').checked
+                };
+            }
+
+            function parseLogLine(raw) {
+                var s = String(raw || '');
+                var sep = s.indexOf('|');
+                if (sep === -1) return { seq: null, line: s };
+                var seq = Number(s.slice(0, sep));
+                var line = s.slice(sep + 1);
+                if (!isFinite(seq)) seq = null;
+                return { seq: seq, line: line };
+            }
+
+            function refresh() {
+                if (!window.pywebview || !window.pywebview.api) {
+                    return Promise.reject(new Error('pywebview api not ready'));
+                }
+
+                var api = window.pywebview.api;
+                return Promise.all([
+                    api.get_status(),
+                    api.get_permissions(),
+                    api.get_logs(logSeq)
+                ]).then(function (res) {
+                    var st = res[0];
+                    var perms = res[1];
+                    var logs = res[2];
+
+                    setStatus(!!(st && st.running), st ? st.pid : null);
+                    renderPerms(perms || {});
+
+                    if (logs && logs.lines && logs.lines.length) {
+                        var box = $('logs');
+                        for (var i = 0; i < logs.lines.length; i++) {
+                            var parsed = parseLogLine(logs.lines[i]);
+                            var line = parsed.line;
+                            box.textContent += line + '\n';
+
+                            // One-shot toasts for key events.
+                            var s = String(line || '');
+                            var sig = s.slice(-140);
+                            if (sig && sig !== lastToastSig) {
+                                if (s.indexOf('Connected:') !== -1) {
+                                    lastToastSig = sig;
+                                    toast('Agent connected', 'good');
+                                } else if (s.indexOf('Server rejected connection') !== -1) {
+                                    lastToastSig = sig;
+                                    var reason = extractRejectReasonFromLine(s);
+                                    var t = toastForRejectReason(reason);
+                                    if (t) toast(t.msg, t.kind, t.ms);
+                                    else toast('Server rejected connection (check token/secret)', 'bad', 3600);
+                                } else if (s.indexOf('Missing agent auth') !== -1) {
+                                    lastToastSig = sig;
+                                    toast('Missing token/secret', 'bad', 3200);
+                                }
+                            }
+                        }
+
+                        if (typeof logs.next_seq === 'number') {
+                            logSeq = logs.next_seq;
+                        } else if (typeof logs.next_index === 'number') {
+                            // Back-compat
+                            logSeq = logs.next_index;
+                        }
+                        box.scrollTop = box.scrollHeight;
+                        $('last').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+                    }
+                });
+            }
+
+            function safeRefresh(showFailureToast) {
+                if (!isReady) return Promise.resolve();
+                if (refreshInFlight) return Promise.resolve();
+                refreshInFlight = true;
+                return refresh().catch(function () {
+                    if (showFailureToast) toast('Refresh failed', 'bad');
+                }).then(function () {
+                    refreshInFlight = false;
+                });
+            }
+
+            function startPolling() {
+                try { if (pollTimer) clearTimeout(pollTimer); } catch (e) { }
+                function tick() {
+                    safeRefresh(false).then(function () {
+                        pollTimer = setTimeout(tick, 1400);
+                    });
+                }
+                pollTimer = setTimeout(tick, 900);
+            }
+
+            function ensureReady() {
+                if (!isReady) {
+                    toast('UI not ready yet', 'warn', 1600);
+                    return false;
+                }
+                if (typeof Promise === 'undefined') {
+                    toast('This UI needs WebView2 (Promise missing)', 'bad', 3600);
+                    return false;
+                }
+                return true;
+            }
+
+            function bindButtons() {
+                $('save').onclick = function () {
+                    if (!ensureReady()) return;
+                    toast('Saving…', 'warn', 1200);
+                    window.pywebview.api.save_config(currentCfg()).then(function () {
+                        toast('Saved', 'good');
+                    }).catch(function () {
+                        toast('Save failed', 'bad');
+                    });
+                };
+
+                $('start').onclick = function () {
+                    if (!ensureReady()) return;
+                    var cfg = currentCfg();
+                    var server = trimStr(cfg.server_url || '');
+                    var token = trimStr(cfg.agent_token || '');
+                    var secret = trimStr(cfg.shared_secret || '');
+                    var device = trimStr(cfg.device_id || '').toLowerCase();
+                    if (!server) { toast('Server URL is required', 'warn'); return; }
+                    if (!token && !secret) { toast('Paste Agent token or Shared secret', 'warn', 3200); return; }
+                    if (!token && secret && device && device !== 'primary') {
+                        toast('Tip: for local Shared Secret mode set Device ID to "primary"', 'warn', 3600);
+                    }
+                    toast('Starting agent…', 'warn', 1600);
+                    window.pywebview.api.start_agent(cfg).then(function () {
+                        toast('Starting agent…', 'good');
+                    }).catch(function () {
+                        toast('Start failed', 'bad');
+                    });
+                };
+
+                $('stop').onclick = function () {
+                    if (!ensureReady()) return;
+                    toast('Stopping…', 'warn', 1600);
+                    window.pywebview.api.stop_agent().then(function () {
+                        toast('Stopping…', 'warn');
+                    }).catch(function () {
+                        toast('Stop failed', 'bad');
+                    });
+                };
+
+                $('refresh').onclick = function () {
+                    if (!ensureReady()) return;
+                    safeRefresh(true).then(function () {
+                        toast('Refreshed', 'good', 1200);
+                    });
+                };
+
+                $('clear').onclick = function () {
+                    if (!ensureReady()) return;
+                    try { $('logs').textContent = ''; } catch (e) { }
+                    logSeq = 0;
+                    window.pywebview.api.clear_logs().then(function () {
+                        toast('Cleared logs', 'good', 1200);
+                    }).catch(function () {
+                        toast('Clear failed', 'bad');
+                    });
+                };
+
+                $('findLocal').onclick = function () {
+                    if (!ensureReady()) return;
+                    toast('Searching local Jarvis…', 'warn', 1600);
+                    window.pywebview.api.discover_local().then(function (r) {
+                        var url = (r && r.server_url) ? String(r.server_url) : '';
+                        if (url) {
+                            $('server').value = url;
+                            toast('Found local Jarvis: ' + url, 'good', 2800);
+                        } else {
+                            toast('Local Jarvis not found (start Jarvis Desktop first)', 'warn', 3200);
+                        }
+                    }).catch(function () {
+                        toast('Local discovery failed', 'bad');
+                    });
+                };
+
+            }
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', function () {
+                    bindButtons();
+                });
+            } else {
+                bindButtons();
+            }
+
+            window.addEventListener('pywebviewready', function () {
+                // If we're running on the legacy MSHTML engine, advanced layout may be limited.
+                try {
+                    var ua = (navigator && navigator.userAgent) ? navigator.userAgent : '';
+                    if (ua.indexOf('Trident/') !== -1 || ua.indexOf('MSIE ') !== -1) {
+                        $('engineNotice').style.display = 'block';
+                        $('build').textContent = 'Legacy';
+                    }
+                } catch (e) { }
+
+                isReady = true;
+                loadConfig().then(function () {
+                    return safeRefresh(true);
+                }).then(function () {
+                    startPolling();
+                    var cfg = currentCfg();
+                    if (cfg.auto_start) {
+                        return window.pywebview.api.start_agent(cfg);
+                    }
+                }).catch(function () { });
+            });
+        })();
+    </script>
+</body>
+</html>
+        

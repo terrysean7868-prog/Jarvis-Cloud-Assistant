@@ -11,6 +11,8 @@ import subprocess
 import time
 from typing import Dict, List, Optional, Tuple
 
+from src.config import env
+
 # Process utilities - optional dependency
 try:
     import psutil
@@ -61,7 +63,7 @@ class AppManager:
                 "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                 "firefox": r"C:\Program Files\Mozilla Firefox\firefox.exe",
                 "edge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                "vscode": r"C:\Users\{}\AppData\Local\Programs\Microsoft VS Code\Code.exe".format(os.getenv("USERNAME", "")),
+                "vscode": r"C:\Users\{}\AppData\Local\Programs\Microsoft VS Code\Code.exe".format(env.get_str("USERNAME", "")),
                 "excel": r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
                 "word": r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
                 "powerpoint": r"C:\Program Files\Microsoft Office\root\Office16\POWERPNT.EXE",

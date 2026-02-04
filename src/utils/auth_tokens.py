@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 from jose import JWTError, jwt
 
 from src.utils.db import db
+from src.config import env
 
 
 def _utcnow() -> datetime:
@@ -15,7 +16,7 @@ def _utcnow() -> datetime:
 class AuthTokens:
     """JWT session tokens with optional MongoDB revocation.
 
-    Env vars:
+    Environment:
     - JARVIS_JWT_SECRET: required for issuing/verifying tokens
     - JARVIS_JWT_TTL_SECONDS: default 28800 (8h)
     - JARVIS_JWT_ISSUER: default "jarvis"
@@ -23,10 +24,10 @@ class AuthTokens:
     """
 
     def __init__(self):
-        self.secret = os.getenv("JARVIS_JWT_SECRET", "")
-        self.issuer = os.getenv("JARVIS_JWT_ISSUER", "jarvis")
-        self.ttl_seconds = int(os.getenv("JARVIS_JWT_TTL_SECONDS", "28800"))
-        self.use_db_revocation = os.getenv("AUTH_TOKEN_USE_DB_REVOCATION", "true").lower() in ("1", "true", "yes")
+        self.secret = env.get_str("JARVIS_JWT_SECRET", "")
+        self.issuer = env.get_str("JARVIS_JWT_ISSUER", "jarvis")
+        self.ttl_seconds = env.get_int("JARVIS_JWT_TTL_SECONDS", 28800)
+        self.use_db_revocation = env.get_bool("AUTH_TOKEN_USE_DB_REVOCATION", True)
 
     def issue(self, username: str, role: str = "user") -> str:
         if not self.secret:

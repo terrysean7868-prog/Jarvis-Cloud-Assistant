@@ -28,12 +28,20 @@ export default function MicAnalyzer({ listening }) {
       }
     };
 
+    let stream = null;
+    let animFrameId = null;
+    let cancelled = false;
+
     navigator.mediaDevices.getUserMedia(audioConstraints)
-      .then((stream) => {
+      .then((s) => {
+        if (cancelled) {
+          try { s.getTracks().forEach(t => t.stop()); } catch {}
+          return;
+        }
+        stream = s;
         const src = audioCtx.createMediaStreamSource(stream);
         src.connect(analyser);
         const data = new Uint8Array(analyser.frequencyBinCount);
-        let animFrameId;
 
         const draw = () => {
           animFrameId = requestAnimationFrame(draw);
@@ -59,18 +67,28 @@ export default function MicAnalyzer({ listening }) {
           ctx.shadowColor = "#00ffff";
           ctx.stroke();
         };
-        
+
         draw();
-        
-        return () => {
-          cancelAnimationFrame(animFrameId);
-          stream.getTracks().forEach(track => track.stop());
-          audioCtx.close();
-        };
       })
       .catch((err) => {
         console.warn("MicAnalyzer: microphone access failed:", err?.message || err);
       });
+
+    return () => {
+      cancelled = true;
+      try {
+        if (animFrameId) cancelAnimationFrame(animFrameId);
+      } catch {}
+      try {
+        if (stream) stream.getTracks().forEach(track => track.stop());
+      } catch {}
+      try {
+        if (audioCtx && audioCtx.state !== "closed") {
+          const p = audioCtx.close();
+          if (p && typeof p.then === "function") p.catch(() => {});
+        }
+      } catch {}
+    };
   }, [listening]);
 
   return <canvas ref={canvasRef} width={200} height={200} className="mic-analyzer" />;

@@ -706,6 +706,17 @@ def synthesize_from_web(user_text: str, tool_results: list[dict[str, Any]], *, f
 
     include_structured = _is_high_level_request(user_text) or _is_specific_fact_request(user_text) or bool(comparison)
 
+    # If the summary is generic/weak, include structure anyway so users get something useful.
+    try:
+        if len((summary or "").strip()) < 120:
+            include_structured = True
+        if re.fullmatch(r"\s*ok(?:ay)?\.?\s*", (summary or ""), flags=re.IGNORECASE):
+            include_structured = True
+        if re.match(r"\s*ok(?:ay)?\b", (summary or ""), flags=re.IGNORECASE):
+            include_structured = True
+    except Exception:
+        pass
+
     if include_structured:
         lines.append("")
         lines.append("Key points:")

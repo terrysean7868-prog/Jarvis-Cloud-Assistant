@@ -45,6 +45,9 @@ scikit-learn>=1.0.2
 networkx>=2.6.3
 scipy>=1.7.3
 
+# Lightweight speaker biometrics (MFCC)
+python_speech_features>=0.6
+
 # Voice Recognition and Audio Processing
 SpeechRecognition==3.8.1; platform_system == "Windows"
 pydub==0.25.1; platform_system == "Windows"
@@ -66,6 +69,8 @@ pytesseract>=0.3.10; platform_system == "Windows"
 opencv-python>=4.8.0; platform_system == "Windows"
 psutil>=5.9.0
 pywin32>=306; sys_platform == 'win32'
+comtypes; sys_platform == 'win32'
+pycaw; sys_platform == 'win32'
 
 # Language Translation
 googletrans==4.0.2

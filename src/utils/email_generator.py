@@ -3,11 +3,12 @@
 Email generation and management for Jarvis
 Generates emails based on voice commands and context
 """
-import os
 import re
 from typing import Dict, Optional, List
 from datetime import datetime
 from openai import OpenAI
+
+from src.config.secrets import llm_secrets
 
 # Lazy-load OpenAI client
 _client = None
@@ -16,7 +17,7 @@ def get_openai_client():
     """Get or create OpenAI client (lazy-loaded)."""
     global _client
     if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("PRIMARY_API_KEY")
+        api_key = llm_secrets().primary_api_key
         if not api_key:
             raise RuntimeError("OpenAI API key not found")
         _client = OpenAI(api_key=api_key)
@@ -49,6 +50,7 @@ class EmailGenerator:
         try:
             # Generate email content using AI
             system_prompt = f"""You are an expert email writer. Generate professional, clear, and concise emails.
+Use correct grammar and spelling. Do NOT include typos.
 Tone: {tone}
 Format: Return JSON with 'subject' and 'body' fields.
 Keep emails concise but complete."""
@@ -73,7 +75,7 @@ Return JSON format:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.7,
+                temperature=0.2,
                 max_tokens=500
             )
             

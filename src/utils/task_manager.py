@@ -51,7 +51,7 @@ class TaskManager:
         except Exception as e:
             print(f"Failed to save tasks: {e}")
     
-    def create_task(self, description: str, steps: List[Dict], priority: int = 5) -> str:
+    def create_task(self, description: str, steps: List[Dict], priority: int = 5, meta: Optional[Dict] = None) -> str:
         """Create a new task"""
         task_id = f"task_{int(time.time())}"
         task = {
@@ -64,11 +64,47 @@ class TaskManager:
             "started_at": None,
             "completed_at": None,
             "current_step": 0,
-            "results": []
+            "results": [],
+            "meta": meta or {},
         }
         self.tasks.append(task)
         self._save_tasks()
         return task_id
+
+    def update_task(self, task_id: str, *, status: Optional[str] = None, append_result: Optional[Dict] = None, meta_update: Optional[Dict] = None) -> Dict:
+        """Update an existing task (best-effort).
+
+        Used by background jobs (e.g., research) to mark progress/completion.
+        """
+        task = self._find_task(task_id)
+        if not task:
+            return {"status": "error", "message": "Task not found"}
+
+        if status:
+            task["status"] = status
+            if status in {TaskStatus.IN_PROGRESS.value} and not task.get("started_at"):
+                task["started_at"] = datetime.now().isoformat()
+            if status in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.STOPPED.value}:
+                task["completed_at"] = datetime.now().isoformat()
+
+        if append_result is not None:
+            try:
+                if not isinstance(task.get("results"), list):
+                    task["results"] = []
+                task["results"].append(append_result)
+            except Exception:
+                pass
+
+        if isinstance(meta_update, dict) and meta_update:
+            try:
+                if not isinstance(task.get("meta"), dict):
+                    task["meta"] = {}
+                task["meta"].update(meta_update)
+            except Exception:
+                pass
+
+        self._save_tasks()
+        return {"status": "success", "task": task}
     
     def start_task(self, task_id: str) -> Dict:
         """Start executing a task"""
@@ -157,6 +193,33 @@ class TaskManager:
             if task["id"] == task_id:
                 return task
         return None
+
+    def get_task(self, task_id: str) -> Optional[Dict]:
+        """Get a task by id."""
+        return self._find_task(task_id)
+
+    def is_cancel_requested(self, task_id: str) -> bool:
+        """Return True if a task has a cancel requested flag set."""
+        task = self._find_task(task_id)
+        if not task:
+            return False
+        meta = task.get("meta")
+        return bool(isinstance(meta, dict) and meta.get("cancel_requested"))
+
+    def request_cancel(self, task_id: str, *, reason: Optional[str] = None) -> Dict:
+        """Request cancellation for a specific task.
+
+        Background jobs should poll `is_cancel_requested` and exit cooperatively.
+        """
+        task = self._find_task(task_id)
+        if not task:
+            return {"status": "error", "message": "Task not found"}
+
+        meta_update = {"cancel_requested": True}
+        if reason:
+            meta_update["cancel_reason"] = reason
+        self.update_task(task_id, meta_update=meta_update)
+        return {"status": "success", "task_id": task_id, "message": "Cancel requested"}
     
     def get_current_task(self) -> Optional[Dict]:
         """Get current task"""

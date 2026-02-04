@@ -4,6 +4,20 @@
       "voice_hash": "local-admin-test-hash",
       "role": "admin",
       "created_at": "2025-12-23T14:06:53.513151"
+    },
+    "testuser": {
+      "voice_hash": "hash123",
+      "voice_samples": [
+        {
+          "hash": "hash123",
+          "text": null,
+          "created_at": "2026-01-18T12:05:50.865639"
+        }
+      ],
+      "role": "user",
+      "assistant_name": "Jarvis",
+      "created_at": "2026-01-18T12:05:50.865660",
+      "last_login": "2026-01-18T12:08:55.377896"
     }
   }
 }

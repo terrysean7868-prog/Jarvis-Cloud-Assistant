@@ -11,6 +11,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from src.config import env
+
 
 # ==============================================================
 # Utility Command Runner
@@ -37,7 +39,7 @@ def setup_ssh_trust():
     Prevents 'Host key verification failed' or 'REMOTE HOST IDENTIFICATION HAS CHANGED'.
     Only runs if SSH_KEY is configured. Silent fail on Windows/systems without ssh-keyscan.
     """
-    ssh_key = os.getenv("SSH_KEY")
+    ssh_key = env.get("SSH_KEY")
     if not ssh_key:
         return  # Silent skip if no SSH_KEY configured
 
@@ -85,14 +87,14 @@ def ensure_remote(repo_path: str, repo_url: str):
         current = run("git remote get-url origin", cwd=repo_path, check=False)
         if not current:
             run(f"git remote add origin {repo_url}", cwd=repo_path)
-            print(f"[GIT SYNC] ✅ Added remote origin: {repo_url}")
+            print(f"[GIT SYNC] [OK] Added remote origin: {repo_url}")
         elif current != repo_url:
             run(f"git remote set-url origin {repo_url}", cwd=repo_path)
-            print(f"[GIT SYNC] 🔄 Updated remote URL to: {repo_url}")
+            print(f"[GIT SYNC] [OK] Updated remote URL to: {repo_url}")
         else:
-            print(f"[GIT SYNC] 🔗 Remote already set to: {current}")
+            print(f"[GIT SYNC] [OK] Remote already set to: {current}")
     except Exception as e:
-        print(f"[GIT SYNC] ⚠️ Could not verify remote: {e}")
+        print(f"[GIT SYNC] [WARN] Could not verify remote: {e}")
         run(f"git remote add origin {repo_url}", cwd=repo_path)
 
 
@@ -107,7 +109,7 @@ def refresh_github_host_key():
     known_hosts_path = os.path.join(ssh_dir, "known_hosts")
 
     try:
-        print("[GIT SYNC] 🔁 Refreshing GitHub host key...")
+        print("[GIT SYNC] Refreshing GitHub host key...")
         result = subprocess.run(
             ["ssh-keyscan", "github.com"],
             capture_output=True, text=True, check=True
@@ -115,9 +117,9 @@ def refresh_github_host_key():
         new_key = result.stdout.strip()
         with open(known_hosts_path, "w") as kh:
             kh.write(new_key + "\n")
-        print("[GIT SYNC] ✅ Host key refreshed successfully.")
+        print("[GIT SYNC] [OK] Host key refreshed successfully.")
     except Exception as e:
-        print(f"[GIT SYNC] ⚠️ Could not refresh host key: {e}")
+        print(f"[GIT SYNC] [WARN] Could not refresh host key: {e}")
 
 
 # ==============================================================
@@ -131,15 +133,15 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):
     Enhanced with better error handling and automatic fixes.
     """
     repo_path = os.path.abspath(repo_path)
-    print(f"[GIT SYNC] 🚀 Starting sync in: {repo_path}")
+    print(f"[GIT SYNC] Starting sync in: {repo_path}")
 
     # --- Environment setup ---
-    ssh_key = os.getenv("SSH_KEY")
-    github_repo = os.getenv("GITHUB_REPO")
-    github_user = os.getenv("GITHUB_USERNAME")
-    github_password = os.getenv("GITHUB_PASSWORD")  # For HTTPS fallback
-    git_name = os.getenv("GIT_USER_NAME", "Jarvis Cloud Assistant")
-    git_email = os.getenv("GIT_USER_EMAIL", "jarvis@render.com")
+    ssh_key = env.get("SSH_KEY")
+    github_repo = env.get("GITHUB_REPO")
+    github_user = env.get("GITHUB_USERNAME")
+    github_password = env.get("GITHUB_PASSWORD")  # For HTTPS fallback
+    git_name = env.get_str("GIT_USER_NAME", "Jarvis Cloud Assistant")
+    git_email = env.get_str("GIT_USER_EMAIL", "jarvis@render.com")
 
     # Try to get repo URL from env or construct it
     if not github_repo:
@@ -148,23 +150,23 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):
             existing_remote = run("git remote get-url origin", cwd=repo_path, check=False)
             if existing_remote:
                 github_repo = existing_remote
-                print(f"[GIT SYNC] 📍 Using existing remote: {existing_remote}")
+                print(f"[GIT SYNC] Using existing remote: {existing_remote}")
         except:
             pass
 
     if not ssh_key and not github_password:
-        raise RuntimeError("[GIT SYNC] ❌ SSH_KEY or GITHUB_PASSWORD not set in environment.")
+        raise RuntimeError("[GIT SYNC] Missing SSH_KEY or GITHUB_PASSWORD in environment.")
     if not github_repo:
-        raise RuntimeError("[GIT SYNC] ❌ GITHUB_REPO not set and no existing remote found.")
+        raise RuntimeError("[GIT SYNC] Missing GITHUB_REPO and no existing remote found.")
 
     # --- Git identity ---
     run(f'git config --global user.name "{git_name}"', cwd=repo_path, check=False)
     run(f'git config --global user.email "{git_email}"', cwd=repo_path, check=False)
-    print(f"[GIT SYNC] ✅ Git identity set to {git_name} <{git_email}>")
+    print(f"[GIT SYNC] [OK] Git identity set to {git_name} <{git_email}>")
 
     # --- Initialize git repo if needed ---
     if not os.path.exists(os.path.join(repo_path, ".git")):
-        print("[GIT SYNC] 🔧 Initializing git repository...")
+        print("[GIT SYNC] Initializing git repository...")
         run("git init", cwd=repo_path, check=False)
         run("git branch -M main", cwd=repo_path, check=False)
 
@@ -192,7 +194,7 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):
             repo_url = f"https://github.com/{github_user}/{github_repo}.git"
 
     ensure_remote(repo_path, repo_url)
-    print(f"[GIT SYNC] 🧩 Using {'SSH' if ssh_key else 'HTTPS'} authentication ({repo_url})")
+    print(f"[GIT SYNC] Using {'SSH' if ssh_key else 'HTTPS'} authentication ({repo_url})")
 
     # --- Setup authentication ---
     tmp_dir = tempfile.mkdtemp()

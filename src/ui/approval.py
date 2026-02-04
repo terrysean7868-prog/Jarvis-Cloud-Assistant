@@ -1,14 +1,17 @@
 # src/ui/approval.py
 import os
 import json
+from datetime import datetime
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from pathlib import Path
 
+from src.config import env
+
 router = APIRouter()
 
 # Storage folder for proposals
-PROPOSAL_DIR = Path(os.getenv("PROPOSAL_DIR", "data/proposals"))
+PROPOSAL_DIR = Path(env.get_str("PROPOSAL_DIR", "data/proposals"))
 PROPOSAL_DIR.mkdir(parents=True, exist_ok=True)
 
 # Simple listing

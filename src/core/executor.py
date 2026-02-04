@@ -2,12 +2,18 @@
 import os
 import shutil
 import asyncio
+import time
 import webbrowser
 import subprocess
 import platform
 import re
 from typing import List
+import json
+from urllib.parse import urljoin
 from src.core.jarvis_brain import JarvisBrain
+from src.config import runtime_defaults as rd
+from src.config import env
+from src.config.secrets import n8n_secrets
 from src.utils.git_sync import git_sync  # ✅ now importing the function, not a class
 from src.utils.self_update import self_update_file, self_add_feature, parse_voice_command
 from src.utils.screen_access import screen_access
@@ -15,6 +21,11 @@ from src.utils.email_generator import email_generator
 from src.utils.app_manager import app_manager
 from src.utils.task_manager import task_manager
 from src.utils.error_handler import error_handler
+
+_n8n = n8n_secrets()
+N8N_WEBHOOK_BASE = _n8n.base_url
+N8N_WEBHOOK_TOKEN = _n8n.token
+N8N_WEBHOOK_SECRET = _n8n.secret
 
 # Optional dependencies (avoid hard failures on cloud builds)
 SELENIUM_AVAILABLE = False
@@ -39,9 +50,16 @@ try:
 except Exception:
     TRANSLATE_AVAILABLE = False
 
-# Runtime mode
-CLOUD_MODE = os.getenv("JARVIS_CLOUD_MODE", "false").lower() in ("1", "true", "yes", "y")
-AUTO_GIT_SYNC = os.getenv("JARVIS_AUTO_GIT_SYNC", "false").lower() in ("1", "true", "yes", "y")
+AIOHTTP_AVAILABLE = False
+try:
+    import aiohttp  # type: ignore
+    AIOHTTP_AVAILABLE = True
+except Exception:
+    AIOHTTP_AVAILABLE = False
+
+# Runtime mode (defaults live in code; cloud is detected from host markers)
+CLOUD_MODE = bool(rd.CLOUD_MODE)
+AUTO_GIT_SYNC = bool(rd.AUTO_GIT_SYNC)
 
 # Optional: pyautogui for screen navigation (only on desktop with display)
 # Check for headless environment before importing
@@ -55,8 +73,8 @@ if platform.system() != "Windows":
         _is_headless_env = True
     # Check for server environment indicators
     # Render sets PORT, RENDER_SERVICE_ID, or path contains /opt/render
-    if (os.getenv("RENDER") or os.getenv("DYNO") or os.getenv("DOCKER") or 
-        os.getenv("PORT") or "/opt/render" in os.getcwd()):
+    if (env.get("RENDER") or env.get("DYNO") or env.get("DOCKER") or 
+        env.get("PORT") or "/opt/render" in os.getcwd()):
         _is_headless_env = True
 
 if not _is_headless_env:
@@ -86,6 +104,9 @@ class ActionExecutor:
     def __init__(self, brain: JarvisBrain):
         self.brain = brain
         self.stop_requested = False
+        # Simple in-memory cache to reduce repeated fetch_url latency.
+        # Key: normalized url, Value: (ts, result_dict)
+        self._fetch_url_cache: dict[str, tuple[float, dict]] = {}
         # Mapping of common website names to URLs
         self.url_map = {
             'youtube': 'https://www.youtube.com',
@@ -172,6 +193,96 @@ class ActionExecutor:
             if action_type == "fetch_url":
                 result = await self._handle_fetch_url(action)
                 results.append(result)
+                continue
+
+            # Handle N8N webhook actions
+            if action_type == "n8n_webhook":
+                if not AIOHTTP_AVAILABLE:
+                    results.append({
+                        "status": "error",
+                        "action_type": "n8n_webhook",
+                        "message": "aiohttp not available",
+                    })
+                    continue
+
+                if not N8N_WEBHOOK_BASE:
+                    results.append({
+                        "status": "error",
+                        "action_type": "n8n_webhook",
+                        "message": "N8N webhook base not configured (JARVIS_N8N_WEBHOOK_BASE)",
+                    })
+                    continue
+
+                raw_url = (action or {}).get("url")
+                raw_path = (action or {}).get("path")
+                if raw_url:
+                    url = str(raw_url).strip()
+                    if not url.startswith(N8N_WEBHOOK_BASE):
+                        results.append({
+                            "status": "forbidden",
+                            "action_type": "n8n_webhook",
+                            "message": "Webhook URL must start with configured base",
+                        })
+                        continue
+                else:
+                    path = str(raw_path or "").strip().lstrip("/")
+                    if not path:
+                        results.append({
+                            "status": "error",
+                            "action_type": "n8n_webhook",
+                            "message": "Webhook path is required",
+                        })
+                        continue
+                    url = urljoin(N8N_WEBHOOK_BASE + "/", path)
+
+                method = str((action or {}).get("method") or "POST").strip().upper()
+                if method not in ("POST", "GET", "PUT", "PATCH", "DELETE"):
+                    results.append({
+                        "status": "error",
+                        "action_type": "n8n_webhook",
+                        "message": f"Unsupported method: {method}",
+                    })
+                    continue
+
+                payload = (action or {}).get("payload")
+                if payload is None:
+                    payload = (action or {}).get("data")
+
+                headers = {"Content-Type": "application/json"}
+                if N8N_WEBHOOK_TOKEN:
+                    headers["Authorization"] = f"Bearer {N8N_WEBHOOK_TOKEN}"
+                if N8N_WEBHOOK_SECRET:
+                    headers["X-Jarvis-Secret"] = N8N_WEBHOOK_SECRET
+
+                try:
+                    timeout = aiohttp.ClientTimeout(total=25)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        if method == "GET" and isinstance(payload, dict):
+                            req = session.request(method, url, params=payload, headers=headers)
+                        else:
+                            req = session.request(method, url, json=payload, headers=headers)
+                        async with req as resp:
+                            text = await resp.text()
+                            data = None
+                            try:
+                                data = json.loads(text) if text else None
+                            except Exception:
+                                data = text
+                            if isinstance(data, str) and len(data) > 2000:
+                                data = data[:2000] + "…"
+                            results.append({
+                                "status": "success" if 200 <= resp.status < 300 else "error",
+                                "action_type": "n8n_webhook",
+                                "code": resp.status,
+                                "url": url,
+                                "response": data,
+                            })
+                except Exception as e:
+                    results.append({
+                        "status": "error",
+                        "action_type": "n8n_webhook",
+                        "message": str(e),
+                    })
                 continue
             
             # Handle URL opening actions
@@ -588,19 +699,48 @@ class ActionExecutor:
         
         try:
             url = action.get("url", "")
+
+            # Normalize URL a bit for caching.
+            cache_key = (url or "").strip()
+            if cache_key:
+                cache_key = re.sub(r"\s+", "", cache_key)
+
+            ttl = int(rd.FETCH_URL_CACHE_SECONDS)
+            ttl = max(0, min(ttl, 60 * 60))
+
+            if ttl and cache_key:
+                cached = self._fetch_url_cache.get(cache_key)
+                if cached:
+                    ts, payload = cached
+                    if (time.time() - ts) <= ttl and isinstance(payload, dict):
+                        out = dict(payload)
+                        out["cached"] = True
+                        return out
             
             print(f"📥 Fetching URL: {url}")
             internet = await get_internet()
             result = await internet.fetch_webpage(url, include_content=True)
             
             if result:
-                return {
+                out = {
                     "status": "success",
                     "action": "fetch_url",
                     "url": url,
                     "title": result.get('title'),
                     "summary": result.get('summary', '')[:500]
                 }
+                if ttl and cache_key:
+                    try:
+                        self._fetch_url_cache[cache_key] = (time.time(), dict(out))
+                        # Best-effort size cap
+                        if len(self._fetch_url_cache) > 128:
+                            # Drop oldest ~25%
+                            items = sorted(self._fetch_url_cache.items(), key=lambda kv: kv[1][0])
+                            for k, _v in items[: max(1, len(items) // 4)]:
+                                self._fetch_url_cache.pop(k, None)
+                    except Exception:
+                        pass
+                return out
             else:
                 return {
                     "status": "error",
