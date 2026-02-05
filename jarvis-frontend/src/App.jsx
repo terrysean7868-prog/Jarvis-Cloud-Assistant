@@ -491,29 +491,6 @@ export default function App() {
     wakeSessionTimerRef.current = null;
   }, []);
 
-  const pushToTalk = useCallback(async () => {
-    if (!isAuthenticated) {
-      setShowAuthModal(true);
-      return;
-    }
-    if (isHandlingCommand.current) return;
-    if (speakingRef.current) return;
-
-    // Match wake-word behavior: open a wake session window for convenience.
-    // In biometrics mode we only open the session after verification.
-    if (!voiceBiometricsActive) {
-      startWakeSessionWindow();
-      setWakePulse(true);
-      setTimeout(() => setWakePulse(false), 900);
-    }
-
-    try {
-      await handleVoiceCommand();
-    } catch {
-      // handleVoiceCommand already logs errors.
-    }
-  }, [handleVoiceCommand, isAuthenticated, startWakeSessionWindow, voiceBiometricsActive]);
-
   // No "Enable Voice" button: voice is always on.
   // On mobile we unlock mic/STT on first user gesture.
 
@@ -1495,7 +1472,7 @@ export default function App() {
       addLog("error", e?.message || String(e));
       try { wakeRecognizer.current?.start(); } catch {}
     }
-  }, [addLog, handleVoiceCommand, pttHolding, secureVoiceToText, googleSpeechToText, sessionId, voiceBiometricsActive, voiceLang, startWakeSessionWindow]);
+  }, [addLog, handleVoiceCommand, pttHolding, sessionId, voiceBiometricsActive, voiceLang, startWakeSessionWindow]);
 
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
