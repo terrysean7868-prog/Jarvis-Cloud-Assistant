@@ -16,12 +16,17 @@ import base64
 from datetime import datetime
 from typing import Iterable, Optional, Tuple
 
-import numpy as np
+try:
+    import numpy as np  # type: ignore
+    _HAS_NUMPY = True
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+    _HAS_NUMPY = False
 
 from src.config import runtime_defaults as rd
 
 
-VOICE_BIOMETRICS_ENABLED = bool(rd.VOICE_BIOMETRICS_ENABLED)
+VOICE_BIOMETRICS_ENABLED = bool(rd.VOICE_BIOMETRICS_ENABLED) and bool(_HAS_NUMPY)
 VOICE_BIOMETRICS_THRESHOLD = float(rd.VOICE_BIOMETRICS_THRESHOLD)
 VOICE_BIOMETRICS_MAX_EMBEDS = int(rd.VOICE_BIOMETRICS_MAX_EMBEDS)
 
@@ -33,6 +38,8 @@ def _decode_pcm16_b64(audio_b64: str) -> bytes:
 
 
 def _pcm16le_bytes_to_float32(audio_bytes: bytes) -> np.ndarray:
+    if not _HAS_NUMPY:
+        return None  # type: ignore
     if not audio_bytes:
         return np.zeros((0,), dtype=np.float32)
     pcm = np.frombuffer(audio_bytes, dtype="<i2").astype(np.float32)
@@ -43,6 +50,8 @@ def _pcm16le_bytes_to_float32(audio_bytes: bytes) -> np.ndarray:
 
 
 def _resample_linear(x: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    if not _HAS_NUMPY:
+        return None  # type: ignore
     if x is None or x.size == 0:
         return np.zeros((0,), dtype=np.float32)
     if src_rate == dst_rate:
@@ -60,6 +69,8 @@ def _resample_linear(x: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    if not _HAS_NUMPY:
+        return 0.0
     if a is None or b is None:
         return 0.0
     if a.size == 0 or b.size == 0:
@@ -72,6 +83,8 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 def _vad_mask(x: np.ndarray, frame: int = 400, hop: int = 160, rms_thresh: float = 0.012) -> np.ndarray:
     """Very small energy-based VAD mask over frames."""
+    if not _HAS_NUMPY:
+        return None  # type: ignore
     if x.size < frame:
         return np.ones((0,), dtype=bool)
     n = 1 + (x.size - frame) // hop
@@ -86,6 +99,8 @@ def _vad_mask(x: np.ndarray, frame: int = 400, hop: int = 160, rms_thresh: float
 
 def compute_embedding_from_pcm16(audio_bytes: bytes, sample_rate_hz: int) -> Optional[np.ndarray]:
     """Return a stable vector (float32) or None if audio unusable."""
+    if not VOICE_BIOMETRICS_ENABLED:
+        return None
     try:
         import python_speech_features  # type: ignore
     except Exception:
@@ -150,10 +165,14 @@ def compute_embedding_from_pcm16(audio_bytes: bytes, sample_rate_hz: int) -> Opt
 
 
 def to_jsonable_embedding(vec: np.ndarray) -> list[float]:
+    if not _HAS_NUMPY:
+        return []
     return [float(x) for x in np.asarray(vec, dtype=np.float32).tolist()]
 
 
 def best_similarity(sample_vec: np.ndarray, stored_vectors: Iterable[Iterable[float]]) -> float:
+    if not VOICE_BIOMETRICS_ENABLED:
+        return 0.0
     best = 0.0
     for v in stored_vectors or []:
         try:

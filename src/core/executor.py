@@ -175,6 +175,8 @@ class ActionExecutor:
                     "open_app", "close_app", "switch_app",
                     "capture_screen", "screen_navigation",
                     "self_update", "self_add",
+                    # Maintenance / self-healing actions can execute shell commands.
+                    "check_errors", "fix_errors", "check_render_logs",
                 }:
                     results.append({
                         "status": "forbidden",

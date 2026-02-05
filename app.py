@@ -158,9 +158,95 @@ _DEVICE_TO_OWNER_CACHE: dict[str, tuple[float, str | None]] = {}
 _AGENT_CONFIG_CACHE_TTL_S = 120
 _AGENT_CONFIG_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 
+# Map job_id -> (ts, username, device_id, source_text) so we can route agent results
+# back to the user over /ws/notifications.
+_JOB_OWNER_CACHE_TTL_S = 10 * 60
+_JOB_OWNER_CACHE: dict[str, tuple[float, str, str | None, str | None]] = {}
+
 _DEVICE_REGISTRY_INDEX_READY = False
 _DEVICE_PERMISSIONS_INDEX_READY = False
 _AGENT_CONFIG_INDEX_READY = False
+
+
+def _remember_job_owner(job: dict) -> None:
+    """Best-effort: remember which authenticated user initiated this job."""
+    try:
+        if not isinstance(job, dict):
+            return
+        job_id = str(job.get("job_id") or "").strip()
+        if not job_id:
+            return
+        username = str(job.get("username") or "").strip().lower()
+        if not username:
+            return
+        device_id = str(job.get("device_id") or "").strip().lower() or None
+        source_text = str(job.get("source_text") or "").strip() or None
+
+        now = time.time()
+        _JOB_OWNER_CACHE[job_id] = (now, username, device_id, source_text)
+
+        # Opportunistic pruning (keep it tiny; avoid background tasks).
+        if len(_JOB_OWNER_CACHE) > 500:
+            cutoff = now - _JOB_OWNER_CACHE_TTL_S
+            for k, v in list(_JOB_OWNER_CACHE.items()):
+                if not v or v[0] < cutoff:
+                    _JOB_OWNER_CACHE.pop(k, None)
+    except Exception:
+        return
+
+
+def _pop_job_owner(job_id: str | None) -> tuple[str | None, str | None, str | None]:
+    """Return (username, device_id, source_text) for a recent job_id."""
+    try:
+        jid = str(job_id or "").strip()
+        if not jid:
+            return None, None, None
+        now = time.time()
+        item = _JOB_OWNER_CACHE.pop(jid, None)
+        if not item:
+            return None, None, None
+        ts, username, device_id, source_text = item
+        if (now - float(ts)) > _JOB_OWNER_CACHE_TTL_S:
+            return None, None, None
+        return username or None, device_id or None, source_text or None
+    except Exception:
+        return None, None, None
+
+
+def _truncate_notification_payload(obj: Any, *, max_str: int = 2000, max_list: int = 30, max_depth: int = 4, _depth: int = 0):
+    """Limit payload size to avoid large websocket frames (screenshots, logs, etc.)."""
+    try:
+        if _depth >= max_depth:
+            return "…"
+        if obj is None:
+            return None
+        if isinstance(obj, (int, float, bool)):
+            return obj
+        if isinstance(obj, str):
+            s = obj
+            if len(s) > max_str:
+                return s[:max_str] + "…"
+            return s
+        if isinstance(obj, dict):
+            out = {}
+            # Keep keys stable; truncate values.
+            for k, v in list(obj.items())[:200]:
+                ks = str(k)
+                if len(ks) > 120:
+                    ks = ks[:120] + "…"
+                out[ks] = _truncate_notification_payload(v, max_str=max_str, max_list=max_list, max_depth=max_depth, _depth=_depth + 1)
+            return out
+        if isinstance(obj, list):
+            return [
+                _truncate_notification_payload(v, max_str=max_str, max_list=max_list, max_depth=max_depth, _depth=_depth + 1)
+                for v in obj[:max_list]
+            ]
+        return _truncate_notification_payload(str(obj), max_str=max_str, max_list=max_list, max_depth=max_depth, _depth=_depth + 1)
+    except Exception:
+        try:
+            return str(obj)[:max_str] + ("…" if len(str(obj)) > max_str else "")
+        except Exception:
+            return "…"
 
 
 def _require_pc_agent_enabled() -> None:
@@ -253,9 +339,14 @@ def _get_principal(session_id: str | None) -> dict:
             if cached and (now - cached[0]) < _ROLE_CACHE_TTL_S:
                 role = cached[1]
             else:
-                role = voice_auth.get_role(username)
-                if role:
-                    _ROLE_CACHE[u] = (now, str(role).strip().lower())
+                # Only trust the user store if the user actually exists there.
+                # voice_auth.get_role() defaults to "user" for unknown users, which would
+                # incorrectly override a valid JWT role.
+                user_doc = voice_auth.get_user(username)
+                if user_doc:
+                    role = (user_doc.get("role") or "").strip().lower() or None
+                    if role:
+                        _ROLE_CACHE[u] = (now, str(role).strip().lower())
         except Exception:
             role = None
         if not role:
@@ -343,6 +434,8 @@ ADMIN_ONLY_ACTION_TYPES = {
     "write", "edit", "delete", "move", "copy", "cleanup",
     # Self-modifying
     "self_update", "self_add",
+    # Error healing (may execute commands / install packages)
+    "check_errors", "fix_errors", "check_render_logs",
     # Universal envelope
     "device_action",
 }
@@ -1011,6 +1104,7 @@ async def _dispatch_actions_to_device(device_id: str, username: str, actions: li
         "source_text": source_text,
         "actions": actions,
     }
+    _remember_job_owner(job)
     await device_hub.send_job(device_id, job)
     return job
 
@@ -1141,6 +1235,25 @@ async def agent_ws(ws: WebSocket):
                 await device_hub.touch(device_id)
                 logger = __import__('logging').getLogger(__name__)
                 logger.info("[AGENT RESULT] %s", payload)
+
+                # Publish to the user who initiated this job (best-effort).
+                try:
+                    jid = (payload or {}).get("job_id")
+                    user, did, source_text = _pop_job_owner(jid)
+                    if user:
+                        await notification_hub.publish(
+                            user,
+                            {
+                                "type": "device_job_result",
+                                "job_id": str(jid or ""),
+                                "device_id": did or device_id,
+                                "source_text": source_text,
+                                "results": _truncate_notification_payload((payload or {}).get("results") or []),
+                                "received_at": datetime.utcnow().isoformat(),
+                            },
+                        )
+                except Exception:
+                    pass
                 continue
 
     except WebSocketDisconnect:
@@ -3335,6 +3448,13 @@ async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
 # =========================================================
 @app.post("/api/chat")
 async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
+    # Cloud mode must require auth for chat to prevent public abuse/cost.
+    # Voice-only mode below already enforces this, but keep it explicit when chat mode is enabled.
+    if CLOUD_MODE and not msg.session_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please login first.",
+        )
     if VOICE_ONLY_MODE:
         incoming_mode = (msg.mode or "").strip().lower()
         if incoming_mode != "voice":
@@ -3349,6 +3469,9 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
             )
     request_id = f"chat_{uuid.uuid4().hex[:12]}"
     principal = _get_principal(msg.session_id) if msg.session_id else {"username": None, "role": "anonymous"}
+    if CLOUD_MODE:
+        # Upgrade anonymous principal to a required authenticated principal.
+        principal = _require_authenticated_session(msg.session_id)
     username = None
     role = principal.get("role", "anonymous")
     if msg.session_id:
@@ -3417,6 +3540,14 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                     response["action_results"] = server_results
             except Exception as e:
                 response["text"] = (response.get("text") or "") + f"\n\n(Server action execution failed: {e})"
+
+        # Strip server-only maintenance actions that the frontend can't execute.
+        # (These are admin-only in local mode and should never be emitted in cloud mode.)
+        server_only_blocked = {"check_errors", "fix_errors", "check_render_logs"}
+        blocked = [a for a in remaining_actions if isinstance(a, dict) and (a.get("type") in server_only_blocked)]
+        if blocked:
+            response["text"] = (response.get("text") or "") + "\n\n(Some maintenance actions are disabled in cloud mode.)"
+            remaining_actions = [a for a in remaining_actions if not (isinstance(a, dict) and (a.get("type") in server_only_blocked))]
 
         response["actions"] = remaining_actions
         response["request_id"] = request_id
@@ -3526,8 +3657,9 @@ async def search_and_summarize(req: SearchRequest):
         }
 
 @app.get("/api/internet/news")
-async def get_news_endpoint(topic: str = "latest", num_results: int = 5):
+async def get_news_endpoint(topic: str = "latest", num_results: int = 5, session_id: str | None = None):
     """Get latest news on a topic"""
+    _require_voice_session(session_id)
     try:
         from src.internet.internet import InternetAccess
         

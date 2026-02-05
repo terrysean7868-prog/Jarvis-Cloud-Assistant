@@ -29,6 +29,10 @@ google-cloud-speech>=2.26.0
 # Lightweight speaker biometrics (MFCC)
 python_speech_features>=0.6
 
+# Numpy is required by voice biometrics and many audio/math utilities.
+# Use a modern version with wheels for Python 3.13 on Linux.
+numpy>=2.1.0
+
 # Version Control / SSH (optional features)
 gitpython>=3.1.0
 paramiko

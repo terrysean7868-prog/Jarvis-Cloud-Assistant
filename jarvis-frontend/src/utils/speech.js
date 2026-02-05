@@ -511,3 +511,212 @@ export async function recordPcm16Once(options = {}) {
     return { audio_b64: null, sample_rate_hz: sampleRateHz };
   }
 }
+
+// Start recording PCM16 and return a controller that can be stopped manually.
+// This enables "hold-to-talk" (press to start, release to stop).
+export async function startPcm16Recorder(options = {}) {
+  const {
+    maxMs = 20000,
+    sampleRateHz = 16000,
+  } = options;
+
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext || !navigator.mediaDevices?.getUserMedia) {
+    return null;
+  }
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+    video: false,
+  });
+
+  const ctx = new AudioContext();
+  try {
+    if (ctx.state === "suspended") {
+      try { await ctx.resume(); } catch {}
+    }
+
+    const source = ctx.createMediaStreamSource(stream);
+    const processorNode = ctx.createScriptProcessor(4096, 1, 1);
+
+    const chunks = [];
+    let total = 0;
+    const startedAt = performance.now();
+    let finished = false;
+    let resolveFinish = null;
+    let rejectFinish = null;
+
+    const stopAll = () => {
+      try { processorNode.disconnect(); } catch {}
+      try { source.disconnect(); } catch {}
+      try { stream.getTracks().forEach(t => t.stop()); } catch {}
+    };
+
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      stopAll();
+      try {
+        if (ctx && ctx.state !== "closed") {
+          const p = ctx.close();
+          if (p && typeof p.then === "function") p.catch(() => {});
+        }
+      } catch {}
+    };
+
+    const finishPromise = new Promise((resolve, reject) => {
+      resolveFinish = resolve;
+      rejectFinish = reject;
+    });
+
+    const finalize = () => {
+      if (finished) return;
+      done();
+      try {
+        const flat = new Float32Array(total);
+        let offset = 0;
+        for (const c of chunks) {
+          flat.set(c, offset);
+          offset += c.length;
+        }
+
+        const resampled = _resampleToTarget(flat, ctx.sampleRate, sampleRateHz);
+        const pcm16 = _floatTo16BitPCM(resampled);
+        resolveFinish({
+          audio_b64: _arrayBufferToBase64(pcm16.buffer),
+          sample_rate_hz: sampleRateHz,
+        });
+      } catch (e) {
+        rejectFinish(e);
+      }
+    };
+
+    processorNode.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+
+      const copy = new Float32Array(input.length);
+      copy.set(input);
+      chunks.push(copy);
+      total += copy.length;
+
+      const now = performance.now();
+      const elapsed = now - startedAt;
+      if (elapsed >= maxMs) {
+        finalize();
+      }
+    };
+
+    source.connect(processorNode);
+    processorNode.connect(ctx.destination);
+
+    // Safety cutoff
+    const cutoff = setTimeout(() => {
+      try { finalize(); } catch {}
+    }, Math.max(1000, maxMs + 250));
+
+    return {
+      stop: async () => {
+        try { clearTimeout(cutoff); } catch {}
+        try { finalize(); } catch {}
+        return await finishPromise;
+      },
+      cancel: () => {
+        try { clearTimeout(cutoff); } catch {}
+        try { done(); } catch {}
+        try { resolveFinish({ audio_b64: null, sample_rate_hz: sampleRateHz }); } catch {}
+      },
+    };
+  } catch (e) {
+    try { stream.getTracks().forEach(t => t.stop()); } catch {}
+    try {
+      if (ctx && ctx.state !== "closed") {
+        const p = ctx.close();
+        if (p && typeof p.then === "function") p.catch(() => {});
+      }
+    } catch {}
+    return null;
+  }
+}
+
+// Start a WebSpeech recognition session that can be stopped manually.
+// This is a fallback for hold-to-talk when server-side audio transcription is disabled.
+export function startWebSpeechHold(options = {}) {
+  const {
+    language = (typeof navigator !== "undefined" && navigator.language) ? navigator.language : "en-US",
+    maxMs = 20000,
+  } = options;
+
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) return null;
+
+  const recognition = new SpeechRecognition();
+  recognition.lang = language;
+  recognition.continuous = true;
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+
+  let settled = false;
+  let transcript = "";
+  let timeoutId = null;
+
+  const promise = new Promise((resolve) => {
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      try { if (timeoutId) clearTimeout(timeoutId); } catch {}
+      try {
+        recognition.onresult = null;
+        recognition.onerror = null;
+        recognition.onend = null;
+      } catch {}
+      resolve(value);
+    };
+
+    recognition.onresult = (event) => {
+      try {
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const r = event.results[i];
+          const t = (r && r[0] && r[0].transcript) ? String(r[0].transcript) : "";
+          if (t) transcript += t + " ";
+        }
+      } catch {}
+    };
+
+    recognition.onerror = () => {
+      finish(transcript.trim() || null);
+    };
+
+    recognition.onend = () => {
+      finish(transcript.trim() || null);
+    };
+
+    if (maxMs > 0) {
+      timeoutId = setTimeout(() => {
+        try { recognition.stop(); } catch {}
+        finish(transcript.trim() || null);
+      }, maxMs);
+    }
+  });
+
+  try {
+    recognition.start();
+  } catch {
+    // If start fails, return a no-op controller.
+    return {
+      stop: async () => null,
+      promise: Promise.resolve(null),
+    };
+  }
+
+  return {
+    stop: () => {
+      try { recognition.stop(); } catch {}
+    },
+    promise,
+  };
+}

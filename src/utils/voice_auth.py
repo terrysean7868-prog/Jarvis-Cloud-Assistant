@@ -31,7 +31,7 @@ from typing import Tuple, Optional
 
 from src.config import runtime_defaults as rd
 
-from src.utils.voice_biometrics import VOICE_BIOMETRICS_MAX_EMBEDS
+VOICE_BIOMETRICS_MAX_EMBEDS = int(rd.VOICE_BIOMETRICS_MAX_EMBEDS)
 
 logger = logging.getLogger("jarvis.voice_auth")
 logger.setLevel(logging.INFO)

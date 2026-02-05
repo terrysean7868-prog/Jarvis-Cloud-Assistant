@@ -1210,29 +1210,42 @@ def run_ui() -> int:
                 if not win:
                     return
 
-                probe = {"ok": False, "value": None, "err": None}
+                # Avoid intrusive popups in production. This probe is useful for diagnosis,
+                # but can false-positive during early startup on some machines.
+                if not debug_webview:
+                    return
 
-                def _js_probe() -> None:
+                last_err = ""
+                # Wait for the document to become interactive/complete before probing arithmetic.
+                for _ in range(12):
+                    try:
+                        state = str(win.evaluate_js("document.readyState") or "")
+                        if state in ("interactive", "complete"):
+                            break
+                    except Exception as e:
+                        last_err = str(e)
+                    time.sleep(0.35)
+
+                ok = False
+                for _ in range(6):
                     try:
                         v = win.evaluate_js("1+1")
-                        probe["value"] = v
-                        probe["ok"] = str(v).strip() in ("2", "2.0")
+                        ok = str(v).strip() in ("2", "2.0")
+                        if ok:
+                            break
                     except Exception as e:
-                        probe["err"] = str(e)
+                        last_err = str(e)
+                    time.sleep(0.35)
 
-                t = threading.Thread(target=_js_probe, name="pc-agent-js-probe", daemon=True)
-                t.start()
-                t.join(2.0)
-
-                if probe["ok"]:
+                if ok:
                     return
 
                 try:
-                    err_tail = (probe.get("err") or "").strip()
+                    err_tail = (last_err or "").strip()
                     extra = f"\n\nDetails: {err_tail}" if err_tail else ""
                     _message_box(
                         "Jarvis PC Agent",
-                        "The embedded UI loaded, but JavaScript is not running.\n\n"
+                        "The embedded UI loaded, but JavaScript is not running (or is blocked).\n\n"
                         "This usually means either:\n"
                         "- WebView2 JavaScript is disabled by policy (managed PC), or\n"
                         "- The app is falling back to legacy MSHTML and Active Scripting is disabled.\n\n"

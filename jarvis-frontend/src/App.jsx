@@ -1,6 +1,6 @@
 // src/App.jsx
 import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, lazy } from "react";
-import { listenOnce, speak, initAudioProcessing, primeSpeechRecognition, recordPcm16Once } from "./utils/speech";
+import { listenOnce, speak, initAudioProcessing, primeSpeechRecognition, recordPcm16Once, startPcm16Recorder, startWebSpeechHold } from "./utils/speech";
 import {
   sendMessage,
   addLearningExample,
@@ -173,6 +173,9 @@ export default function App() {
   const notificationsReconnectTimerRef = useRef(null);
   const latestResearchTaskIdRef = useRef(null);
 
+  const pttControllerRef = useRef(null);
+  const [pttHolding, setPttHolding] = useState(false);
+
   useEffect(() => {
     speakingRef.current = !!speaking;
   }, [speaking]);
@@ -295,6 +298,29 @@ export default function App() {
           if (type === "research_cancelled") {
             const topic = (msg?.topic || "").toString();
             addLog("system", `Research cancelled${topic ? `: ${topic}` : ""}.`);
+            return;
+          }
+
+          if (type === "device_job_result") {
+            const deviceId = (msg?.device_id || "").toString();
+            const jobId = (msg?.job_id || "").toString();
+            const sourceText = (msg?.source_text || "").toString();
+            const results = Array.isArray(msg?.results) ? msg.results : [];
+
+            let ok = 0;
+            let err = 0;
+            let forbidden = 0;
+            for (const r of results) {
+              const st = (r?.status || "").toString().toLowerCase();
+              if (st === "success" || st === "opened" || st === "edited" || st === "written" || st === "copied" || st === "moved" || st === "deleted") ok += 1;
+              else if (st === "forbidden") forbidden += 1;
+              else if (st) err += 1;
+            }
+
+            const header = `PC action completed${deviceId ? ` (${deviceId})` : ""}${jobId ? ` [${jobId}]` : ""}.`;
+            const summary = `Results: ${ok} ok, ${err} error, ${forbidden} forbidden.`;
+            const details = sourceText ? `Source: ${sourceText}` : "";
+            addLog("system", [header, summary, details].filter(Boolean).join("\n"));
             return;
           }
 
@@ -464,6 +490,29 @@ export default function App() {
     } catch {}
     wakeSessionTimerRef.current = null;
   }, []);
+
+  const pushToTalk = useCallback(async () => {
+    if (!isAuthenticated) {
+      setShowAuthModal(true);
+      return;
+    }
+    if (isHandlingCommand.current) return;
+    if (speakingRef.current) return;
+
+    // Match wake-word behavior: open a wake session window for convenience.
+    // In biometrics mode we only open the session after verification.
+    if (!voiceBiometricsActive) {
+      startWakeSessionWindow();
+      setWakePulse(true);
+      setTimeout(() => setWakePulse(false), 900);
+    }
+
+    try {
+      await handleVoiceCommand();
+    } catch {
+      // handleVoiceCommand already logs errors.
+    }
+  }, [handleVoiceCommand, isAuthenticated, startWakeSessionWindow, voiceBiometricsActive]);
 
   // No "Enable Voice" button: voice is always on.
   // On mobile we unlock mic/STT on first user gesture.
@@ -760,7 +809,7 @@ export default function App() {
     if (typeof transcript === "string") transcript = transcript.trim();
     if (!transcript) transcript = null;
 
-    if (webSpeechSupported) {
+    if (webSpeechSupported && !transcript) {
       try {
         // In biometrics mode, we require the secure server audio path so that speaker identity is verified.
         // WebSpeech doesn't provide raw audio to the backend, so we skip it.
@@ -1319,6 +1368,135 @@ export default function App() {
     }
   }, [sessionId, addLog, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow]);
 
+  const startHoldToTalk = useCallback(async () => {
+    if (!isAuthenticated) {
+      setShowAuthModal(true);
+      return;
+    }
+    if (pttHolding) return;
+    if (isHandlingCommand.current) return;
+    if (speakingRef.current) return;
+
+    setPttHolding(true);
+    addLog("system", "Hold to talk… release to send.");
+
+    // Stop wake recognizer to avoid overlap.
+    try { wakeRecognizer.current?.stop(); } catch {}
+
+    // Prefer the server audio path when available (best accuracy + required for biometrics).
+    if (voiceBiometricsActive || googleSttEnabled) {
+      try {
+        const ctrl = await startPcm16Recorder({
+          sampleRateHz: 16000,
+          maxMs: isMobile ? 20000 : 25000,
+        });
+        pttControllerRef.current = { kind: "pcm", ctrl };
+        if (!ctrl) {
+          addLog("system", "Microphone is not available for push-to-talk.");
+        }
+        return;
+      } catch {
+        pttControllerRef.current = null;
+        addLog("system", "Could not start push-to-talk recording.");
+        return;
+      }
+    }
+
+    // Fallback: WebSpeech hold session.
+    try {
+      const ws = startWebSpeechHold({ language: voiceLang, maxMs: isMobile ? 20000 : 25000 });
+      pttControllerRef.current = { kind: "webspeech", ctrl: ws };
+      if (!ws) {
+        addLog("system", "SpeechRecognition not available for push-to-talk.");
+      }
+    } catch {
+      pttControllerRef.current = null;
+      addLog("system", "Could not start SpeechRecognition.");
+    }
+  }, [addLog, googleSttEnabled, isAuthenticated, isMobile, pttHolding, voiceBiometricsActive, voiceLang]);
+
+  const stopHoldToTalk = useCallback(async () => {
+    if (!pttHolding) return;
+    setPttHolding(false);
+
+    const holder = pttControllerRef.current;
+    pttControllerRef.current = null;
+
+    try {
+      if (!holder || !holder.ctrl) {
+        try { wakeRecognizer.current?.start(); } catch {}
+        return;
+      }
+
+      // PCM path (server transcription)
+      if (holder.kind === "pcm") {
+        const { audio_b64, sample_rate_hz } = await holder.ctrl.stop();
+        if (!audio_b64) {
+          addLog("error", "No speech captured.");
+          try { wakeRecognizer.current?.start(); } catch {}
+          return;
+        }
+
+        let text = null;
+        try {
+          if (voiceBiometricsActive) {
+            const resp = await secureVoiceToText(sessionId, audio_b64, voiceLang, sample_rate_hz);
+            text = (resp?.text || "").toString().trim() || null;
+          } else {
+            const resp = await googleSpeechToText(sessionId, audio_b64, voiceLang, sample_rate_hz);
+            text = (resp?.text || "").toString().trim() || null;
+          }
+        } catch (e) {
+          addLog("error", e?.message || String(e));
+          try { wakeRecognizer.current?.start(); } catch {}
+          return;
+        }
+
+        if (!text) {
+          addLog("error", "No command received.");
+          try { wakeRecognizer.current?.start(); } catch {}
+          return;
+        }
+
+        // Match wake-word UX: pulse + open wake-session after a successful command.
+        // In biometrics mode, we only open the wake-session after verification (handled in handleVoiceCommand).
+        if (!voiceBiometricsActive) {
+          startWakeSessionWindow();
+          setWakePulse(true);
+          setTimeout(() => setWakePulse(false), 900);
+        }
+
+        pendingTranscriptRef.current = text;
+        await handleVoiceCommand();
+        return;
+      }
+
+      // WebSpeech hold path
+      if (holder.kind === "webspeech") {
+        try { holder.ctrl.stop(); } catch {}
+        const text = await holder.ctrl.promise;
+        if (!text) {
+          addLog("error", "No command received.");
+          try { wakeRecognizer.current?.start(); } catch {}
+          return;
+        }
+
+        if (!voiceBiometricsActive) {
+          startWakeSessionWindow();
+          setWakePulse(true);
+          setTimeout(() => setWakePulse(false), 900);
+        }
+
+        pendingTranscriptRef.current = String(text).trim();
+        await handleVoiceCommand();
+        return;
+      }
+    } catch (e) {
+      addLog("error", e?.message || String(e));
+      try { wakeRecognizer.current?.start(); } catch {}
+    }
+  }, [addLog, handleVoiceCommand, pttHolding, secureVoiceToText, googleSpeechToText, sessionId, voiceBiometricsActive, voiceLang, startWakeSessionWindow]);
+
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -1337,6 +1515,8 @@ export default function App() {
     let active = false;
     let startAttempts = 0;
     let restartTimer = null;
+    let watchdogTimer = null;
+    let lastEventAt = Date.now();
 
     const scheduleStart = (ms) => {
       try {
@@ -1360,14 +1540,21 @@ export default function App() {
         recognizer.start();
         active = true;
         startAttempts = 0;
+        lastEventAt = Date.now();
       } catch (err) {
         startAttempts++;
         if (startAttempts < 6) scheduleStart(400 + startAttempts * 200);
       }
     };
 
+    recognizer.onstart = () => {
+      active = true;
+      lastEventAt = Date.now();
+    };
+
     recognizer.onresult = (e) => {
       try {
+        lastEventAt = Date.now();
         const result = e.results[e.resultIndex];
         const rawTranscript = (result[0].transcript || "").toString().trim();
         const transcript = normalizeWake(rawTranscript);
@@ -1421,6 +1608,7 @@ export default function App() {
 
     recognizer.onerror = (ev) => {
       const errName = ev?.error || "unknown";
+      lastEventAt = Date.now();
 
       // Some errors are not recoverable without user action (permissions / missing mic).
       // Avoid an infinite restart loop that spams logs in packaged desktop builds.
@@ -1462,8 +1650,39 @@ export default function App() {
 
     recognizer.onend = () => {
       active = false;
+      lastEventAt = Date.now();
       if (!isHandlingCommand.current && isAuthenticated) scheduleStart(700);
     };
+
+    // Desktop/Electron/WebView builds sometimes end up with a "stuck" recognizer
+    // that stops emitting events but also doesn't reliably fire onend. Add a small
+    // watchdog so the user doesn't need to refresh the UI.
+    watchdogTimer = setInterval(() => {
+      try {
+        if (!isAuthenticated) return;
+        if (isHandlingCommand.current) return;
+        if (speakingRef.current) return;
+
+        const now = Date.now();
+        const quietMs = now - (lastEventAt || now);
+
+        // If nothing has happened for a while, restart recognition.
+        if (quietMs > 45_000) {
+          try { recognizer.stop(); } catch {}
+          active = false;
+          lastEventAt = now;
+          scheduleStart(1200);
+          return;
+        }
+
+        // If we are not active, attempt a gentle restart.
+        if (!active) {
+          scheduleStart(1200);
+        }
+      } catch {
+        // ignore
+      }
+    }, 12_000);
 
     // Start after a short delay to avoid slowing initial paint
     const startTimer = setTimeout(safeStart, 600);
@@ -1477,8 +1696,12 @@ export default function App() {
         if (restartTimer) clearTimeout(restartTimer);
       } catch {}
       try {
+        if (watchdogTimer) clearInterval(watchdogTimer);
+      } catch {}
+      try {
         recognizer.onresult = null;
         recognizer.onerror = null;
+        recognizer.onstart = null;
         recognizer.onend = null;
         recognizer.stop();
       } catch {}
@@ -1769,8 +1992,53 @@ export default function App() {
 
           <div style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)" }}>
             <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
-              {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to begin`}
+              {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to wake up`}
             </div>
+
+            {isAuthenticated && (!isMobile || voiceUnlocked) && (
+              <button
+                onPointerDown={(e) => {
+                  try { e.preventDefault(); } catch {}
+                  startHoldToTalk();
+                }}
+                onPointerUp={(e) => {
+                  try { e.preventDefault(); } catch {}
+                  stopHoldToTalk();
+                }}
+                onPointerCancel={() => {
+                  stopHoldToTalk();
+                }}
+                onPointerLeave={() => {
+                  // If the user drags out while holding, treat as release.
+                  if (pttHolding) stopHoldToTalk();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === " " || e.key === "Enter") {
+                    e.preventDefault();
+                    startHoldToTalk();
+                  }
+                }}
+                onKeyUp={(e) => {
+                  if (e.key === " " || e.key === "Enter") {
+                    e.preventDefault();
+                    stopHoldToTalk();
+                  }
+                }}
+                style={{
+                  background: "rgba(0,0,0,0.25)",
+                  color: "var(--jarvis-accent)",
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  padding: "6px 10px",
+                  borderRadius: 999,
+                  cursor: "pointer",
+                  fontSize: 12,
+                  letterSpacing: 0.2,
+                }}
+                title="Hold to talk (fallback if wake word fails)"
+              >
+                {pttHolding ? "Release to send" : "Hold to talk"}
+              </button>
+            )}
           </div>
         </div>
       </div>
