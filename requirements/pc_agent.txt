@@ -1,0 +1,5 @@
+# PC Agent (headless) dependencies
+# The agent primarily needs the shared core.
+# If you want *all* optional Windows automation/vision features, use requirements/full.txt.
+
+-r core.txt

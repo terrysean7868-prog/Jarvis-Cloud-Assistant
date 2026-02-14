@@ -12,6 +12,7 @@ from src.utils.db import db
 from src.core.llm_adapter import LLMAdapter
 from src.utils.task_manager import task_manager
 from src.config import runtime_defaults as rd
+from src.config.settings import settings as jarvis_settings
 from src.config.secrets import llm_secrets
 
 # MCP support (existing integration from prior patch)
@@ -1108,7 +1109,7 @@ class JarvisBrain:
             for action in actions:
                 if action.get("type") == "mcp_tool":
                     # Cloud deployments must not perform server-side tool execution.
-                    if bool(rd.CLOUD_MODE):
+                    if bool(jarvis_settings.cloud_mode):
                         tool_results.append({
                             "tool": action.get("tool"),
                             "args": action.get("args", {}),

@@ -1,2 +1,4 @@
-PySimpleGUI
-psutil
+# Back-compat wrapper.
+# Canonical PC Agent desktop requirements live in: requirements/pc_agent_desktop.txt
+
+-r ../../requirements/pc_agent_desktop.txt

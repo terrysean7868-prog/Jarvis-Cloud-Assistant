@@ -1,0 +1,2 @@
+# UI dependencies are managed by npm in jarvis-frontend/.
+# See docs/INSTALL.md (UI section).

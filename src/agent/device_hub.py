@@ -7,6 +7,13 @@ from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
 
+from src.config.settings import settings
+
+try:
+    from src.broker.redis_broker import RedisBroker
+except Exception:
+    RedisBroker = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,10 +33,91 @@ class DeviceHub:
     run multiple gunicorn workers, you need a shared broker (Redis) instead.
     """
 
-    def __init__(self, shared_secret: str):
+    def __init__(self, shared_secret: str, *, broker: Any | None = None, instance_id: str | None = None):
         self._shared_secret = shared_secret
         self._lock = asyncio.Lock()
         self._agents: Dict[str, AgentConnection] = {}
+
+        # Optional broker for multi-instance routing.
+        self._broker = broker
+        self._instance_id = (instance_id or settings.instance_id).strip()
+        self._listener_task: asyncio.Task | None = None
+        self._registry_ttl_seconds = 60
+
+    def attach_broker(self, broker: Any) -> None:
+        self._broker = broker
+
+    def start_broker_listener(self) -> None:
+        """Listen for jobs destined for this instance and forward to connected agents."""
+        if not self._broker:
+            return
+        if self._listener_task and not self._listener_task.done():
+            return
+
+        channel = f"agent_jobs:{self._instance_id}"
+
+        async def _on_message(msg: dict) -> None:
+            try:
+                job = msg.get("job")
+                device_id = (msg.get("device_id") or "").strip().lower()
+                if not device_id or not isinstance(job, dict):
+                    return
+                # Forward only if the agent is connected on this instance.
+                async with self._lock:
+                    conn = self._agents.get(device_id)
+                if not conn:
+                    return
+                await conn.websocket.send_text(json.dumps({"type": "job", **job}))
+            except Exception:
+                return
+
+        try:
+            self._listener_task = self._broker.start_listener(channel, _on_message, task_name="broker-agent-jobs")
+        except Exception:
+            self._listener_task = None
+
+    async def shutdown(self) -> None:
+        try:
+            if self._listener_task and not self._listener_task.done():
+                self._listener_task.cancel()
+        except Exception:
+            pass
+
+    async def _set_registry(self, device_id: str, conn: AgentConnection) -> None:
+        """Persist device->instance mapping in broker so dispatch can route across workers."""
+        if not self._broker:
+            return
+        try:
+            key = f"agent_registry:{device_id}"
+            await self._broker.set_json(
+                key,
+                {
+                    "device_id": device_id,
+                    "instance_id": self._instance_id,
+                    "connected_at": conn.connected_at,
+                    "last_seen_at": conn.last_seen_at,
+                    "capabilities": conn.capabilities or {},
+                },
+                ttl_seconds=self._registry_ttl_seconds,
+            )
+        except Exception:
+            return
+
+    async def _del_registry(self, device_id: str) -> None:
+        if not self._broker:
+            return
+        try:
+            await self._broker.delete(f"agent_registry:{device_id}")
+        except Exception:
+            pass
+
+    async def _get_registry(self, device_id: str) -> Optional[dict]:
+        if not self._broker:
+            return None
+        try:
+            return await self._broker.get_json(f"agent_registry:{device_id}")
+        except Exception:
+            return None
 
     async def register(self, device_id: str, secret: str, websocket: WebSocket, capabilities: Optional[Dict[str, Any]] = None) -> None:
         if not self._shared_secret:
@@ -49,6 +137,15 @@ class DeviceHub:
                 capabilities=capabilities or {},
             )
 
+        # Best-effort multi-instance registry.
+        try:
+            async with self._lock:
+                conn = self._agents.get(device_id)
+            if conn:
+                await self._set_registry(device_id, conn)
+        except Exception:
+            pass
+
     async def register_token(self, device_id: str, websocket: WebSocket, capabilities: Optional[Dict[str, Any]] = None) -> None:
         """Register an agent using a verified server-issued JWT token.
 
@@ -67,21 +164,41 @@ class DeviceHub:
                 capabilities=capabilities or {},
             )
 
+        try:
+            async with self._lock:
+                conn = self._agents.get(device_id)
+            if conn:
+                await self._set_registry(device_id, conn)
+        except Exception:
+            pass
+
     async def get_agent(self, device_id: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
             conn = self._agents.get(device_id)
-            if not conn:
-                return None
+            if conn:
+                return {
+                    "device_id": device_id,
+                    "connected_at": conn.connected_at,
+                    "last_seen_at": conn.last_seen_at,
+                    "capabilities": conn.capabilities or {},
+                }
+
+        # Multi-instance: return registry info if available.
+        reg = await self._get_registry(device_id)
+        if isinstance(reg, dict) and reg.get("instance_id"):
             return {
                 "device_id": device_id,
-                "connected_at": conn.connected_at,
-                "last_seen_at": conn.last_seen_at,
-                "capabilities": conn.capabilities or {},
+                "connected_at": reg.get("connected_at"),
+                "last_seen_at": reg.get("last_seen_at"),
+                "capabilities": reg.get("capabilities") or {},
+                "instance_id": reg.get("instance_id"),
             }
+        return None
 
     async def unregister(self, device_id: str) -> None:
         async with self._lock:
             self._agents.pop(device_id, None)
+        await self._del_registry(device_id)
 
     async def touch(self, device_id: str) -> None:
         now = datetime.utcnow().isoformat()
@@ -90,24 +207,59 @@ class DeviceHub:
             if conn:
                 conn.last_seen_at = now
 
+        # Refresh registry TTL.
+        try:
+            async with self._lock:
+                conn2 = self._agents.get(device_id)
+            if conn2:
+                await self._set_registry(device_id, conn2)
+        except Exception:
+            pass
+
     async def update_capabilities(self, device_id: str, capabilities: Dict[str, Any]) -> None:
         async with self._lock:
             conn = self._agents.get(device_id)
             if conn:
                 conn.capabilities = capabilities or {}
 
+        try:
+            async with self._lock:
+                conn2 = self._agents.get(device_id)
+            if conn2:
+                await self._set_registry(device_id, conn2)
+        except Exception:
+            pass
+
     async def is_connected(self, device_id: str) -> bool:
         async with self._lock:
-            return device_id in self._agents
+            if device_id in self._agents:
+                return True
+        reg = await self._get_registry(device_id)
+        return bool(isinstance(reg, dict) and reg.get("instance_id"))
 
     async def send_job(self, device_id: str, job: Dict[str, Any]) -> None:
         """Send a job to the connected agent."""
         async with self._lock:
             conn = self._agents.get(device_id)
-        if not conn:
-            raise RuntimeError(f"Agent not connected: {device_id}")
+        if conn:
+            await conn.websocket.send_text(json.dumps({"type": "job", **job}))
+            return
 
-        await conn.websocket.send_text(json.dumps({"type": "job", **job}))
+        # Multi-instance: route to the instance holding the websocket.
+        if self._broker is not None:
+            reg = await self._get_registry(device_id)
+            target = (reg or {}).get("instance_id") if isinstance(reg, dict) else None
+            if target:
+                await self._broker.publish_json(
+                    f"agent_jobs:{str(target).strip()}",
+                    {
+                        "device_id": device_id,
+                        "job": job,
+                    },
+                )
+                return
+
+        raise RuntimeError(f"Agent not connected: {device_id}")
 
     async def list_agents(self) -> Dict[str, Dict[str, Any]]:
         async with self._lock:

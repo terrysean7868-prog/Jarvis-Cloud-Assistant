@@ -101,6 +101,7 @@ class Config:
         'run_jarvis.py',
         'config.py',
         'requirements.txt',
+        'requirements',
         'README.md'
     ]
     

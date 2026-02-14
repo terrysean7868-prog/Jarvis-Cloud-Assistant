@@ -1,0 +1,38 @@
+# ===============================================
+# Jarvis - Full local/dev dependencies
+# This matches the previous root requirements.txt content, split by usage.
+# ===============================================
+
+-r core.txt
+
+# Data Science and ML (for reasoning, pattern recognition)
+numpy>=1.21.0
+scikit-learn>=1.0.2
+networkx>=2.6.3
+scipy>=1.7.3
+
+# Advanced ML Features (optional but included)
+tensorflow>=2.13.0; platform_system == "Windows"
+pandas>=1.3.3
+nltk>=3.6.5
+gensim>=4.1.2
+
+# Voice Recognition and Audio Processing (Windows)
+SpeechRecognition==3.8.1; platform_system == "Windows"
+pydub==0.25.1; platform_system == "Windows"
+vosk==0.3.42; platform_system == "Windows"
+pyttsx3>=2.90; platform_system == "Windows"
+pocketsphinx>=0.1.15; platform_system == "Windows"
+
+# Desktop Integration and Automation
+selenium>=4.0.0
+pyautogui>=0.9.53; platform_system == "Windows"
+Pillow>=10.0.0
+pytesseract>=0.3.10; platform_system == "Windows"
+opencv-python>=4.8.0; platform_system == "Windows"
+pywin32>=306; sys_platform == 'win32'
+comtypes; sys_platform == 'win32'
+pycaw; sys_platform == 'win32'
+
+# Language Translation
+googletrans==4.0.2

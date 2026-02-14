@@ -51,9 +51,9 @@ if "%AGENT_TOKEN%"=="" (
 )
 
 if not "%AGENT_TOKEN%"=="" (
-	"%PYTHON%" "%REPO%pc_agent.py" --token "%AGENT_TOKEN%"
+	"%PYTHON%" "%REPO%apps\pc_agent\pc_agent.py" --token "%AGENT_TOKEN%"
 ) else (
-	"%PYTHON%" "%REPO%pc_agent.py"
+	"%PYTHON%" "%REPO%apps\pc_agent\pc_agent.py"
 )
 set "EXITCODE=%ERRORLEVEL%"
 

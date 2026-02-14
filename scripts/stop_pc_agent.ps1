@@ -20,7 +20,7 @@ try {
   $matches = Get-CimInstance Win32_Process |
     Where-Object {
       $_.CommandLine -and
-      $_.CommandLine -like "*pc_agent.py*" -and
+      ($_.CommandLine -like "*pc_agent.py*" -or $_.CommandLine -like "*apps\\pc_agent\\pc_agent.py*") -and
       $_.CommandLine -like "*$repoNorm*"
     }
 } catch {

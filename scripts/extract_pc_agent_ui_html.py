@@ -5,7 +5,7 @@ from pathlib import Path
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
-    src_path = repo_root / "pc_agent_app.py"
+    src_path = repo_root / "apps" / "pc_agent" / "pc_agent_app.py"
     src = src_path.read_text(encoding="utf-8")
 
     marker = '"""<!doctype html>'

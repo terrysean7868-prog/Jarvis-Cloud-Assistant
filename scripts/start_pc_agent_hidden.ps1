@@ -15,9 +15,12 @@ if (-not $RepoPath) {
   try { $RepoPath = (Resolve-Path $RepoPath).Path } catch { }
 }
 
-$agent = Join-Path $RepoPath 'pc_agent.py'
+$agent = Join-Path $RepoPath 'apps\pc_agent\pc_agent.py'
 if (-not (Test-Path $agent)) {
-  Write-Host "pc_agent.py not found at $agent"
+  $agent = Join-Path $RepoPath 'pc_agent.py'
+}
+if (-not (Test-Path $agent)) {
+  Write-Host "PC agent entrypoint not found at $agent"
   exit 1
 }
 

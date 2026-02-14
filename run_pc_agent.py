@@ -8,7 +8,7 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent
 
     agent_exe = repo_root / "dist" / "JarvisPCAgent.exe"
-    agent_py = repo_root / "pc_agent.py"
+    agent_py = repo_root / "apps" / "pc_agent" / "pc_agent.py"
 
     if agent_exe.exists():
         args = list(sys.argv[1:])

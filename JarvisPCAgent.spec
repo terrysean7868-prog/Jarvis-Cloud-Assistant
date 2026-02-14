@@ -13,8 +13,8 @@ except Exception:
     pass
 
 a = Analysis(
-    ['pc_agent_app.py'],
-    pathex=[],
+    ['apps\\pc_agent\\pc_agent_app.py'],
+    pathex=['.'],
     binaries=[] + (webview_binaries or []),
     datas=[('assets\\jarvis.ico', 'assets'), ('assets\\pc_agent_ui.html', 'assets')] + (webview_datas or []),
     hiddenimports=hiddenimports,

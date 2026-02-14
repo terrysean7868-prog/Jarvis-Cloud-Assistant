@@ -1,0 +1,3 @@
+# Dev/all-in-one dependencies (local Windows-focused)
+
+-r full.txt

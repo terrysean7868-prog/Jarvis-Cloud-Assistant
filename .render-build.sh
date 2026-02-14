@@ -3,7 +3,10 @@ set -euo pipefail
 
 echo "🪶 Installing dependencies"
 pip install --upgrade pip
-if [ -f requirements.render.txt ]; then
+if [ -f requirements/render.txt ]; then
+	echo "🪶 Using requirements/render.txt"
+	pip install -r requirements/render.txt
+elif [ -f requirements.render.txt ]; then
 	echo "🪶 Using requirements.render.txt"
 	pip install -r requirements.render.txt
 else

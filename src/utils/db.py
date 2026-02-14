@@ -198,6 +198,33 @@ class Database:
             pass
         # end _setup_collections
 
+        # Tasks (long-running operations; used by research + automation workflows)
+        try:
+            tasks = self.db.tasks
+            tasks.create_indexes(
+                [
+                    IndexModel([("id", ASCENDING)], unique=True),
+                    IndexModel([("created_at", DESCENDING)]),
+                    IndexModel([("status", ASCENDING)]),
+                    IndexModel([("meta.user_id", ASCENDING)]),
+                ]
+            )
+        except Exception:
+            pass
+
+        # Wakeup context (voice-first continuity)
+        try:
+            wakeup = self.db.wakeup_context
+            wakeup.create_indexes(
+                [
+                    IndexModel([("context_id", ASCENDING)], unique=True),
+                    IndexModel([("timestamp", DESCENDING)]),
+                    IndexModel([("meta.user_id", ASCENDING)]),
+                ]
+            )
+        except Exception:
+            pass
+
     def _start_reconnect_thread(self):
         """Start background thread to attempt reconnection if not already running."""
         with self._reconnect_lock:
@@ -289,6 +316,70 @@ class Database:
             }
         }
         return collection.insert_one(doc)
+
+    # =========================================================
+    # Tasks (centralized long-running operations store)
+    # =========================================================
+    def tasks_upsert(self, task: dict) -> bool:
+        """Upsert a task document by id. Returns True on best-effort success."""
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        try:
+            tid = (task or {}).get("id")
+            if not tid:
+                return False
+            self.db.tasks.update_one({"id": tid}, {"$set": task}, upsert=True)
+            return True
+        except Exception:
+            return False
+
+    def tasks_get(self, task_id: str) -> dict | None:
+        self._ensure_connected()
+        if self.db is None:
+            return None
+        try:
+            doc = self.db.tasks.find_one({"id": str(task_id)})
+            if not doc:
+                return None
+            # normalize ObjectId
+            try:
+                doc.pop("_id", None)
+            except Exception:
+                pass
+            return doc
+        except Exception:
+            return None
+
+    def tasks_list(self, *, user_id: str | None = None, limit: int = 500) -> list[dict]:
+        self._ensure_connected()
+        if self.db is None:
+            return []
+        try:
+            q = {}
+            if user_id:
+                q = {"meta.user_id": str(user_id).strip().lower()}
+            cur = self.db.tasks.find(q).sort("created_at", DESCENDING).limit(int(max(1, min(limit, 2000))))
+            out = []
+            for d in cur:
+                try:
+                    d.pop("_id", None)
+                except Exception:
+                    pass
+                out.append(d)
+            return out
+        except Exception:
+            return []
+
+    def tasks_update_fields(self, task_id: str, fields: dict) -> bool:
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        try:
+            self.db.tasks.update_one({"id": str(task_id)}, {"$set": fields})
+            return True
+        except Exception:
+            return False
 
     # =========================================================
     # Learning Examples (persistent training store)

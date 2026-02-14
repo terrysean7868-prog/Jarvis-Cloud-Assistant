@@ -1,0 +1,10 @@
+# ===============================================
+# Jarvis - Render (Linux/Cloud)
+# Used by: Render build (.render-build.sh)
+# ===============================================
+
+-r core.txt
+
+# Numpy is required by voice biometrics and many audio/math utilities.
+# Use a modern version with wheels for Python 3.13 on Linux.
+numpy>=2.1.0

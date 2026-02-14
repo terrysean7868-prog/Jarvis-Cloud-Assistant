@@ -1,0 +1,7 @@
+# ===============================================
+# Jarvis - PC Agent (desktop UI) dependencies
+# ===============================================
+
+-r core.txt
+
+PySimpleGUI

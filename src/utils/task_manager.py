@@ -1,14 +1,20 @@
-# src/utils/task_manager.py
+"""Task Management System.
+
+Scalability goals:
+- In cloud/multi-instance deployments, task state must be centralized and survive restarts.
+- Prefer MongoDB when available.
+- Avoid file-based persistence in cloud mode.
 """
-Task Management System
-Manages tasks, operations, and step-by-step execution tracking
-"""
+
 import json
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
-from pathlib import Path
 from enum import Enum
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from src.config.settings import settings
+from src.utils.db import db
 
 TASK_FILE = Path(__file__).parent.parent.parent / "data" / "tasks.json"
 TASK_FILE.parent.mkdir(exist_ok=True)
@@ -27,33 +33,79 @@ class TaskManager:
     """Manage tasks and operations"""
     
     def __init__(self):
+        self._store_mode = (settings.task_store or "auto").strip().lower()
+        # Backstop: cloud must not use file-based persistence.
+        if settings.cloud_mode and self._store_mode in {"auto", "file"}:
+            self._store_mode = "mongo"
+
         self.tasks = self._load_tasks()
         self.current_task = None
         self.task_history = []
         self.stop_requested = False
         self.wakeup_context = {}  # Context mapping for wakeup command
+
+    def _mongo_available(self) -> bool:
+        try:
+            db._ensure_connected()
+            return db.db is not None
+        except Exception:
+            return False
+
+    def _use_mongo(self) -> bool:
+        if self._store_mode == "mongo":
+            return True
+        if self._store_mode in {"file", "memory"}:
+            return False
+        # auto
+        return self._mongo_available()
     
     def _load_tasks(self) -> List[Dict]:
         """Load tasks from file"""
+        if self._use_mongo():
+            try:
+                return db.tasks_list(limit=1000) or []
+            except Exception:
+                return []
+
+        if self._store_mode != "file":
+            # Default when Mongo isn't available: in-memory only.
+            return []
+
         if TASK_FILE.exists():
             try:
-                with open(TASK_FILE, 'r') as f:
-                    return json.load(f)
-            except:
+                with open(TASK_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, list) else []
+            except Exception:
                 return []
         return []
     
     def _save_tasks(self):
         """Save tasks to file"""
+        if self._use_mongo():
+            try:
+                for t in self.tasks or []:
+                    if isinstance(t, dict):
+                        db.tasks_upsert(t)
+            except Exception:
+                pass
+            return
+
+        if self._store_mode != "file":
+            return
+
         try:
-            with open(TASK_FILE, 'w') as f:
+            with open(TASK_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.tasks, f, indent=2)
         except Exception as e:
             print(f"Failed to save tasks: {e}")
     
     def create_task(self, description: str, steps: List[Dict], priority: int = 5, meta: Optional[Dict] = None) -> str:
         """Create a new task"""
-        task_id = f"task_{int(time.time())}"
+        # Cloud backstop: tasks must be persisted centrally.
+        if settings.cloud_mode and not self._use_mongo():
+            raise RuntimeError("Task store unavailable in cloud mode (MongoDB required)")
+        task_id = f"task_{int(time.time())}_{int(time.time() * 1000) % 100000}"
         task = {
             "id": task_id,
             "description": description,
@@ -100,6 +152,13 @@ class TaskManager:
                 if not isinstance(task.get("meta"), dict):
                     task["meta"] = {}
                 task["meta"].update(meta_update)
+            except Exception:
+                pass
+
+        # Mongo: persist incremental update so other instances can see it quickly.
+        if self._use_mongo():
+            try:
+                db.tasks_upsert(task)
             except Exception:
                 pass
 
@@ -196,11 +255,18 @@ class TaskManager:
 
     def get_task(self, task_id: str) -> Optional[Dict]:
         """Get a task by id."""
+        if self._use_mongo():
+            try:
+                t = db.tasks_get(task_id)
+                if t:
+                    return t
+            except Exception:
+                pass
         return self._find_task(task_id)
 
     def is_cancel_requested(self, task_id: str) -> bool:
         """Return True if a task has a cancel requested flag set."""
-        task = self._find_task(task_id)
+        task = self.get_task(task_id)
         if not task:
             return False
         meta = task.get("meta")
@@ -211,7 +277,7 @@ class TaskManager:
 
         Background jobs should poll `is_cancel_requested` and exit cooperatively.
         """
-        task = self._find_task(task_id)
+        task = self.get_task(task_id)
         if not task:
             return {"status": "error", "message": "Task not found"}
 
@@ -227,6 +293,11 @@ class TaskManager:
     
     def get_all_tasks(self) -> List[Dict]:
         """Get all tasks"""
+        if self._use_mongo():
+            try:
+                self.tasks = db.tasks_list(limit=1000) or []
+            except Exception:
+                pass
         return self.tasks
     
     def save_wakeup_context(self, prompt: str, response: str, actions: List[Dict]):
@@ -242,9 +313,63 @@ class TaskManager:
         if len(self.wakeup_context) > 50:
             oldest = min(self.wakeup_context.keys())
             del self.wakeup_context[oldest]
+
+        # Persist to MongoDB when available.
+        if self._use_mongo():
+            try:
+                db._ensure_connected()
+                if db.db is not None:
+                    col = db.db.wakeup_context
+                    col.update_one(
+                        {"context_id": context_id},
+                        {
+                            "$set": {
+                                "context_id": context_id,
+                                "prompt": prompt,
+                                "response": response,
+                                "actions": actions,
+                                "timestamp": datetime.utcnow(),
+                            }
+                        },
+                        upsert=True,
+                    )
+                    # Prune to last 200 entries (best-effort)
+                    try:
+                        ids = [d.get("_id") for d in col.find({}, {"_id": 1}).sort("timestamp", -1).skip(200)]
+                        ids = [i for i in ids if i]
+                        if ids:
+                            col.delete_many({"_id": {"$in": ids}})
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     
     def get_wakeup_context(self) -> Dict:
         """Get wakeup context mapping"""
+        if self._use_mongo():
+            try:
+                db._ensure_connected()
+                if db.db is not None:
+                    col = db.db.wakeup_context
+                    out: dict = {}
+                    for d in col.find({}).sort("timestamp", -1).limit(50):
+                        try:
+                            cid = str(d.get("context_id") or "").strip()
+                            if not cid:
+                                continue
+                            out[cid] = {
+                                "prompt": d.get("prompt"),
+                                "response": d.get("response"),
+                                "actions": d.get("actions") or [],
+                                "timestamp": (
+                                    d.get("timestamp").isoformat() if hasattr(d.get("timestamp"), "isoformat") else d.get("timestamp")
+                                ),
+                            }
+                        except Exception:
+                            continue
+                    self.wakeup_context = out
+            except Exception:
+                pass
         return self.wakeup_context
     
     def create_task_from_context(self, context_id: str) -> Optional[str]:

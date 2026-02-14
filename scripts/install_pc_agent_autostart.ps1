@@ -14,4 +14,4 @@ if (Test-Path $uninstall) {
 }
 
 Write-Host "PC agent autostart at Windows login is disabled." -ForegroundColor Yellow
-Write-Host "Start the agent manually when needed (dist\JarvisPCAgent.exe or python pc_agent.py)." -ForegroundColor Yellow
+Write-Host "Start the agent manually when needed (dist\JarvisPCAgent.exe or python apps\pc_agent\pc_agent.py)." -ForegroundColor Yellow

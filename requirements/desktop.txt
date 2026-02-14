@@ -1,0 +1,9 @@
+# ===============================================
+# Jarvis - Desktop UI dependencies
+# Used by: JarvisDesktop.spec / desktop launcher scripts
+# ===============================================
+
+-r core.txt
+
+PySide6
+pywebview>=4.4

@@ -1,3 +1,4 @@
-PySide6
-pywebview>=4.4
-requests
+# Back-compat wrapper.
+# Canonical desktop requirements live in: requirements/desktop.txt
+
+-r ../../requirements/desktop.txt

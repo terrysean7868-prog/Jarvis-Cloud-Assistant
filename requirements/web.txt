@@ -1,0 +1,4 @@
+# Web/backend (API server) dependencies
+# Canonical base is core.
+
+-r core.txt

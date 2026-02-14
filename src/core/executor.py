@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 from src.core.jarvis_brain import JarvisBrain
 from src.config import runtime_defaults as rd
 from src.config import env
+from src.config.settings import settings as jarvis_settings
 from src.config.secrets import n8n_secrets
 from src.utils.git_sync import git_sync  # ✅ now importing the function, not a class
 from src.utils.self_update import self_update_file, self_add_feature, parse_voice_command
@@ -57,8 +58,8 @@ try:
 except Exception:
     AIOHTTP_AVAILABLE = False
 
-# Runtime mode (defaults live in code; cloud is detected from host markers)
-CLOUD_MODE = bool(rd.CLOUD_MODE)
+# Runtime mode (single source of truth)
+CLOUD_MODE = bool(jarvis_settings.cloud_mode)
 AUTO_GIT_SYNC = bool(rd.AUTO_GIT_SYNC)
 
 # Optional: pyautogui for screen navigation (only on desktop with display)
