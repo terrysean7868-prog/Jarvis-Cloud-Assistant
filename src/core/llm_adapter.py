@@ -72,6 +72,361 @@ class LLMAdapter:
                 pass
         self._skills_cache = None
         self._skills_cache_mtime = 0.0
+        self._local_reasoner_state_key = self._resolve_local_reasoner_state_key()
+        self._local_reasoner_state_path = self._resolve_local_reasoner_state_path()
+        self._local_reasoner_state = self._load_local_reasoner_state()
+        self._local_reasoner_daily_maintenance()
+
+    @staticmethod
+    def _resolve_local_reasoner_state_key() -> str:
+        try:
+            key = str(getattr(rd, "LOCAL_REASONER_STATE_KEY", "global") or "global").strip().lower()
+            return key or "global"
+        except Exception:
+            return "global"
+
+    @staticmethod
+    def _sanitize_local_reasoner_key_part(value: str) -> str:
+        v = (value or "").strip().lower()
+        if not v:
+            return ""
+        v = re.sub(r"\s+", "_", v)
+        v = re.sub(r"[^a-z0-9@._\-]", "", v)
+        return v[:120]
+
+    def _extract_user_identity_from_prefs(self, user_prefs: dict | None) -> str:
+        if not isinstance(user_prefs, dict):
+            return ""
+        for field in (
+            "user_id",
+            "auth_user_id",
+            "id",
+            "username",
+            "email",
+            "session_user",
+            "profile_id",
+        ):
+            raw = user_prefs.get(field)
+            if raw is None:
+                continue
+            s = self._sanitize_local_reasoner_key_part(str(raw))
+            if s:
+                return s
+        return ""
+
+    def _derive_local_reasoner_state_key(self, user_prefs: dict | None) -> str:
+        base = self._resolve_local_reasoner_state_key()
+        if base in {"", "global"}:
+            return "global"
+
+        if base in {"user", "per_user", "user_scoped", "userscoped"}:
+            ident = self._extract_user_identity_from_prefs(user_prefs)
+            if ident:
+                return f"user:{ident}"
+            return "global"
+
+        # Optional template support: e.g. "tenant:{user}".
+        if "{user}" in base:
+            ident = self._extract_user_identity_from_prefs(user_prefs)
+            if ident:
+                return base.replace("{user}", ident)
+            return base.replace("{user}", "global")
+
+        return base
+
+    def _ensure_local_reasoner_state_scope(self, user_prefs: dict | None) -> None:
+        try:
+            desired_key = self._derive_local_reasoner_state_key(user_prefs)
+            if desired_key == self._local_reasoner_state_key:
+                return
+            self._local_reasoner_state_key = desired_key
+            self._local_reasoner_state = self._load_local_reasoner_state()
+            self._local_reasoner_daily_maintenance()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _resolve_local_reasoner_state_path() -> Path:
+        try:
+            raw = str(getattr(rd, "LOCAL_REASONER_STATE_FILE", "data/local_reasoner_state.json") or "").strip()
+            if not raw:
+                raw = "data/local_reasoner_state.json"
+            p = Path(raw)
+            if p.is_absolute():
+                return p
+            root = Path(__file__).resolve().parents[2]
+            return root / p
+        except Exception:
+            root = Path(__file__).resolve().parents[2]
+            return root / "data" / "local_reasoner_state.json"
+
+    @staticmethod
+    def _default_local_reasoner_state() -> dict:
+        return {
+            "version": 1,
+            "updated_at": "",
+            "last_maintenance_day": "",
+            "app_aliases": {},
+            "site_aliases": {},
+            "stats": {
+                "learn_events": 0,
+                "hits": 0,
+            },
+        }
+
+    def _load_local_reasoner_state(self) -> dict:
+        state = self._default_local_reasoner_state()
+        if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
+            try:
+                remote = db.local_reasoner_state_get(state_key=self._local_reasoner_state_key)
+                if isinstance(remote, dict):
+                    for k, v in state.items():
+                        if k not in remote:
+                            remote[k] = v
+                    if not isinstance(remote.get("app_aliases"), dict):
+                        remote["app_aliases"] = {}
+                    if not isinstance(remote.get("site_aliases"), dict):
+                        remote["site_aliases"] = {}
+                    if not isinstance(remote.get("stats"), dict):
+                        remote["stats"] = {"learn_events": 0, "hits": 0}
+                    return remote
+
+                # User-scoped cold start: inherit global seeded knowledge when user
+                # state doesn't exist yet, then continue learning in user scope.
+                if str(self._local_reasoner_state_key).startswith("user:"):
+                    seeded = db.local_reasoner_state_get(state_key="global")
+                    if isinstance(seeded, dict):
+                        for k, v in state.items():
+                            if k not in seeded:
+                                seeded[k] = v
+                        if not isinstance(seeded.get("app_aliases"), dict):
+                            seeded["app_aliases"] = {}
+                        if not isinstance(seeded.get("site_aliases"), dict):
+                            seeded["site_aliases"] = {}
+                        if not isinstance(seeded.get("stats"), dict):
+                            seeded["stats"] = {"learn_events": 0, "hits": 0}
+                        return seeded
+            except Exception:
+                pass
+        try:
+            p = self._local_reasoner_state_path
+            if not p.exists():
+                return state
+            raw = p.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return state
+            for k, v in state.items():
+                if k not in data:
+                    data[k] = v
+            if not isinstance(data.get("app_aliases"), dict):
+                data["app_aliases"] = {}
+            if not isinstance(data.get("site_aliases"), dict):
+                data["site_aliases"] = {}
+            if not isinstance(data.get("stats"), dict):
+                data["stats"] = {"learn_events": 0, "hits": 0}
+            return data
+        except Exception:
+            return state
+
+    def _save_local_reasoner_state(self) -> None:
+        self._local_reasoner_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
+            try:
+                ok = db.local_reasoner_state_upsert(
+                    state=self._local_reasoner_state,
+                    state_key=self._local_reasoner_state_key,
+                )
+                if ok:
+                    return
+            except Exception:
+                pass
+        try:
+            p = self._local_reasoner_state_path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(self._local_reasoner_state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _local_reasoner_daily_maintenance(self) -> None:
+        if not bool(getattr(rd, "LOCAL_REASONER_LEARNING_ENABLED", True)):
+            return
+        try:
+            st = self._local_reasoner_state
+            today = datetime.now(timezone.utc).date().isoformat()
+            last = str(st.get("last_maintenance_day") or "").strip()
+            if last == today:
+                return
+
+            decay = float(getattr(rd, "LOCAL_REASONER_DAILY_DECAY", 0.98) or 0.98)
+            decay = max(0.50, min(1.0, decay))
+            min_score = float(getattr(rd, "LOCAL_REASONER_MIN_ALIAS_SCORE", 0.20) or 0.20)
+            max_aliases = int(getattr(rd, "LOCAL_REASONER_MAX_ALIASES", 400) or 400)
+
+            for bucket_name in ("app_aliases", "site_aliases"):
+                bucket = st.get(bucket_name) if isinstance(st.get(bucket_name), dict) else {}
+                cleaned: dict[str, dict] = {}
+                for alias, item in bucket.items():
+                    if not isinstance(item, dict):
+                        continue
+                    score = float(item.get("score") or 0.0) * decay
+                    if score < min_score:
+                        continue
+                    item["score"] = round(score, 4)
+                    cleaned[str(alias)] = item
+                if len(cleaned) > max_aliases:
+                    ordered = sorted(cleaned.items(), key=lambda x: float((x[1] or {}).get("score") or 0.0), reverse=True)
+                    cleaned = dict(ordered[:max_aliases])
+                st[bucket_name] = cleaned
+
+            st["last_maintenance_day"] = today
+            self._save_local_reasoner_state()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _normalize_alias_phrase(s: str) -> str:
+        t = (s or "").strip().lower()
+        if not t:
+            return ""
+        t = re.sub(r"^[\s,.;:!?\-]+|[\s,.;:!?\-]+$", "", t)
+        t = re.sub(r"\b(?:please|pls|jarvis|can\s+you|could\s+you|would\s+you)\b", "", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    @staticmethod
+    def _extract_command_target_phrase(user_text: str) -> str:
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            return ""
+        m = re.search(
+            r"\b(?:open|launch|start|close|quit|exit|switch\s+to|switch|go\s+to|visit|browse|navigate\s+to)\b\s+(.+)$",
+            tl,
+        )
+        if not m:
+            return ""
+        target = (m.group(1) or "").strip()
+        target = re.split(r"\b(and\s+then|then|after\s+that|and\s+type|and\s+write|and\s+search)\b", target, maxsplit=1)[0]
+        return LLMAdapter._normalize_alias_phrase(target)
+
+    @staticmethod
+    def _extract_action_url(action: dict) -> str:
+        try:
+            if not isinstance(action, dict):
+                return ""
+            if str(action.get("type") or "").strip().lower() != "open_url":
+                return ""
+            url = str(action.get("url") or "").strip()
+            if not url:
+                return ""
+            if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", url):
+                url = "https://" + url
+            return url
+        except Exception:
+            return ""
+
+    def _predict_action_from_learned_alias(self, user_text: str) -> dict | None:
+        if not bool(getattr(rd, "LOCAL_REASONER_LEARNING_ENABLED", True)):
+            return None
+        try:
+            self._local_reasoner_daily_maintenance()
+            tl = (user_text or "").strip().lower()
+            phrase = self._extract_command_target_phrase(user_text)
+            if not phrase:
+                return None
+            min_score = float(getattr(rd, "LOCAL_REASONER_MIN_ALIAS_SCORE", 0.20) or 0.20)
+
+            app_aliases = self._local_reasoner_state.get("app_aliases") if isinstance(self._local_reasoner_state.get("app_aliases"), dict) else {}
+            site_aliases = self._local_reasoner_state.get("site_aliases") if isinstance(self._local_reasoner_state.get("site_aliases"), dict) else {}
+
+            app_entry = app_aliases.get(phrase) if isinstance(app_aliases.get(phrase), dict) else None
+            site_entry = site_aliases.get(phrase) if isinstance(site_aliases.get(phrase), dict) else None
+
+            if app_entry and float(app_entry.get("score") or 0.0) >= min_score:
+                app_name = str(app_entry.get("app_name") or "").strip()
+                if app_name:
+                    if re.search(r"\b(close|quit|exit)\b", tl):
+                        out = {"text": f"Closing {app_name}.", "actions": [{"type": "close_app", "app_name": app_name}]}
+                    elif re.search(r"\b(switch\s+to|switch|go\s+to)\b", tl):
+                        out = {"text": f"Switching to {app_name}.", "actions": [{"type": "switch_app", "app_name": app_name}]}
+                    else:
+                        out = {"text": f"Opening {app_name}.", "actions": [{"type": "open_app", "app_name": app_name, "args": []}]}
+                    st = self._local_reasoner_state.get("stats") if isinstance(self._local_reasoner_state.get("stats"), dict) else {}
+                    st["hits"] = int(st.get("hits") or 0) + 1
+                    self._local_reasoner_state["stats"] = st
+                    self._save_local_reasoner_state()
+                    return out
+
+            if site_entry and float(site_entry.get("score") or 0.0) >= min_score:
+                url = str(site_entry.get("url") or "").strip()
+                if url and re.search(r"\b(open|visit|browse|navigate|go\s+to)\b", tl):
+                    st = self._local_reasoner_state.get("stats") if isinstance(self._local_reasoner_state.get("stats"), dict) else {}
+                    st["hits"] = int(st.get("hits") or 0) + 1
+                    self._local_reasoner_state["stats"] = st
+                    self._save_local_reasoner_state()
+                    return {"text": "Opening it.", "actions": [{"type": "open_url", "url": url}]}
+        except Exception:
+            return None
+        return None
+
+    def _learn_from_actions(self, user_text: str, actions: list[dict]) -> None:
+        if not bool(getattr(rd, "LOCAL_REASONER_LEARNING_ENABLED", True)):
+            return
+        if not isinstance(actions, list) or not actions:
+            return
+        try:
+            self._local_reasoner_daily_maintenance()
+            phrase = self._extract_command_target_phrase(user_text)
+            if not phrase or len(phrase) < 2:
+                return
+
+            stop_phrases = {
+                "it", "this", "that", "something", "anything", "app", "application", "website", "site"
+            }
+            if phrase in stop_phrases:
+                return
+
+            app_aliases = self._local_reasoner_state.get("app_aliases") if isinstance(self._local_reasoner_state.get("app_aliases"), dict) else {}
+            site_aliases = self._local_reasoner_state.get("site_aliases") if isinstance(self._local_reasoner_state.get("site_aliases"), dict) else {}
+
+            learned = False
+            for a in actions[:3]:
+                if not isinstance(a, dict):
+                    continue
+                at = str(a.get("type") or "").strip().lower()
+                if at in {"open_app", "close_app", "switch_app"}:
+                    app_name = str(a.get("app_name") or "").strip().lower()
+                    if app_name and phrase != app_name:
+                        item = app_aliases.get(phrase) if isinstance(app_aliases.get(phrase), dict) else {"app_name": app_name, "score": 0.0}
+                        item["app_name"] = app_name
+                        item["score"] = round(float(item.get("score") or 0.0) + 1.0, 4)
+                        item["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        app_aliases[phrase] = item
+                        learned = True
+                elif at == "open_url":
+                    url = self._extract_action_url(a)
+                    if url and not re.search(r"\bhttps?://|www\.|\.[a-z]{2,}\b", phrase):
+                        item = site_aliases.get(phrase) if isinstance(site_aliases.get(phrase), dict) else {"url": url, "score": 0.0}
+                        item["url"] = url
+                        item["score"] = round(float(item.get("score") or 0.0) + 1.0, 4)
+                        item["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        site_aliases[phrase] = item
+                        learned = True
+
+            if learned:
+                max_aliases = int(getattr(rd, "LOCAL_REASONER_MAX_ALIASES", 400) or 400)
+                if len(app_aliases) > max_aliases:
+                    app_aliases = dict(sorted(app_aliases.items(), key=lambda x: float((x[1] or {}).get("score") or 0.0), reverse=True)[:max_aliases])
+                if len(site_aliases) > max_aliases:
+                    site_aliases = dict(sorted(site_aliases.items(), key=lambda x: float((x[1] or {}).get("score") or 0.0), reverse=True)[:max_aliases])
+                self._local_reasoner_state["app_aliases"] = app_aliases
+                self._local_reasoner_state["site_aliases"] = site_aliases
+                stats = self._local_reasoner_state.get("stats") if isinstance(self._local_reasoner_state.get("stats"), dict) else {}
+                stats["learn_events"] = int(stats.get("learn_events") or 0) + 1
+                self._local_reasoner_state["stats"] = stats
+                self._save_local_reasoner_state()
+        except Exception:
+            pass
 
     async def _ensure_session(self):
         if not self.session:
@@ -239,6 +594,173 @@ class LLMAdapter:
         if complexity == 1:
             return min(max(base, 600), self.max_max_tokens), 0.55
         return min(max(base, 800), self.max_max_tokens), 0.5
+
+    @staticmethod
+    def _action_text_from_first_action(actions: list[dict]) -> str:
+        if not isinstance(actions, list) or not actions:
+            return "Done."
+        first = actions[0] if isinstance(actions[0], dict) else {}
+        at = str(first.get("type") or "").strip().lower()
+        if at == "open_app":
+            name = str(first.get("app_name") or "").strip() or "the app"
+            return f"Opening {name}."
+        if at == "close_app":
+            name = str(first.get("app_name") or "").strip() or "the app"
+            return f"Closing {name}."
+        if at == "switch_app":
+            name = str(first.get("app_name") or "").strip() or "the app"
+            return f"Switching to {name}."
+        if at == "open_url":
+            return "Opening it."
+        if at == "web_search":
+            return "Looking it up online."
+        if at == "device_action":
+            return "Applying that setting."
+        return "Done."
+
+    def _is_local_reasoner_candidate(self, text: str, mode: str, decision_hint: dict | None) -> bool:
+        if not bool(rd.LOCAL_REASONER_ENABLED):
+            return False
+        if (mode or "").lower() == "voice":
+            return True
+        if not bool(rd.LOCAL_REASONER_CHAT_ENABLED):
+            return False
+
+        tl = (text or "").strip().lower()
+        if not tl:
+            return False
+
+        actionable = bool(
+            re.search(
+                r"\b(open|launch|start|close|quit|exit|switch\s+to|go\s+to|visit|browse|navigate|"
+                r"search|look\s+up|research|fetch|open\s+settings|settings|turn\s+on|turn\s+off|enable|disable|"
+                r"set|increase|decrease|write|type|draft|compose|format|rewrite|fix)\b",
+                tl,
+            )
+        )
+        if actionable:
+            return True
+
+        if isinstance(decision_hint, dict):
+            conf = float(decision_hint.get("confidence") or 0.0)
+            rec = decision_hint.get("recommended_action")
+            if conf >= float(rd.LOCAL_REASONER_MIN_CONFIDENCE) and isinstance(rec, dict) and rec.get("type"):
+                return True
+
+        return False
+
+    def _build_local_reasoned_response(
+        self,
+        *,
+        text: str,
+        context: str,
+        mode: str,
+        decision_hint: dict | None,
+    ) -> dict | None:
+        parsed: dict = {"text": "", "actions": []}
+
+        try:
+            learned = self._predict_action_from_learned_alias(text)
+            if isinstance(learned, dict) and isinstance(learned.get("actions"), list) and learned.get("actions"):
+                learned["source"] = "local-reasoner-learned"
+                return learned
+        except Exception:
+            pass
+
+        try:
+            # Reuse deterministic parser (already battle-tested for local PC commands).
+            pre = self._preparse_deterministic_voice_actions(text)
+            if isinstance(pre, dict) and isinstance(pre.get("actions"), list) and pre.get("actions"):
+                try:
+                    pre["actions"] = self._dedupe_actions(pre.get("actions") or [])
+                except Exception:
+                    pass
+                pre["source"] = "local-reasoner"
+                if not (pre.get("text") or "").strip():
+                    pre["text"] = self._action_text_from_first_action(pre.get("actions") or [])
+                self._learn_from_actions(text, pre.get("actions") or [])
+                return pre
+        except Exception:
+            pass
+
+        # Seed with high-confidence decision-maker action when available.
+        try:
+            if isinstance(decision_hint, dict):
+                conf = float(decision_hint.get("confidence") or 0.0)
+                rec = decision_hint.get("recommended_action")
+                if conf >= float(rd.LOCAL_REASONER_MIN_CONFIDENCE) and isinstance(rec, dict) and rec.get("type"):
+                    parsed["actions"] = [rec]
+        except Exception:
+            pass
+
+        # Build/normalize a deterministic action plan.
+        try:
+            parsed = self._postprocess_open_url_actions(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_pc_settings_actions(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_write_actions(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_email_clarification_actions(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_ambiguous_type_text_actions(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_missing_value_actions(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_file_action_clarification(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_research_clarification(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_generic_clarification(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_followup_edit_actions(user_text=text, context=context, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_web_lookup_policy(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+        try:
+            parsed = self._postprocess_system_safety(user_text=text, parsed=parsed)
+        except Exception:
+            pass
+
+        actions = parsed.get("actions") or []
+        if not (isinstance(actions, list) and actions):
+            return None
+
+        try:
+            parsed["actions"] = self._dedupe_actions(actions)
+        except Exception:
+            pass
+
+        if not (parsed.get("text") or "").strip():
+            parsed["text"] = self._action_text_from_first_action(parsed.get("actions") or [])
+        parsed["source"] = "local-reasoner"
+        self._learn_from_actions(text, parsed.get("actions") or [])
+        return parsed
 
     def _apply_preference_overrides(self, max_tokens: int, temperature: float, mode: str, user_prefs: dict | None) -> tuple[int, float]:
         """Adjust generation parameters based on stored user preferences."""
@@ -1388,6 +1910,11 @@ class LLMAdapter:
 
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
         """Generate a rich, humanlike structured response."""
+        try:
+            self._ensure_local_reasoner_state_scope(user_prefs)
+        except Exception:
+            pass
+
         # Deterministic voice mode: handle simple commands without relying on LLM.
         try:
             if (mode or "").lower() == "voice":
@@ -1538,7 +2065,9 @@ class LLMAdapter:
                         if conf >= float(rd.DECISION_FASTPATH_CONF):
                             a = decision_hint.get("recommended_action")
                             if isinstance(a, dict) and a.get("type") in {"open_app", "open_url", "web_search", "fetch_url"}:
-                                return {"text": "Okay.", "actions": [a], "source": "decision-maker"}
+                                out = {"text": "Okay.", "actions": [a], "source": "decision-maker"}
+                                self._learn_from_actions(text, out.get("actions") or [])
+                                return out
         except Exception:
             decision_hint = None
 
@@ -1558,6 +2087,25 @@ class LLMAdapter:
                     if parsed.get("actions"):
                         parsed["source"] = "auto-web-unknown"
                         return parsed
+        except Exception:
+            pass
+
+        # Local-first reasoning path: solve obvious tasks without calling external LLMs.
+        try:
+            if self._is_local_reasoner_candidate(text=text, mode=mode, decision_hint=decision_hint):
+                local = self._build_local_reasoned_response(
+                    text=text,
+                    context=context,
+                    mode=mode,
+                    decision_hint=decision_hint,
+                )
+                if isinstance(local, dict) and isinstance(local.get("actions"), list) and local.get("actions"):
+                    try:
+                        if "emotion" not in local:
+                            local["emotion"] = self._infer_emotion(local.get("text") or text)
+                    except Exception:
+                        pass
+                    return local
         except Exception:
             pass
 
@@ -1857,6 +2405,8 @@ Return ONLY valid JSON matching:
             parsed["latency"] = f"{latency:.2f}s"
             parsed["source"] = provider_source
 
+            self._learn_from_actions(text, parsed.get("actions") or [])
+
             print(f"[LLM] {parsed}")
             return parsed
 
@@ -1961,6 +2511,7 @@ Return ONLY valid JSON matching:
                     else:
                         parsed["text"] = "Done."
                     parsed["source"] = "fallback-local"
+                    self._learn_from_actions(text, parsed.get("actions") or [])
                     return parsed
             except Exception:
                 pass

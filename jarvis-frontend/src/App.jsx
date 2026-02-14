@@ -1355,7 +1355,7 @@ export default function App() {
     if (speakingRef.current) return;
 
     setPttHolding(true);
-    addLog("system", "Hold to talk… release to send.");
+    addLog("system", "Voice capture started.");
 
     // Stop wake recognizer to avoid overlap.
     try { wakeRecognizer.current?.stop(); } catch {}
@@ -1967,55 +1967,48 @@ export default function App() {
             </div>
           </div>
 
-          <div style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)" }}>
+          <div
+            onPointerDown={(e) => {
+              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+              try { e.preventDefault(); } catch {}
+              startHoldToTalk();
+            }}
+            onPointerUp={(e) => {
+              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+              try { e.preventDefault(); } catch {}
+              stopHoldToTalk();
+            }}
+            onPointerCancel={() => {
+              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+              stopHoldToTalk();
+            }}
+            onPointerLeave={() => {
+              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+              if (pttHolding) stopHoldToTalk();
+            }}
+            onKeyDown={(e) => {
+              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+              if (e.key === " " || e.key === "Enter") {
+                e.preventDefault();
+                startHoldToTalk();
+              }
+            }}
+            onKeyUp={(e) => {
+              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+              if (e.key === " " || e.key === "Enter") {
+                e.preventDefault();
+                stopHoldToTalk();
+              }
+            }}
+            role={isAuthenticated ? "button" : undefined}
+            tabIndex={isAuthenticated ? 0 : -1}
+            aria-label="Voice wake area"
+            style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)", cursor: isAuthenticated ? "pointer" : "default" }}
+          >
             <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
               {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to wake up`}
             </div>
 
-            {isAuthenticated && (!isMobile || voiceUnlocked) && (
-              <button
-                onPointerDown={(e) => {
-                  try { e.preventDefault(); } catch {}
-                  startHoldToTalk();
-                }}
-                onPointerUp={(e) => {
-                  try { e.preventDefault(); } catch {}
-                  stopHoldToTalk();
-                }}
-                onPointerCancel={() => {
-                  stopHoldToTalk();
-                }}
-                onPointerLeave={() => {
-                  // If the user drags out while holding, treat as release.
-                  if (pttHolding) stopHoldToTalk();
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === " " || e.key === "Enter") {
-                    e.preventDefault();
-                    startHoldToTalk();
-                  }
-                }}
-                onKeyUp={(e) => {
-                  if (e.key === " " || e.key === "Enter") {
-                    e.preventDefault();
-                    stopHoldToTalk();
-                  }
-                }}
-                style={{
-                  background: "rgba(0,0,0,0.25)",
-                  color: "var(--jarvis-accent)",
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  padding: "6px 10px",
-                  borderRadius: 999,
-                  cursor: "pointer",
-                  fontSize: 12,
-                  letterSpacing: 0.2,
-                }}
-                title="Hold to talk (fallback if wake word fails)"
-              >
-                {pttHolding ? "Release to send" : "Hold to talk"}
-              </button>
-            )}
           </div>
         </div>
       </div>

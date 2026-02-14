@@ -67,6 +67,7 @@ class JobScheduler:
         enable_web_training = bool(rd.ENABLE_WEB_TRAINING_JOB)
         enable_wiki_training = bool(rd.ENABLE_WIKI_TRAINING_JOB)
         enable_background_analysis = bool(rd.ENABLE_BACKGROUND_ANALYSIS_JOB)
+        enable_local_reasoner_prewarm = bool(getattr(rd, "ENABLE_LOCAL_REASONER_PREWARM_JOB", False))
         enable_memory_optimization = bool(rd.ENABLE_MEMORY_OPTIMIZATION)
         enable_training_data_job = bool(rd.ENABLE_TRAINING_DATA_JOB)
 
@@ -135,6 +136,19 @@ class JobScheduler:
                 background_analyze_web_training_data,
                 interval_seconds=interval_seconds,
                 job_id="background_web_analysis"
+            )
+
+        # Local reasoner prewarm (daily): analysis-first + web fetch to improve cold-start UX.
+        if enable_local_reasoner_prewarm:
+            try:
+                interval_seconds = int(getattr(rd, "LOCAL_REASONER_PREWARM_INTERVAL_SECONDS", 86400))
+            except Exception:
+                interval_seconds = 86400
+            interval_seconds = max(6 * 3600, min(interval_seconds, 7 * 86400))
+            self.add_job(
+                refresh_local_reasoner_prewarm,
+                interval_seconds=interval_seconds,
+                job_id="local_reasoner_prewarm"
             )
 
 
@@ -438,6 +452,49 @@ def background_analyze_web_training_data():
             db.save_system_event(
                 event_type="background_web_analysis_error",
                 description=f"Background web analysis failed: {str(e)}",
+                status="error",
+            )
+
+
+def refresh_local_reasoner_prewarm():
+    """Daily prewarm for local reasoner with analysis-first strategy."""
+    try:
+        print(f"\n🧩 [PREWARM] Starting local reasoner prewarm at {datetime.utcnow().isoformat()}")
+
+        from src.config import runtime_defaults as rd
+        from src.core.local_reasoner_prewarm import prewarm_local_reasoner_from_web
+
+        # Systematic pipeline: analyze existing web corpus first, then fetch fresh pages.
+        if bool(getattr(rd, "LOCAL_REASONER_PREWARM_ANALYSIS_FIRST", True)):
+            try:
+                background_analyze_web_training_data()
+            except Exception:
+                pass
+
+        max_q = max(1, min(int(getattr(rd, "LOCAL_REASONER_PREWARM_MAX_QUERIES", 8)), 20))
+        per_q = max(1, min(int(getattr(rd, "LOCAL_REASONER_PREWARM_RESULTS_PER_QUERY", 4)), 8))
+
+        report = asyncio.run(
+            prewarm_local_reasoner_from_web(max_queries=max_q, results_per_query=per_q)
+        )
+
+        print(
+            "✅ [PREWARM] Local reasoner prewarm completed "
+            f"(queries={report.get('queries')}, results={report.get('results_seen')}, aliases={report.get('aliases_added')})"
+        )
+        if _db_available():
+            db.save_system_event(
+                event_type="local_reasoner_prewarm",
+                description="Local reasoner prewarm refresh completed",
+                status="success",
+                details=report,
+            )
+    except Exception as e:
+        print(f"❌ [PREWARM] Local reasoner prewarm failed: {e}")
+        if _db_available():
+            db.save_system_event(
+                event_type="local_reasoner_prewarm_error",
+                description=f"Local reasoner prewarm failed: {str(e)}",
                 status="error",
             )
 

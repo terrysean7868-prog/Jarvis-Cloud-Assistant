@@ -225,6 +225,18 @@ class Database:
         except Exception:
             pass
 
+        # Local reasoner shared state (cross-runtime learning memory)
+        try:
+            local_reasoner_state = self.db.local_reasoner_state
+            local_reasoner_state.create_indexes(
+                [
+                    IndexModel([("state_key", ASCENDING)], unique=True),
+                    IndexModel([("updated_at", DESCENDING)]),
+                ]
+            )
+        except Exception:
+            pass
+
     def _start_reconnect_thread(self):
         """Start background thread to attempt reconnection if not already running."""
         with self._reconnect_lock:
@@ -377,6 +389,46 @@ class Database:
             return False
         try:
             self.db.tasks.update_one({"id": str(task_id)}, {"$set": fields})
+            return True
+        except Exception:
+            return False
+
+    # =========================================================
+    # Local reasoner shared state (cross-runtime)
+    # =========================================================
+    def local_reasoner_state_get(self, state_key: str = "global") -> dict | None:
+        self._ensure_connected()
+        if self.db is None:
+            return None
+        try:
+            key = (state_key or "global").strip().lower()
+            doc = self.db.local_reasoner_state.find_one({"state_key": key})
+            if not doc:
+                return None
+            try:
+                doc.pop("_id", None)
+            except Exception:
+                pass
+            return doc
+        except Exception:
+            return None
+
+    def local_reasoner_state_upsert(self, state: dict, state_key: str = "global") -> bool:
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        try:
+            key = (state_key or "global").strip().lower()
+            if not isinstance(state, dict):
+                return False
+            doc = {**state}
+            doc["state_key"] = key
+            doc["updated_at"] = datetime.utcnow().isoformat()
+            self.db.local_reasoner_state.update_one(
+                {"state_key": key},
+                {"$set": doc},
+                upsert=True,
+            )
             return True
         except Exception:
             return False
