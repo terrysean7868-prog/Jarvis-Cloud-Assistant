@@ -178,6 +178,7 @@
                 <div id="logs" class="logs"></div>
                 <div class="toolbar">
                     <button class="btn" id="clear">Clear</button>
+                    <button class="btn" id="copyLogs">Copy Logs</button>
                     <span class="spacer"></span>
                     <div class="muted" id="last">—</div>
                 </div>
@@ -241,6 +242,19 @@
                 var hintIdx = rest.indexOf(' (Hint:');
                 if (hintIdx !== -1) rest = trimStr(rest.slice(0, hintIdx));
                 return rest;
+            }
+
+            function looksLikeConnectionRefused(line) {
+                var s = String(line || '').toLowerCase();
+                if (!s) return false;
+                return (
+                    s.indexOf('connection error:') !== -1 && (
+                        s.indexOf('refused') !== -1 ||
+                        s.indexOf('connect call failed') !== -1 ||
+                        s.indexOf('cannot connect to host') !== -1 ||
+                        s.indexOf('winerror 10061') !== -1
+                    )
+                );
             }
 
             function setStatus(running, pid) {
@@ -354,6 +368,9 @@
                                 } else if (s.indexOf('Missing agent auth') !== -1) {
                                     lastToastSig = sig;
                                     toast('Missing token/secret', 'bad', 3200);
+                                } else if (looksLikeConnectionRefused(s)) {
+                                    lastToastSig = sig;
+                                    toast('Cannot reach server. Check Server URL and ensure Jarvis backend is running.', 'bad', 4600);
                                 }
                             }
                         }
@@ -459,6 +476,19 @@
                         toast('Cleared logs', 'good', 1200);
                     }).catch(function () {
                         toast('Clear failed', 'bad');
+                    });
+                };
+
+                $('copyLogs').onclick = function () {
+                    if (!ensureReady()) return;
+                    window.pywebview.api.copy_logs().then(function (r) {
+                        if (r && r.ok) {
+                            toast('Logs copied', 'good', 1400);
+                        } else {
+                            toast('Copy failed', 'bad');
+                        }
+                    }).catch(function () {
+                        toast('Copy failed', 'bad');
                     });
                 };
 

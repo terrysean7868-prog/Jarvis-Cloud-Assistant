@@ -13,6 +13,8 @@ Configuration:
 from __future__ import annotations
 
 import base64
+import math
+import sys
 from datetime import datetime
 from typing import Iterable, Optional, Tuple
 
@@ -35,6 +37,64 @@ def _decode_pcm16_b64(audio_b64: str) -> bytes:
     if not audio_b64:
         return b""
     return base64.b64decode(audio_b64)
+
+
+def validate_pcm16_audio_quality(
+    audio_bytes: bytes,
+    sample_rate_hz: int,
+    *,
+    min_duration_ms: int = 300,
+    min_rms: float = 120.0,
+    min_peak: int = 300,
+) -> Tuple[bool, str, str]:
+    """Validate raw PCM16LE audio before biometrics extraction.
+
+    Returns:
+      (ok, code, message)
+      - ok=True when payload appears valid and non-silent.
+      - ok=False with a stable error code/message for API responses.
+    """
+    if not audio_bytes:
+        return False, "audio_empty", "Audio payload is empty."
+
+    if not sample_rate_hz or int(sample_rate_hz) <= 0:
+        return False, "audio_invalid_sample_rate", "Invalid sample rate."
+
+    # PCM16LE requires an even byte length.
+    if len(audio_bytes) < 2 or (len(audio_bytes) % 2) != 0:
+        return False, "audio_invalid_pcm", "Invalid PCM16 audio payload."
+
+    sample_rate = int(sample_rate_hz)
+    sample_count = len(audio_bytes) // 2
+    duration_ms = (sample_count * 1000.0) / float(sample_rate)
+    if duration_ms < float(max(1, min_duration_ms)):
+        return False, "audio_too_short", "Audio sample is too short. Hold push-to-talk a bit longer."
+
+    try:
+        if _HAS_NUMPY:
+            pcm = np.frombuffer(audio_bytes, dtype="<i2").astype(np.float64)
+            if pcm.size == 0:
+                return False, "audio_empty", "Audio payload is empty."
+            peak = float(np.max(np.abs(pcm)))
+            rms = float(np.sqrt(np.mean(pcm * pcm) + 1e-12))
+        else:
+            from array import array
+
+            pcm_arr = array("h")
+            pcm_arr.frombytes(audio_bytes)
+            if sys.byteorder != "little":
+                pcm_arr.byteswap()
+            if len(pcm_arr) == 0:
+                return False, "audio_empty", "Audio payload is empty."
+            peak = float(max(abs(int(v)) for v in pcm_arr))
+            rms = math.sqrt(sum(int(v) * int(v) for v in pcm_arr) / float(len(pcm_arr)))
+    except Exception:
+        return False, "audio_invalid_pcm", "Invalid PCM16 audio payload."
+
+    if peak < float(max(1, min_peak)) or rms < float(max(1.0, min_rms)):
+        return False, "audio_too_silent", "Audio is too quiet/silent. Check mic access and speak clearly."
+
+    return True, "", ""
 
 
 def _pcm16le_bytes_to_float32(audio_bytes: bytes) -> np.ndarray:

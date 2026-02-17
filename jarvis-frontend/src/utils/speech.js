@@ -371,6 +371,50 @@ function _floatTo16BitPCM(float32) {
   return out;
 }
 
+function _trimLeadingTrailingSilence(float32, sampleRateHz, options = {}) {
+  const {
+    threshold = 0.008,
+    padMs = 140,
+    minMs = 220,
+    maxTrimMs = 26000,
+  } = options;
+
+  if (!float32 || !float32.length) return new Float32Array();
+
+  const maxSamples = Math.max(1, Math.floor((Math.max(500, maxTrimMs) / 1000) * sampleRateHz));
+  const n = Math.min(float32.length, maxSamples);
+
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(float32[i]) >= threshold) {
+      first = i;
+      break;
+    }
+  }
+  if (first === -1) return new Float32Array();
+  for (let i = n - 1; i >= 0; i--) {
+    if (Math.abs(float32[i]) >= threshold) {
+      last = i;
+      break;
+    }
+  }
+  if (last < first) return new Float32Array();
+
+  const pad = Math.floor((Math.max(0, padMs) / 1000) * sampleRateHz);
+  let start = Math.max(0, first - pad);
+  let end = Math.min(n, last + pad + 1);
+  const minSamples = Math.floor((Math.max(0, minMs) / 1000) * sampleRateHz);
+  if ((end - start) < minSamples) {
+    // Keep at least a minimal slice centered around detected speech.
+    const mid = Math.floor((first + last) / 2);
+    start = Math.max(0, mid - Math.floor(minSamples / 2));
+    end = Math.min(n, start + minSamples);
+  }
+
+  return float32.slice(start, end);
+}
+
 // Records audio using WebAudio and returns LINEAR16 PCM base64.
 // Works on iOS where MediaRecorder may be missing.
 export async function recordPcm16Once(options = {}) {
@@ -586,7 +630,19 @@ export async function startPcm16Recorder(options = {}) {
         }
 
         const resampled = _resampleToTarget(flat, ctx.sampleRate, sampleRateHz);
-        const pcm16 = _floatTo16BitPCM(resampled);
+        const trimmed = _trimLeadingTrailingSilence(resampled, sampleRateHz, {
+          threshold: 0.008,
+          padMs: 150,
+          minMs: 240,
+          maxTrimMs: maxMs,
+        });
+
+        if (!trimmed || !trimmed.length) {
+          resolveFinish({ audio_b64: null, sample_rate_hz: sampleRateHz });
+          return;
+        }
+
+        const pcm16 = _floatTo16BitPCM(trimmed);
         resolveFinish({
           audio_b64: _arrayBufferToBase64(pcm16.buffer),
           sample_rate_hz: sampleRateHz,

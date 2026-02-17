@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
@@ -127,7 +127,7 @@ class DeviceHub:
         if not device_id:
             raise PermissionError("Missing device_id")
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         async with self._lock:
             self._agents[device_id] = AgentConnection(
                 device_id=device_id,
@@ -154,7 +154,7 @@ class DeviceHub:
         if not device_id:
             raise PermissionError("Missing device_id")
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         async with self._lock:
             self._agents[device_id] = AgentConnection(
                 device_id=device_id,
@@ -201,7 +201,7 @@ class DeviceHub:
         await self._del_registry(device_id)
 
     async def touch(self, device_id: str) -> None:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         async with self._lock:
             conn = self._agents.get(device_id)
             if conn:

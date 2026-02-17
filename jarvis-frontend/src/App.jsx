@@ -174,6 +174,8 @@ export default function App() {
   const latestResearchTaskIdRef = useRef(null);
 
   const pttControllerRef = useRef(null);
+  const pttInitPromiseRef = useRef(null);
+  const pttSeqRef = useRef(0);
   const [pttHolding, setPttHolding] = useState(false);
 
   useEffect(() => {
@@ -1354,6 +1356,9 @@ export default function App() {
     if (isHandlingCommand.current) return;
     if (speakingRef.current) return;
 
+    const seq = (pttSeqRef.current || 0) + 1;
+    pttSeqRef.current = seq;
+
     setPttHolding(true);
     addLog("system", "Voice capture started.");
 
@@ -1363,17 +1368,29 @@ export default function App() {
     // Prefer the server audio path when available (best accuracy + required for biometrics).
     if (voiceBiometricsActive || googleSttEnabled) {
       try {
-        const ctrl = await startPcm16Recorder({
+        const initPromise = startPcm16Recorder({
           sampleRateHz: 16000,
           maxMs: isMobile ? 20000 : 25000,
         });
-        pttControllerRef.current = { kind: "pcm", ctrl };
-        if (!ctrl) {
-          addLog("system", "Microphone is not available for push-to-talk.");
+
+        pttInitPromiseRef.current = initPromise;
+        // Store a placeholder so stopHoldToTalk can await init if the user releases quickly.
+        pttControllerRef.current = { kind: "pcm", ctrl: null, seq };
+
+        const ctrl = await initPromise;
+        // If the user released (or restarted) while init was in flight, stop/cancel immediately.
+        if (pttSeqRef.current !== seq) {
+          try { ctrl?.cancel?.(); } catch {}
+          return;
         }
+
+        pttInitPromiseRef.current = null;
+        pttControllerRef.current = { kind: "pcm", ctrl, seq };
+        if (!ctrl) addLog("system", "Microphone is not available for push-to-talk.");
         return;
       } catch {
         pttControllerRef.current = null;
+        pttInitPromiseRef.current = null;
         addLog("system", "Could not start push-to-talk recording.");
         return;
       }
@@ -1396,18 +1413,38 @@ export default function App() {
     if (!pttHolding) return;
     setPttHolding(false);
 
+    // Invalidate any in-flight recorder init.
+    const stopSeq = (pttSeqRef.current || 0) + 1;
+    pttSeqRef.current = stopSeq;
+
     const holder = pttControllerRef.current;
     pttControllerRef.current = null;
+    const initPromise = pttInitPromiseRef.current;
+    pttInitPromiseRef.current = null;
 
     try {
-      if (!holder || !holder.ctrl) {
+      if (!holder) {
         try { wakeRecognizer.current?.start(); } catch {}
         return;
       }
 
       // PCM path (server transcription)
       if (holder.kind === "pcm") {
-        const { audio_b64, sample_rate_hz } = await holder.ctrl.stop();
+        let ctrl = holder.ctrl;
+        // If stop occurs before init completes, await init and stop the resulting controller.
+        if (!ctrl && initPromise && typeof initPromise.then === "function") {
+          try {
+            ctrl = await initPromise;
+          } catch {
+            ctrl = null;
+          }
+        }
+        if (!ctrl || !ctrl.stop) {
+          try { wakeRecognizer.current?.start(); } catch {}
+          return;
+        }
+
+        const { audio_b64, sample_rate_hz } = await ctrl.stop();
         if (!audio_b64) {
           addLog("error", "No speech captured.");
           try { wakeRecognizer.current?.start(); } catch {}

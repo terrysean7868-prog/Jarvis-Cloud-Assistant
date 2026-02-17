@@ -1335,7 +1335,7 @@ async def agent_ws(ws: WebSocket):
                                 "device_id": did or device_id,
                                 "source_text": source_text,
                                 "results": _truncate_notification_payload((payload or {}).get("results") or []),
-                                "received_at": datetime.utcnow().isoformat(),
+                                "received_at": datetime.now(timezone.utc).isoformat(),
                             },
                         )
                 except Exception:
@@ -2989,6 +2989,7 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
             compute_embedding_from_pcm16,
             should_accept,
             to_jsonable_embedding,
+            validate_pcm16_audio_quality,
         )
 
         if auth_req.action == "register":
@@ -3086,6 +3087,16 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
                             }
                         try:
                             audio_bytes = _decode_pcm16_b64(auth_req.audio_b64)
+                            ok_audio, audio_code, audio_msg = validate_pcm16_audio_quality(
+                                audio_bytes,
+                                int(auth_req.sample_rate_hz or 16000),
+                            )
+                            if not ok_audio:
+                                return {
+                                    "status": "error",
+                                    "message": f"Voice biometrics audio invalid: {audio_msg}",
+                                    "code": f"biometrics_{audio_code}",
+                                }
                             emb = compute_embedding_from_pcm16(audio_bytes, int(auth_req.sample_rate_hz or 16000))
                             if emb is None:
                                 return {
@@ -3148,6 +3159,7 @@ async def voice_biometrics_enroll(req: VoiceBiometricsRequest):
         _decode_pcm16_b64,
         compute_embedding_from_pcm16,
         to_jsonable_embedding,
+        validate_pcm16_audio_quality,
     )
     if not VOICE_BIOMETRICS_ENABLED:
         raise HTTPException(status_code=501, detail="VOICE_BIOMETRICS_ENABLED is false")
@@ -3156,6 +3168,10 @@ async def voice_biometrics_enroll(req: VoiceBiometricsRequest):
         raise HTTPException(status_code=413, detail="Audio payload too large")
 
     audio_bytes = _decode_pcm16_b64(req.audio_b64)
+    ok_audio, audio_code, audio_msg = validate_pcm16_audio_quality(audio_bytes, int(req.sample_rate_hz or 16000))
+    if not ok_audio:
+        raise HTTPException(status_code=400, detail={"code": f"biometrics_{audio_code}", "message": audio_msg})
+
     emb = compute_embedding_from_pcm16(audio_bytes, int(req.sample_rate_hz or 16000))
     if emb is None:
         raise HTTPException(status_code=400, detail="Could not extract a stable voice embedding")
@@ -3180,6 +3196,7 @@ async def voice_secure_transcribe(req: SecureVoiceTranscribeRequest):
         _decode_pcm16_b64,
         compute_embedding_from_pcm16,
         should_accept,
+        validate_pcm16_audio_quality,
     )
 
     if not VOICE_BIOMETRICS_ENABLED:
@@ -3189,6 +3206,9 @@ async def voice_secure_transcribe(req: SecureVoiceTranscribeRequest):
         raise HTTPException(status_code=413, detail="Audio payload too large")
 
     audio_bytes = _decode_pcm16_b64(req.audio_b64)
+    ok_audio, audio_code, audio_msg = validate_pcm16_audio_quality(audio_bytes, int(req.sample_rate_hz or 16000))
+    if not ok_audio:
+        raise HTTPException(status_code=400, detail={"code": f"biometrics_{audio_code}", "message": audio_msg})
 
     stored_vecs = voice_auth.get_voice_biometrics_vectors(username)
     if not stored_vecs:

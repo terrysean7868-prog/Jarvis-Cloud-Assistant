@@ -1716,7 +1716,26 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                         ping_task.cancel()
 
             except Exception as e:
-                print(f"[AGENT] Connection error: {e}", flush=True)
+                msg = str(e or "")
+                try:
+                    msg = msg.replace("refuced", "refused")
+                except Exception:
+                    pass
+                print(f"[AGENT] Connection error: {msg}", flush=True)
+                try:
+                    ml = msg.lower()
+                    if (
+                        "refused" in ml
+                        or "connect call failed" in ml
+                        or "cannot connect to host" in ml
+                        or "winerror 10061" in ml
+                    ):
+                        print(
+                            f"[AGENT] Hint: server is unreachable. Check JARVIS_SERVER_URL ({base}) and ensure backend is running.",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
                 await asyncio.sleep(3)
 
 

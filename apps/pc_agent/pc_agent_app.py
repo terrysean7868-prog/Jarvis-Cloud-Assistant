@@ -98,6 +98,24 @@ def _now_hms() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+def _copy_text_to_clipboard(text: str) -> bool:
+    s = str(text or "")
+    if not s:
+        return False
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(s)
+        root.update()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
 def _load_json(path: Path) -> dict:
     try:
         if path.exists():
@@ -1155,6 +1173,24 @@ def run_ui() -> int:
                             continue
                     next_seq = int(log_seq)
                 return {"lines": lines, "next_seq": next_seq}
+
+            def copy_logs(self) -> dict:
+                _drain_logs()
+                with log_lock:
+                    plain = []
+                    for raw in log_lines:
+                        try:
+                            s = str(raw)
+                            sep = s.find("|")
+                            plain.append(s[sep + 1:] if sep != -1 else s)
+                        except Exception:
+                            continue
+                    text = "\n".join(plain).strip()
+
+                if not text:
+                    return {"ok": False, "error": "empty"}
+                ok = _copy_text_to_clipboard(text)
+                return {"ok": bool(ok), "copied_chars": len(text) if ok else 0}
 
         # Preferred UI: embedded HTML via pywebview (matches desktop/cloud look better).
         try:
