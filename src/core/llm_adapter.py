@@ -908,6 +908,121 @@ class LLMAdapter:
         except Exception:
             pass
 
+        # Voice-first developer operations:
+        # - update/improve Jarvis internals
+        # - add new feature/module/component
+        # - find code/files in project
+        try:
+            dev_keywords = r"\b(update|modify|improve|fix|refactor|patch|edit|add|create|make|build)\b"
+            target_keywords = r"\b(jarvis|assistant|llm|voice|prompt|orchestrator|brain|executor|flow|logic|code|feature|module|component|project|repo|repository)\b"
+            wants_dev_update = bool(re.search(dev_keywords, tl) and re.search(target_keywords, tl))
+
+            if wants_dev_update:
+                parsed_cmd = None
+                try:
+                    from src.utils.self_update import parse_voice_command
+
+                    parsed_cmd = parse_voice_command(t)
+                except Exception:
+                    parsed_cmd = None
+
+                def _map_target_path(target: str, raw: str) -> str:
+                    tx = ((target or "") + " " + (raw or "")).lower()
+                    mapping = [
+                        ("llm", "src/core/llm_adapter.py"),
+                        ("prompt", "src/core/llm_adapter.py"),
+                        ("voice", "src/core/llm_adapter.py"),
+                        ("orchestrator", "src/core/chat_orchestrator.py"),
+                        ("brain", "src/core/jarvis_brain.py"),
+                        ("executor", "src/core/executor.py"),
+                        ("app.py", "apps/web/app.py"),
+                        ("web app", "apps/web/app.py"),
+                        ("frontend", "jarvis-frontend/src/App.js"),
+                        ("ui", "jarvis-frontend/src/App.js"),
+                    ]
+                    for k, p in mapping:
+                        if k in tx:
+                            return p
+
+                    # If user already named a file, pass it through.
+                    if re.search(r"\.[a-z0-9]{1,6}$", (target or "").strip().lower()):
+                        return (target or "").strip()
+                    return "src/core/llm_adapter.py"
+
+                if isinstance(parsed_cmd, dict) and parsed_cmd.get("action") in {"update", "edit"}:
+                    target = str(parsed_cmd.get("target") or "").strip()
+                    description = str(parsed_cmd.get("description") or t).strip() or t
+                    file_path = _map_target_path(target, t)
+                    return {
+                        "text": f"Preparing update in {file_path}.",
+                        "actions": [{
+                            "type": "self_update",
+                            "description": description,
+                            "file_path": file_path,
+                        }],
+                        "source": "deterministic-voice-self-update",
+                    }
+
+                if isinstance(parsed_cmd, dict) and parsed_cmd.get("action") == "add":
+                    feature_type = str(parsed_cmd.get("feature_type") or "module").strip().lower()
+                    if feature_type not in {"module", "component", "feature", "file"}:
+                        feature_type = "module"
+                    description = str(parsed_cmd.get("description") or t).strip() or t
+                    return {
+                        "text": f"Preparing to add a new {feature_type}.",
+                        "actions": [{
+                            "type": "self_add",
+                            "description": description,
+                            "feature_type": feature_type,
+                        }],
+                        "source": "deterministic-voice-self-update",
+                    }
+
+                # Fallback for broad update phrasing without precise parse.
+                if re.search(r"\b(add|create|build|make)\b", tl):
+                    return {
+                        "text": "Preparing to add the requested feature.",
+                        "actions": [{
+                            "type": "self_add",
+                            "description": t,
+                            "feature_type": "module",
+                        }],
+                        "source": "deterministic-voice-self-update",
+                    }
+
+                return {
+                    "text": "Preparing to update assistant logic.",
+                    "actions": [{
+                        "type": "self_update",
+                        "description": t,
+                        "file_path": _map_target_path("", t),
+                    }],
+                    "source": "deterministic-voice-self-update",
+                }
+
+            # Project file/code discovery in voice mode.
+            wants_project_find = bool(
+                re.search(r"\b(find|search|locate|look\s+for|where\s+is)\b", tl)
+                and re.search(r"\b(file|code|project|repo|repository|folder|path|class|function)\b", tl)
+            )
+            if wants_project_find:
+                q = re.sub(r"(?i)\b(find|search|locate|look\s+for|where\s+is|file|code|project|repo|repository|folder|path|class|function|in|the|for|please|jarvis)\b", " ", t)
+                q = re.sub(r"\s+", " ", q).strip(" .")
+                if len(re.findall(r"[a-z0-9_\-\.]+", q.lower())) >= 1:
+                    return {
+                        "text": "Searching the project for matches.",
+                        "actions": [{
+                            "type": "find_files",
+                            "query": q,
+                            "path": "src",
+                            "in_content": True,
+                            "max_results": 20,
+                        }],
+                        "source": "deterministic-voice-find",
+                    }
+        except Exception:
+            pass
+
         # Intent-based skill routing (research/scrape) when skills exist
         try:
             skills = LLMAdapter._get_skills_catalog() or []
@@ -2121,6 +2236,8 @@ You must respect strict per-user/device permissions; if a request targets a PC/d
     - Use web_search/fetch_url when necessary (e.g., "latest/current", documentation, troubleshooting, or unknown app steps). Avoid web lookups for simple local PC actions.
     - If the user asks for *latest/current/today* info OR explicitly says to look it up online/from the internet OR asks for sources/citations/links, you MUST use web_search/fetch_url first and MUST NOT answer from memory.
     - If you do use web_search/fetch_url, do it FIRST (no other actions in the same response).
+    - For operational/maintenance requests (storage, cleanup, diagnostics, setup), follow this order when feasible: 1) inspect current state, 2) execute safe actions, 3) verify outcome with concrete before/after numbers.
+    - After proposing executable actions, keep text practical and outcome-focused (what was checked, what changed, what remains).
     - Only ask at most 1 clarifying question, only if it requires private/user-specific info that cannot be searched.
     - For multi-step workflows, give a short step-by-step plan and ask for confirmation before executing risky steps.
 
@@ -2194,6 +2311,7 @@ Allowed action types (only include required fields):
 - move: {{"type":"move","path":"src/a.txt","dest":"src/b.txt"}}
 - copy: {{"type":"copy","source":"src/a.txt","destination":"src/b.txt"}}
 - cleanup: {{"type":"cleanup"}}
+- find_files: {{"type":"find_files","query":"keyword","path":"src","in_content":true,"max_results":20}}
 
 # Screen actions (must be explicitly requested by the user):
 - capture_screen: {{"type":"capture_screen","region":{{"x":0,"y":0,"width":800,"height":600}}}}

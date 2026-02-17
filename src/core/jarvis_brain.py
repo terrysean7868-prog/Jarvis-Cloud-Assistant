@@ -1031,6 +1031,7 @@ class JarvisBrain:
                 "move",
                 "copy",
                 "cleanup",
+                "find_files",
 
                 # Task helpers
                 "create_task",

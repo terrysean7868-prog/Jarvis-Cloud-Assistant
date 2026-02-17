@@ -446,6 +446,88 @@ class ActionExecutor:
                 results.append(result)
                 continue
 
+            if action_type == "find_files":
+                query = str(action.get("query") or "").strip()
+                scan_path = os.path.normpath(str(action.get("path") or "src").strip() or "src")
+                in_content = bool(action.get("in_content", True))
+                max_results = int(action.get("max_results", 20) or 20)
+                max_results = max(1, min(max_results, 100))
+
+                if not query:
+                    results.append({
+                        "status": "error",
+                        "action_type": "find_files",
+                        "message": "query is required",
+                    })
+                    continue
+
+                if not self.brain.is_path_allowed(scan_path):
+                    results.append({
+                        "status": "forbidden",
+                        "action_type": "find_files",
+                        "path": scan_path,
+                        "message": "Path is outside allowed sandbox",
+                    })
+                    continue
+
+                if not os.path.exists(scan_path) or not os.path.isdir(scan_path):
+                    results.append({
+                        "status": "not_found",
+                        "action_type": "find_files",
+                        "path": scan_path,
+                    })
+                    continue
+
+                ql = query.lower()
+                matches = []
+                text_exts = {
+                    ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt", ".yaml", ".yml", ".toml", ".ini",
+                    ".html", ".css", ".scss", ".sql", ".sh", ".ps1", ".bat",
+                }
+                blocked_dirs = set(getattr(self.brain, "blocked_dirnames", set()) or set())
+
+                stop = False
+                for root, dirs, files in os.walk(scan_path):
+                    dirs[:] = [d for d in dirs if d not in blocked_dirs and not d.startswith(".")]
+
+                    for name in files:
+                        full = os.path.join(root, name)
+                        rel = os.path.relpath(full, start=".")
+                        nl = name.lower()
+
+                        hit_reason = None
+                        if ql in nl:
+                            hit_reason = "filename"
+                        elif in_content:
+                            ext = os.path.splitext(name)[1].lower()
+                            if ext in text_exts:
+                                try:
+                                    with open(full, "r", encoding="utf-8", errors="ignore") as fh:
+                                        content = fh.read(200_000)
+                                    if ql in content.lower():
+                                        hit_reason = "content"
+                                except Exception:
+                                    pass
+
+                        if hit_reason:
+                            matches.append({"path": rel.replace("\\", "/"), "reason": hit_reason})
+                            if len(matches) >= max_results:
+                                stop = True
+                                break
+
+                    if stop:
+                        break
+
+                results.append({
+                    "status": "success",
+                    "action_type": "find_files",
+                    "query": query,
+                    "path": scan_path,
+                    "matches_count": len(matches),
+                    "matches": matches,
+                })
+                continue
+
             # File operations (existing code)
             # For file actions, enforce sandbox.
             if action_type in ("read", "list", "mkdir", "write", "edit", "delete", "move", "copy", "cleanup"):

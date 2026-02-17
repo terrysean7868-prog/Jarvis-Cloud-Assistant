@@ -549,6 +549,120 @@ class ChatOrchestrator:
         deferred_actions = [a for a in actions if (a or {}).get("type") not in immediate_types]
         return immediate_actions, deferred_actions
 
+    @staticmethod
+    def _inline_non_web_action_types() -> set[str]:
+        raw = str(getattr(rd, "INLINE_NON_WEB_ACTION_TYPES_CSV", "") or "").strip()
+        if not raw:
+            return set()
+        out: set[str] = set()
+        for part in raw.split(","):
+            p = (part or "").strip().lower()
+            if p:
+                out.add(p)
+        return out
+
+    @staticmethod
+    def _summarize_inline_action_results(results: List[dict]) -> str:
+        if not isinstance(results, list) or not results:
+            return ""
+
+        success_statuses = {
+            "success",
+            "opened",
+            "written",
+            "edited",
+            "deleted",
+            "copied",
+        }
+        fail_statuses = {"error", "forbidden", "approval_required", "unknown_action"}
+
+        ok = 0
+        fail = 0
+        other = 0
+        lines: List[str] = []
+
+        for item in results[:6]:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            action_name = str(item.get("action_type") or item.get("action") or "action").strip() or "action"
+
+            if status in success_statuses:
+                ok += 1
+            elif status in fail_statuses:
+                fail += 1
+            else:
+                other += 1
+
+            detail = (
+                str(item.get("message") or "").strip()
+                or str(item.get("error") or "").strip()
+                or str(item.get("path") or "").strip()
+                or str(item.get("query") or "").strip()
+                or str(item.get("url") or "").strip()
+            )
+
+            if status:
+                if detail:
+                    lines.append(f"- {action_name}: {status} ({detail})")
+                else:
+                    lines.append(f"- {action_name}: {status}")
+
+        headline = f"Execution update: {ok} succeeded"
+        if fail:
+            headline += f", {fail} failed"
+        if other:
+            headline += f", {other} with other status"
+        headline += "."
+
+        preview = "\n".join(lines[:3])
+        return (headline + ("\n" + preview if preview else "")).strip()
+
+    async def _run_inline_non_web_actions(
+        self,
+        *,
+        response: JsonDict,
+        actions: List[dict],
+        acting_user: str,
+    ) -> List[dict]:
+        if not actions:
+            return actions
+
+        inline_types = self._inline_non_web_action_types()
+        if not inline_types:
+            return actions
+
+        inline_actions = [a for a in actions if str((a or {}).get("type") or "").strip().lower() in inline_types]
+        remaining_actions = [a for a in actions if str((a or {}).get("type") or "").strip().lower() not in inline_types]
+
+        if not inline_actions:
+            return actions
+
+        try:
+            results = await self.executor.process_actions(inline_actions, acting_user)
+
+            if bool(rd.RETURN_ACTION_RESULTS):
+                current = response.get("action_results")
+                if isinstance(current, list):
+                    current.extend(results if isinstance(results, list) else [])
+                    response["action_results"] = current
+                else:
+                    response["action_results"] = results
+
+            if bool(getattr(rd, "APPEND_INLINE_ACTION_SUMMARY", True)):
+                summary = self._summarize_inline_action_results(results if isinstance(results, list) else [])
+                if summary:
+                    base = (response.get("text") or "").strip()
+                    response["text"] = (base + "\n\n" + summary).strip() if base else summary
+
+            response["actions"] = remaining_actions
+            return remaining_actions
+        except Exception as e:
+            base = (response.get("text") or "").strip()
+            note = f"(Inline action execution failed: {e})"
+            response["text"] = (base + "\n\n" + note).strip() if base else note
+            return actions
+
     def _filter_capture_screen(self, user_text: str, actions: List[dict]) -> List[dict]:
         if not actions:
             return actions
@@ -870,6 +984,14 @@ class ChatOrchestrator:
         actions = await self._run_inline_web_pipeline(
             user_text=text,
             mode=str(mode or "chat"),
+            response=response,
+            actions=actions,
+            acting_user=(acting_user or "user"),
+        )
+
+        # Run selected safe non-web actions inline to improve immediate UX
+        # (e.g., create_task/check_errors/generate_email), then defer the rest.
+        actions = await self._run_inline_non_web_actions(
             response=response,
             actions=actions,
             acting_user=(acting_user or "user"),

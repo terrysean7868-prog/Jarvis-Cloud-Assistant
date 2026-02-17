@@ -58,6 +58,11 @@ AUTO_FETCH_WIKIPEDIA_LINKS_ONLY: bool = False
 RETURN_ACTION_RESULTS: bool = False
 FETCH_URL_CACHE_SECONDS: int = 600
 
+# Inline execution/UX behavior for safe non-web actions.
+# These run synchronously in the chat response path so users get immediate outcomes.
+INLINE_NON_WEB_ACTION_TYPES_CSV: str = "create_task,stop_task,check_errors,check_render_logs,generate_email,find_files"
+APPEND_INLINE_ACTION_SUMMARY: bool = True
+
 
 # -------------------------
 # Decision / routing
