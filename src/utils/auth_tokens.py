@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from jose import JWTError, jwt
+from pymongo.errors import PyMongoError
 
 from src.utils.db import db
 from src.config import env
@@ -71,7 +72,7 @@ class AuthTokens:
                         jti = payload.get("jti")
                         if jti and col.find_one({"jti": jti}):
                             return False, None, None
-                except Exception:
+                except (PyMongoError, OSError):
                     # If DB is down, treat tokens as valid (degrades gracefully).
                     pass
 
@@ -99,9 +100,9 @@ class AuthTokens:
             col.create_index([("exp", 1)])
             col.update_one(
                 {"jti": payload.get("jti")},
-                {"$set": {"jti": payload.get("jti"), "exp": payload.get("exp"), "revoked_at": datetime.utcnow()}},
+                {"$set": {"jti": payload.get("jti"), "exp": payload.get("exp"), "revoked_at": datetime.now(timezone.utc)}},
                 upsert=True,
             )
             return True
-        except Exception:
+        except (PyMongoError, OSError, ValueError):
             return False

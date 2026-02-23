@@ -24,12 +24,25 @@ This repo has multiple runnable parts. Use the matching dependency set so instal
 
 - Python deps:
   - `pip install -r requirements/desktop.txt`
-- Run (dev):
+- Run (new canonical desktop app):
+  - `python apps/desktop/desktop_app.py`
+- Backward-compatible launchers (still supported):
   - `python apps/desktop/jarvis_desktop.py`
-- Run (web-shell desktop wrapper):
   - `python apps/desktop/jarvis_web_shell.py`
 - Packaging note:
   - The desktop PyInstaller spec is `JarvisDesktop.spec`.
+
+### Desktop builder (latest package each run)
+
+- One-command build (Windows):
+  - `build_desktop_app.bat`
+- Cross-platform/advanced options:
+  - `python scripts/build_desktop_app.py`
+  - optional flags: `--install-frontend`, `--skip-frontend`, `--skip-clean`
+- What it does:
+  - rebuilds `jarvis-frontend/build`
+  - runs PyInstaller on `JarvisDesktop.spec`
+  - outputs latest desktop app under `dist/`
 
 ## PC Agent (headless)
 

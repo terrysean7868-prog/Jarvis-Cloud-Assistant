@@ -17,6 +17,10 @@ from src.utils.db import db
 from src.utils.git_sync import git_sync
 
 
+_progressive_llm_update_running = False
+_last_progressive_llm_update_report: dict | None = None
+
+
 class JobScheduler:
     """Background job scheduler for periodic tasks"""
 
@@ -70,6 +74,7 @@ class JobScheduler:
         enable_local_reasoner_prewarm = bool(getattr(rd, "ENABLE_LOCAL_REASONER_PREWARM_JOB", False))
         enable_memory_optimization = bool(rd.ENABLE_MEMORY_OPTIMIZATION)
         enable_training_data_job = bool(rd.ENABLE_TRAINING_DATA_JOB)
+        enable_progressive_llm_update_job = bool(getattr(rd, "ENABLE_PROGRESSIVE_LLM_UPDATE_JOB", False))
 
         # GitHub auto-sync every 5 minutes (off by default for hosted deploys)
         if enable_git_sync:
@@ -149,6 +154,19 @@ class JobScheduler:
                 refresh_local_reasoner_prewarm,
                 interval_seconds=interval_seconds,
                 job_id="local_reasoner_prewarm"
+            )
+
+        # Progressive daily LLM/brain quality update (self-update pipeline).
+        if enable_progressive_llm_update_job:
+            try:
+                interval_seconds = int(getattr(rd, "PROGRESSIVE_LLM_UPDATE_INTERVAL_SECONDS", 86400))
+            except Exception:
+                interval_seconds = 86400
+            interval_seconds = max(6 * 3600, min(interval_seconds, 7 * 86400))
+            self.add_job(
+                progressive_llm_brain_update,
+                interval_seconds=interval_seconds,
+                job_id="progressive_llm_brain_update",
             )
 
 
@@ -497,6 +515,189 @@ def refresh_local_reasoner_prewarm():
                 description=f"Local reasoner prewarm failed: {str(e)}",
                 status="error",
             )
+
+
+def progressive_llm_brain_update():
+    """Run incremental daily self-update on LLM + brain files.
+
+    This uses the same guarded update pipeline used by admin operations:
+    - code generation
+    - validation gate
+    - backup + rollback
+    - audit trail
+    """
+    global _progressive_llm_update_running
+    global _last_progressive_llm_update_report
+    if _progressive_llm_update_running:
+        print("⚠️  [LLM-PROGRESSIVE] Previous run still in progress; skipping")
+        return
+
+    _progressive_llm_update_running = True
+    try:
+        from src.config import runtime_defaults as rd
+        from src.utils.self_update import self_update_file
+
+        started_at = datetime.utcnow().isoformat()
+        print(f"\n🧠 [LLM-PROGRESSIVE] Starting daily LLM/brain update at {started_at}")
+
+        actor = str(getattr(rd, "PROGRESSIVE_LLM_UPDATE_ACTOR", "scheduler") or "scheduler").strip() or "scheduler"
+        description = str(getattr(rd, "PROGRESSIVE_LLM_UPDATE_DESCRIPTION", "") or "").strip()
+        if not description:
+            description = (
+                "Apply a small, safe, incremental improvement to reasoning quality and "
+                "response consistency while preserving APIs and existing behavior."
+            )
+
+        targets_raw = str(getattr(rd, "PROGRESSIVE_LLM_UPDATE_TARGET_FILES_CSV", "") or "").strip()
+        if targets_raw:
+            targets = [x.strip() for x in targets_raw.split(",") if (x or "").strip()]
+        else:
+            targets = ["src/core/llm_adapter.py", "src/core/jarvis_brain.py"]
+
+        dry_run = bool(getattr(rd, "PROGRESSIVE_LLM_UPDATE_DRY_RUN", False))
+        auto_install_deps = bool(getattr(rd, "PROGRESSIVE_LLM_UPDATE_AUTO_INSTALL_DEPS", False))
+
+        results = []
+        success_count = 0
+        for target in targets:
+            try:
+                res = self_update_file(
+                    description,
+                    target,
+                    actor=actor,
+                    auto_install_deps=auto_install_deps,
+                    dry_run=dry_run,
+                )
+            except Exception as e:
+                res = {"status": "error", "message": str(e), "path": target}
+
+            results.append({"target": target, "result": res})
+            if isinstance(res, dict) and res.get("status") == "success":
+                success_count += 1
+
+        status_text = "success" if success_count == len(targets) else ("partial" if success_count > 0 else "error")
+        changed_files: list[str] = []
+        for item in results:
+            try:
+                r = item.get("result") if isinstance(item, dict) else {}
+                if not isinstance(r, dict):
+                    continue
+                if r.get("status") != "success":
+                    continue
+                p = (r.get("path") or item.get("target") or "").strip()
+                if p and p not in changed_files:
+                    changed_files.append(p)
+            except Exception:
+                continue
+
+        _last_progressive_llm_update_report = {
+            "event_type": "progressive_llm_update",
+            "started_at": started_at,
+            "completed_at": datetime.utcnow().isoformat(),
+            "status": status_text,
+            "targets": targets,
+            "changed_files": changed_files,
+            "dry_run": dry_run,
+            "auto_install_deps": auto_install_deps,
+            "actor": actor,
+            "results": results,
+        }
+        print(
+            "✅ [LLM-PROGRESSIVE] Completed"
+            if status_text == "success"
+            else "⚠️  [LLM-PROGRESSIVE] Completed with issues"
+        )
+
+        if _db_available():
+            db.save_system_event(
+                event_type="progressive_llm_update",
+                description=(
+                    f"Daily LLM/brain progressive update finished: {success_count}/{len(targets)} targets updated"
+                ),
+                status=status_text,
+                details={
+                    "targets": targets,
+                    "changed_files": changed_files,
+                    "started_at": started_at,
+                    "completed_at": _last_progressive_llm_update_report.get("completed_at"),
+                    "dry_run": dry_run,
+                    "auto_install_deps": auto_install_deps,
+                    "actor": actor,
+                    "results": results,
+                },
+            )
+    except Exception as e:
+        print(f"❌ [LLM-PROGRESSIVE] Failed: {e}")
+        _last_progressive_llm_update_report = {
+            "event_type": "progressive_llm_update_error",
+            "started_at": datetime.utcnow().isoformat(),
+            "completed_at": datetime.utcnow().isoformat(),
+            "status": "error",
+            "targets": [],
+            "changed_files": [],
+            "results": [],
+            "error": str(e),
+        }
+        if _db_available():
+            db.save_system_event(
+                event_type="progressive_llm_update_error",
+                description=f"Daily LLM/brain progressive update failed: {str(e)}",
+                status="error",
+            )
+    finally:
+        _progressive_llm_update_running = False
+
+
+def get_progressive_llm_update_report() -> dict:
+    """Return latest progressive LLM update report.
+
+    Preference order:
+    1) In-memory last report from this process
+    2) Latest system_events entry from DB
+    """
+    global _last_progressive_llm_update_report
+
+    if isinstance(_last_progressive_llm_update_report, dict) and _last_progressive_llm_update_report:
+        return {
+            "status": "success",
+            "source": "memory",
+            "report": _last_progressive_llm_update_report,
+        }
+
+    if _db_available():
+        try:
+            col = db.db.system_events
+            doc = col.find_one(
+                {"event_type": {"$in": ["progressive_llm_update", "progressive_llm_update_error"]}},
+                sort=[("timestamp", -1)],
+            )
+            if doc:
+                details = doc.get("details") if isinstance(doc.get("details"), dict) else {}
+                report = {
+                    "event_type": doc.get("event_type"),
+                    "status": doc.get("status") or details.get("status") or "unknown",
+                    "started_at": details.get("started_at"),
+                    "completed_at": details.get("completed_at") or (
+                        doc.get("timestamp").isoformat() if hasattr(doc.get("timestamp"), "isoformat") else doc.get("timestamp")
+                    ),
+                    "targets": details.get("targets") or [],
+                    "changed_files": details.get("changed_files") or [],
+                    "dry_run": details.get("dry_run"),
+                    "auto_install_deps": details.get("auto_install_deps"),
+                    "actor": details.get("actor"),
+                    "results": details.get("results") or [],
+                    "description": doc.get("description"),
+                }
+                return {"status": "success", "source": "db", "report": report}
+        except Exception as e:
+            return {"status": "error", "message": str(e), "report": None}
+
+    return {
+        "status": "success",
+        "source": "none",
+        "report": None,
+        "message": "No progressive LLM update report yet",
+    }
 
 
 async def _fetch_wikipedia_training_data_async(topics, *, lang: str = "en", max_pages: int = 2) -> int:

@@ -24,23 +24,33 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import env
+from src.config import runtime_defaults as rd
 from src.config.settings import settings as jarvis_settings
 
 from src.core.llm_adapter import LLMAdapter
 from src.core.jarvis_brain import JarvisBrain
 from src.core.executor import ActionExecutor
 from src.core.chat_orchestrator import ChatOrchestrator
+from src.core.module_update_cycle import ModuleUpdateCycleService
 from src.core.notification_hub import notification_hub
 from src.utils.git_sync import git_sync, setup_ssh_trust
 
 # Self-update is optional and may pull in extra dependencies. Keep API boot resilient.
 try:
-    from src.utils.self_update import parse_voice_command, self_update_file, self_add_feature
+    from src.utils.self_update import (
+        parse_voice_command,
+        self_update_file,
+        self_add_feature,
+        rollback_file,
+        get_update_history,
+    )
     SELF_UPDATE_AVAILABLE = True
 except Exception:
     parse_voice_command = None
     self_update_file = None
     self_add_feature = None
+    rollback_file = None
+    get_update_history = None
     SELF_UPDATE_AVAILABLE = False
 from src.utils.voice_auth import voice_auth
 from src.utils.auth_tokens import AuthTokens
@@ -54,6 +64,10 @@ from src.utils.telegram_bot import telegram_bot
 from src.utils.session_manager import session_manager, start_session_cleanup_task
 from src.utils.mcp_file_ops import file_ops
 from src.agent.device_hub import DeviceHub
+from src.api.internet_routes import build_internet_router
+from src.api.session_routes import build_session_router
+from src.api.system_control_routes import build_system_control_router
+from src.api.telegram_routes import build_telegram_router
 
 # Optional shared broker for multi-instance deployments (Redis pub/sub).
 try:
@@ -63,11 +77,12 @@ except Exception:
 
 # Background scheduler (optional)
 try:
-    from src.jobs.job_scheduler import initialize_scheduler, shutdown_scheduler
+    from src.jobs.job_scheduler import initialize_scheduler, shutdown_scheduler, get_progressive_llm_update_report
     SCHEDULER_AVAILABLE = True
 except Exception:
     initialize_scheduler = None
     shutdown_scheduler = None
+    get_progressive_llm_update_report = None
     SCHEDULER_AVAILABLE = False
 
 # Import system_operations safely (may fail on headless systems)
@@ -2574,6 +2589,7 @@ app.add_middleware(
 llm = LLMAdapter()
 brain = JarvisBrain(llm=llm)
 executor = ActionExecutor(brain=brain)
+module_cycle_service = ModuleUpdateCycleService(executor=executor, self_add_feature=self_add_feature)
 
 
 async def _shutdown_cleanup():
@@ -2822,12 +2838,27 @@ async def _continue_user_using_web_context(user_text: str, web_context: str, mod
         if found:
             # Require at least one URL; if missing, pull 1-2 URLs from web_context.
             has_url = bool(re.search(r"https?://\S+", txt))
+            urls = re.findall(r"https?://\S+", web_context or "")
+            urls = [u.rstrip(").,;") for u in urls]
+            urls = [u for i, u in enumerate(urls) if u and u not in urls[:i]]
             if not has_url:
-                urls = re.findall(r"https?://\S+", web_context or "")
-                urls = [u.rstrip(").,;") for u in urls]
-                urls = [u for i, u in enumerate(urls) if u and u not in urls[:i]]
                 if urls:
                     txt = (txt + "\n\nSource URLs:\n" + "\n".join([f"{i+1}. {u}" for i, u in enumerate(urls[:2])])).strip()
+
+            if bool(getattr(rd, "GLOBAL_FACTUAL_INCLUDE_CONFIDENCE", False)):
+                # Simple deterministic confidence estimate based on number of unique source URLs.
+                # This is confidence in available evidence quality, not absolute truth.
+                source_count = len(urls)
+                if source_count >= 3:
+                    confidence = "High"
+                elif source_count == 2:
+                    confidence = "Medium"
+                elif source_count == 1:
+                    confidence = "Low"
+                else:
+                    confidence = "Low"
+                if "Confidence:" not in txt:
+                    txt = (txt + f"\n\nConfidence: {confidence} (based on {source_count} source URL(s))").strip()
 
             # If the user asked an informational question (not to open anything), avoid emitting side-effect actions.
             ut = (user_text or "").strip().lower()
@@ -2993,8 +3024,8 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
         )
 
         if auth_req.action == "register":
-            if not auth_req.voice_sample_hash:
-                return {"status": "error", "message": "Voice sample required for registration"}
+            if not (auth_req.voice_sample_hash or auth_req.voice_sample_text):
+                return {"status": "error", "message": "Voice sample hash or text required for registration"}
 
             # Prevent privilege escalation on hosted deployments.
             uname = (auth_req.username or "").strip().lower()
@@ -3011,7 +3042,7 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
 
             result = voice_auth.register_user(
                 uname,
-                auth_req.voice_sample_hash,
+                auth_req.voice_sample_hash or "",
                 auth_req.password,
                 role=role,
                 voice_sample_text=auth_req.voice_sample_text,
@@ -3042,7 +3073,7 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
                     # Local/dev fallback: create legacy session via voice_auth.
                     ok, sid_or_err = voice_auth.authenticate_by_voice(
                         uname,
-                        auth_req.voice_sample_hash,
+                        auth_req.voice_sample_hash or "",
                         auth_req.password,
                         voice_sample_text=auth_req.voice_sample_text,
                     )
@@ -3063,12 +3094,12 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
             return result
         
         elif auth_req.action == "login":
-            if not auth_req.voice_sample_hash:
-                return {"status": "error", "message": "Voice sample required for login"}
+            if not (auth_req.voice_sample_hash or auth_req.voice_sample_text):
+                return {"status": "error", "message": "Voice sample hash or text required for login"}
 
             is_valid, session_or_error = voice_auth.authenticate_by_voice(
                 auth_req.username,
-                auth_req.voice_sample_hash,
+                auth_req.voice_sample_hash or "",
                 auth_req.password,
                 voice_sample_text=auth_req.voice_sample_text,
             )
@@ -3275,6 +3306,7 @@ async def health_check(check_db: int = 0):
         try:
             # Do not call database._connect() here because it can create indexes (slow).
             from pymongo import MongoClient
+            from pymongo.errors import PyMongoError
 
             probe_uri = getattr(database, "uri", None) or db_uri
             client = MongoClient(
@@ -3287,15 +3319,15 @@ async def health_check(check_db: int = 0):
             db_ping_ok = True
             try:
                 client.close()
-            except Exception:
+            except (PyMongoError, OSError):
                 pass
-        except Exception as e:
+        except (PyMongoError, ValueError, OSError) as e:
             db_ping_ok = False
             db_ping_error = str(e)[:200]
 
     payload = {
         "status": "ok",
-        "time_utc": datetime.utcnow().isoformat() + "Z",
+        "time_utc": datetime.now(timezone.utc).isoformat(),
         "uptime_s": int(time.time() - START_TS),
         "cloud_mode": bool(CLOUD_MODE),
         "db": {
@@ -3367,187 +3399,72 @@ async def logout(session_id: str | dict):
         success = voice_auth.logout(sid)
     return {"status": "success" if success else "error"}
 
-# =========================================================
-# Telegram Bot Endpoints
-# =========================================================
-class TelegramAuthRequest(BaseModel):
-    user_id: str
-    username: str
-    action: str  # "register" or "login"
-    voice_sample_hash: str | None = None
-    password: str | None = None
-    role: str | None = None
 
-@app.post("/api/telegram/register-start")
-async def telegram_register_start(req: dict):
-    """Start Telegram registration process"""
-    user_id = req.get("user_id")
-    username = req.get("username")
-    
-    if not user_id or not username:
-        return {"status": "error", "message": "user_id and username required"}
-    
-    result = telegram_bot.start_registration(user_id, username)
-    return result
-
-@app.post("/api/telegram/process-voice")
-async def telegram_process_voice(req: dict):
-    """Process voice sample from Telegram"""
-    user_id = req.get("user_id")
-    voice_file_id = req.get("voice_file_id")
-    # In production, download voice file from Telegram and get bytes
-    voice_bytes = req.get("voice_bytes", b"")
-    
-    if not user_id or not voice_file_id:
-        return {"status": "error", "message": "user_id and voice_file_id required"}
-    
-    result = telegram_bot.process_voice_sample(user_id, voice_file_id, voice_bytes)
-    return result
-
-@app.post("/api/telegram/complete-registration")
-async def telegram_complete_registration(auth_req: TelegramAuthRequest):
-    """Complete Telegram registration"""
-    if not auth_req.voice_sample_hash or not auth_req.password:
-        return {"status": "error", "message": "voice_sample_hash and password required"}
-    
-    result = telegram_bot.complete_registration(
-        auth_req.user_id,
-        auth_req.voice_sample_hash,
-        auth_req.password,
-        auth_req.username,
-        auth_req.role or "user"
+def _extract_delete_task_title(text: str) -> str | None:
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = re.match(
+        r"^\s*(?:delete|remove|cancel)\s+(?:the\s+)?task\s+(?:title\s+)?[\"']?(.+?)[\"']?\s*$",
+        t,
+        flags=re.IGNORECASE,
     )
-    return result
+    if not m:
+        return None
+    title = (m.group(1) or "").strip(" .,!?:;\"'")
+    return title or None
 
-@app.post("/api/telegram/login")
-async def telegram_login(auth_req: TelegramAuthRequest):
-    """Handle Telegram user login"""
-    if not auth_req.voice_sample_hash:
-        return {"status": "error", "message": "voice_sample_hash required"}
-    
-    result = telegram_bot.telegram_login(
-        auth_req.user_id,
-        auth_req.username,
-        auth_req.voice_sample_hash
+
+def _parse_admin_update_voice_command(text: str) -> dict | None:
+    t = (text or "").strip()
+    if not t:
+        return None
+    tl = t.lower()
+
+    if re.search(r"\b(show|get|check|open|list)\b.*\b(update\s+history|updates\s+history|update\s+log|update\s+logs)\b", tl):
+        return {"kind": "history", "limit": 20}
+
+    m = re.match(
+        r"^\s*(?:dry\s*run|validate)\s+update\s+file\s+(.+?)\s*(?::|,|\s+with\s+)\s*(.+)\s*$",
+        t,
+        flags=re.IGNORECASE,
     )
-    return result
-
-@app.post("/api/telegram/validate-session")
-async def telegram_validate_session(req: dict):
-    """Validate Telegram user session"""
-    user_id = req.get("user_id")
-    if not user_id:
-        return {"status": "error", "message": "user_id required"}
-    
-    is_valid, username = telegram_bot.validate_telegram_session(user_id)
-    return {
-        "valid": is_valid,
-        "username": username,
-        "user_info": telegram_bot.get_user_info(user_id)
-    }
-
-@app.post("/api/telegram/logout")
-async def telegram_logout(req: dict):
-    """Logout Telegram user"""
-    user_id = req.get("user_id")
-    if not user_id:
-        return {"status": "error", "message": "user_id required"}
-    
-    success = telegram_bot.logout_telegram_user(user_id)
-    return {
-        "status": "success" if success else "error",
-        "message": "Logged out successfully" if success else "User not found"
-    }
-
-@app.post("/api/telegram/chat")
-async def telegram_chat(req: dict, background_tasks: BackgroundTasks):
-    """Handle chat message from Telegram user"""
-    if VOICE_ONLY_MODE:
+    if m:
         return {
-            "status": "error",
-            "message": "Voice-only mode is enabled on this assistant.",
+            "kind": "update",
+            "file_path": (m.group(1) or "").strip(),
+            "description": (m.group(2) or "").strip(),
+            "dry_run": True,
+            "auto_install_deps": ("auto install" in tl) or ("install dependencies" in tl),
         }
-    user_id = req.get("user_id")
-    text = req.get("text")
-    
-    if not user_id or not text:
-        return {"status": "error", "message": "user_id and text required"}
-    
-    # Validate session
-    is_valid, username = telegram_bot.validate_telegram_session(user_id)
-    if not is_valid:
+
+    m = re.match(
+        r"^\s*(?:run\s+)?update\s+file\s+(.+?)\s*(?::|,|\s+with\s+)\s*(.+)\s*$",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if m:
         return {
-            "status": "auth_required",
-            "message": "Please login first",
-            "action": "redirect_to_login"
+            "kind": "update",
+            "file_path": (m.group(1) or "").strip(),
+            "description": (m.group(2) or "").strip(),
+            "dry_run": False,
+            "auto_install_deps": ("auto install" in tl) or ("install dependencies" in tl),
         }
-    
-    # Process message through brain
-    response = await brain.handle_message(text, mode="chat")
-    actions = response.get("actions", [])
 
-    # Avoid accidental screen capture which can degrade UX.
-    if actions and not _user_explicitly_requested_screen_capture(text):
-        actions = [
-            a
-            for a in actions
-            if (a or {}).get("type") not in ("capture_screen",)
-        ]
-        response["actions"] = actions
+    m = re.match(
+        r"^\s*rollback\s+file\s+(.+?)(?:\s+backup\s+(.+))?\s*$",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return {
+            "kind": "rollback",
+            "file_path": (m.group(1) or "").strip(),
+            "backup_path": (m.group(2) or "").strip() or None,
+        }
 
-    # Enforce role-based permissions (Telegram sessions store role in user_info)
-    role = ((telegram_bot.get_user_info(user_id) or {}).get("role") or "user").strip().lower()
-    if role not in ("user", "admin"):
-        role = "user"
-
-    if actions:
-        if role != "admin":
-            blocked = [a for a in actions if (a or {}).get("type") in ADMIN_ONLY_ACTION_TYPES]
-            actions = [a for a in actions if (a or {}).get("type") not in ADMIN_ONLY_ACTION_TYPES]
-            response["actions"] = actions
-            if blocked:
-                response["text"] = (response.get("text") or "") + "\n\n(Some actions require admin privileges and were skipped.)"
-
-        # Execute web lookups inline so Telegram responses include results.
-        immediate_types = {"web_search", "fetch_url", "search"}
-        immediate_actions = [a for a in actions if (a or {}).get("type") in immediate_types]
-        deferred_actions = [a for a in actions if (a or {}).get("type") not in immediate_types]
-        if immediate_actions:
-            continued_actions = None
-            try:
-                tool_results = await executor.process_actions(immediate_actions, (username or "user"))
-                if env.get_bool("JARVIS_RETURN_ACTION_RESULTS", False):
-                    response["action_results"] = tool_results
-                mode = (response.get("mode") or "chat")
-                web_ctx = _build_web_context_from_action_results(tool_results)
-                _persist_web_context_items(topic=text, action_results=tool_results)
-                found = _web_lookup_found(tool_results)
-                if env.get_str("JARVIS_WEB_RESULTS_MODE", "answer").lower() in ("append", "both"):
-                    # Legacy/debug mode: append raw results.
-                    response["text"] = (response.get("text") or "")
-                else:
-                    continued = await _continue_user_using_web_context(text, web_ctx, mode=mode, found=found)
-                    if continued:
-                        response["text"] = (continued.get("text") or response.get("text") or "")
-                        # Allow dynamic actions after web lookup
-                        continued_actions = continued.get("actions") or []
-            except Exception as e:
-                response["text"] = (response.get("text") or "") + f"\n\n(Web lookup failed: {e})"
-            actions = deferred_actions
-            if isinstance(continued_actions, list) and continued_actions:
-                actions = continued_actions
-            response["actions"] = actions
-
-        if actions:
-            background_tasks.add_task(executor.process_actions, actions, username)
-    
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "username": username,
-        "response": response.get("text", ""),
-        "actions": actions
-    }
+    return None
 
 # =========================================================
 # Main Chat Endpoint (With Auth Check)
@@ -3584,6 +3501,106 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         username = _require_voice_session(msg.session_id)
     if username:
         msg.user = username
+
+    # Admin-only module update cycle flow (start/continue/delete by title).
+    # Uses explicit phrases so unrelated conversations continue normally.
+    message_text = (msg.text or "").strip()
+    if message_text and role == "admin":
+        update_voice_cmd = _parse_admin_update_voice_command(message_text)
+        if update_voice_cmd and SELF_UPDATE_AVAILABLE:
+            actor = (username or principal.get("username") or "admin").strip().lower() or "admin"
+            kind = (update_voice_cmd.get("kind") or "").strip().lower()
+
+            if kind == "history" and get_update_history is not None:
+                limit = int(update_voice_cmd.get("limit") or 20)
+                history_res = get_update_history(limit=limit)
+                rows = history_res.get("history") if isinstance(history_res, dict) else []
+                rows = rows if isinstance(rows, list) else []
+                top = rows[:5]
+                if not top:
+                    text = "No update history found."
+                else:
+                    lines = []
+                    for row in top:
+                        if not isinstance(row, dict):
+                            continue
+                        lines.append(
+                            f"- {(row.get('action') or 'update')} | {(row.get('status') or 'unknown')} | {(row.get('target_file') or '-') }"
+                        )
+                    text = "Recent update history:\n" + ("\n".join(lines) if lines else "No update history found.")
+                return {
+                    "text": text,
+                    "actions": [],
+                    "request_id": request_id,
+                    "update_history": history_res,
+                }
+
+            if kind == "update" and self_update_file is not None:
+                upd = self_update_file(
+                    str(update_voice_cmd.get("description") or "").strip(),
+                    str(update_voice_cmd.get("file_path") or "").strip(),
+                    actor=actor,
+                    auto_install_deps=bool(update_voice_cmd.get("auto_install_deps")),
+                    dry_run=bool(update_voice_cmd.get("dry_run")),
+                )
+                status_text = (upd.get("message") or "Update processed.") if isinstance(upd, dict) else "Update processed."
+                return {
+                    "text": status_text,
+                    "actions": [],
+                    "request_id": request_id,
+                    "update_result": upd,
+                }
+
+            if kind == "rollback" and rollback_file is not None:
+                rb = rollback_file(
+                    str(update_voice_cmd.get("file_path") or "").strip(),
+                    update_voice_cmd.get("backup_path"),
+                    actor=actor,
+                )
+                status_text = (rb.get("message") or "Rollback processed.") if isinstance(rb, dict) else "Rollback processed."
+                return {
+                    "text": status_text,
+                    "actions": [],
+                    "request_id": request_id,
+                    "rollback_result": rb,
+                }
+
+        delete_title = _extract_delete_task_title(message_text)
+        if delete_title:
+            delete_result = task_manager.delete_tasks_by_title(
+                delete_title,
+                owner=(username or principal.get("username") or "admin"),
+                is_admin=True,
+            )
+            return {
+                "text": delete_result.get("message") or "Task deletion processed.",
+                "actions": [],
+                "request_id": request_id,
+                "task_delete": delete_result,
+            }
+
+        start_title = module_cycle_service.parse_start_module_title(message_text)
+        if start_title:
+            cycle = await module_cycle_service.start_cycle(
+                title=start_title,
+                username=(username or principal.get("username") or "admin"),
+                background_tasks=background_tasks,
+            )
+            if cycle.get("handled"):
+                response = cycle.get("response") or {"text": "Module cycle started.", "actions": []}
+                response["request_id"] = request_id
+                return response
+
+        if module_cycle_service.is_continue_command(message_text):
+            cycle = await module_cycle_service.continue_cycle(
+                text=message_text,
+                username=(username or principal.get("username") or "admin"),
+                background_tasks=background_tasks,
+            )
+            if cycle.get("handled"):
+                response = cycle.get("response") or {"text": "Module cycle continued.", "actions": []}
+                response["request_id"] = request_id
+                return response
     
     # Bind learning/training memory to the authenticated principal when available.
     response, actions = await chat_orchestrator.run_chat(
@@ -3673,122 +3690,6 @@ async def message_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     return await chat_endpoint(msg, background_tasks)
 
 # =========================================================
-# Internet Access API (Web Search & Data Retrieval)
-# =========================================================
-class SearchRequest(BaseModel):
-    query: str
-    num_results: int | None = 5
-    session_id: str | None = None
-
-@app.post("/api/internet/search")
-async def search_web(req: SearchRequest):
-    """Search the web for information"""
-    _require_voice_session(req.session_id)
-    try:
-        from src.internet.internet import InternetAccess
-        
-        internet = InternetAccess()
-        await internet.initialize()
-        
-        results = await internet.search(req.query, num_results=req.num_results or 5)
-        
-        await internet.close()
-        
-        return {
-            "status": "success",
-            "query": req.query,
-            "results": results,
-            "count": len(results)
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
-class FetchRequest(BaseModel):
-    url: str
-    include_content: bool | None = True
-    session_id: str | None = None
-
-@app.post("/api/internet/fetch")
-async def fetch_webpage(req: FetchRequest):
-    """Fetch and parse a webpage"""
-    _require_voice_session(req.session_id)
-    try:
-        from src.internet.internet import InternetAccess
-        
-        internet = InternetAccess()
-        await internet.initialize()
-        
-        result = await internet.fetch_webpage(req.url, include_content=req.include_content or True)
-        
-        await internet.close()
-        
-        return {
-            "status": "success",
-            "url": req.url,
-            "content": result
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
-@app.post("/api/internet/search-summarize")
-async def search_and_summarize(req: SearchRequest):
-    """Search web and get summaries of top results"""
-    _require_voice_session(req.session_id)
-    try:
-        from src.internet.internet import InternetAccess
-        
-        internet = InternetAccess()
-        await internet.initialize()
-        
-        results = await internet.search_and_summarize(req.query, num_results=req.num_results or 3)
-        
-        await internet.close()
-        
-        return {
-            "status": "success",
-            "query": req.query,
-            "results": results,
-            "count": len(results)
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
-@app.get("/api/internet/news")
-async def get_news_endpoint(topic: str = "latest", num_results: int = 5, session_id: str | None = None):
-    """Get latest news on a topic"""
-    _require_voice_session(session_id)
-    try:
-        from src.internet.internet import InternetAccess
-        
-        internet = InternetAccess()
-        await internet.initialize()
-        
-        news = await internet.get_news(topic, num_results)
-        
-        await internet.close()
-        
-        return {
-            "status": "success",
-            "topic": topic,
-            "news": news,
-            "count": len(news)
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
-# =========================================================
 # Git Sync API
 # =========================================================
 @app.post("/api/git-sync")
@@ -3860,6 +3761,22 @@ class SelfUpdateRequest(BaseModel):
     file_path: str | None = None
     description: str | None = None
     session_id: str | None = None  # session id of the caller (required for admin actions)
+    auto_install_deps: bool | None = None
+    dry_run: bool = False
+
+
+class AdminUpdateRunRequest(BaseModel):
+    description: str
+    file_path: str
+    session_id: str
+    auto_install_deps: bool | None = None
+    dry_run: bool = False
+
+
+class AdminRollbackRequest(BaseModel):
+    file_path: str
+    backup_path: str | None = None
+    session_id: str
 
 @app.post("/api/self-update")
 async def handle_self_update(request: SelfUpdateRequest):
@@ -3900,19 +3817,69 @@ async def handle_self_update(request: SelfUpdateRequest):
         if action == "update" or action == "edit":
             file_path = parsed.get("target", request.file_path or "")
             description = parsed.get("description", request.description or request.command)
-            result = self_update_file(description, file_path)
+            result = self_update_file(
+                description,
+                file_path,
+                actor=username,
+                auto_install_deps=request.auto_install_deps,
+                dry_run=bool(request.dry_run),
+            )
             return result
         
         elif action == "add":
             feature_type = parsed.get("feature_type", "module")
             description = parsed.get("description", request.description or request.command)
-            result = self_add_feature(description, feature_type)
+            result = self_add_feature(description, feature_type, actor=username)
             return result
         
         return {"status": "error", "message": f"Unknown action: {action}"}
         
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/admin/updates/history")
+async def admin_updates_history(session_id: str, limit: int = 100):
+    _require_admin_session(session_id)
+    if not SELF_UPDATE_AVAILABLE or get_update_history is None:
+        return {"status": "error", "message": "Self-update is unavailable", "history": []}
+    return get_update_history(limit=limit)
+
+
+@app.post("/api/admin/updates/run")
+async def admin_updates_run(req: AdminUpdateRunRequest):
+    principal = _require_admin_session(req.session_id)
+    if not SELF_UPDATE_AVAILABLE or self_update_file is None:
+        return {"status": "error", "message": "Self-update is unavailable"}
+    actor = (principal.get("username") or "admin").strip().lower() or "admin"
+    return self_update_file(
+        req.description,
+        req.file_path,
+        actor=actor,
+        auto_install_deps=req.auto_install_deps,
+        dry_run=bool(req.dry_run),
+    )
+
+
+@app.post("/api/admin/updates/rollback")
+async def admin_updates_rollback(req: AdminRollbackRequest):
+    principal = _require_admin_session(req.session_id)
+    if not SELF_UPDATE_AVAILABLE or rollback_file is None:
+        return {"status": "error", "message": "Rollback is unavailable"}
+    actor = (principal.get("username") or "admin").strip().lower() or "admin"
+    return rollback_file(req.file_path, req.backup_path, actor=actor)
+
+
+@app.get("/api/admin/updates/progressive-report")
+async def admin_progressive_update_report(session_id: str):
+    _require_admin_session(session_id)
+    if not SCHEDULER_AVAILABLE or get_progressive_llm_update_report is None:
+        return {
+            "status": "error",
+            "message": "Scheduler/reporting is unavailable",
+            "report": None,
+        }
+    return get_progressive_llm_update_report()
 
 # =========================================================
 # Email Generation API
@@ -3947,99 +3914,6 @@ async def get_email_drafts():
     return {"drafts": email_generator.get_drafts()}
 
 # =========================================================
-# Screen Access API
-# =========================================================
-@app.post("/api/capture-screen")
-async def capture_screen_endpoint(region: dict | None = None):
-    """Capture screen or region"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("Screen capture")
-    sid = (region or {}).get("session_id") if isinstance(region, dict) else None
-    _require_admin_session(sid)
-    try:
-        reg = None
-        if region:
-            reg = (region.get("x"), region.get("y"), region.get("width"), region.get("height"))
-        include_base64 = bool((region or {}).get("include_base64", False)) if isinstance(region, dict) else False
-        screenshot_info = screen_access.take_screenshot_info(region=reg, include_base64=include_base64)
-        return screenshot_info
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/api/read-screen")
-async def read_screen_endpoint(region: dict | None = None):
-    """Read text from screen using OCR"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("Screen OCR")
-    sid = (region or {}).get("session_id") if isinstance(region, dict) else None
-    _require_admin_session(sid)
-    try:
-        reg = None
-        if region:
-            reg = (region.get("x"), region.get("y"), region.get("width"), region.get("height"))
-        text = screen_access.read_screen_text(reg)
-        return {"text": text, "status": "success"}
-    except Exception as e:
-        return {"error": str(e), "status": "error"}
-
-# =========================================================
-# Application Management API
-# =========================================================
-class OpenAppRequest(BaseModel):
-    app_name: str
-    args: List[str] | None = None
-    session_id: str | None = None
-
-@app.post("/api/open-app")
-async def open_app_endpoint(request: OpenAppRequest):
-    """Open an application"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("Opening local applications")
-    _require_admin_session(request.session_id)
-    return app_manager.open_app(request.app_name, request.args)
-
-class AppNameRequest(BaseModel):
-    app_name: str
-    session_id: str | None = None
-
-@app.post("/api/close-app")
-async def close_app_endpoint(request: AppNameRequest):
-    """Close an application"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("Closing local applications")
-    _require_admin_session(request.session_id)
-    return app_manager.close_app(request.app_name)
-
-@app.post("/api/switch-app")
-async def switch_app_endpoint(request: AppNameRequest):
-    """Switch to an application"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("Switching local applications")
-    _require_admin_session(request.session_id)
-    return app_manager.switch_to_app(request.app_name)
-
-@app.get("/api/running-apps")
-async def get_running_apps(session_id: str):
-    """Get list of running applications"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("Listing local applications")
-    _require_authenticated_session(session_id)
-    return {"apps": app_manager.list_running_apps()}
-
-class ExecuteCommandRequest(BaseModel):
-    command: str
-    wait: bool = True
-    session_id: str | None = None
-
-@app.post("/api/execute-command")
-async def execute_command_endpoint(request: ExecuteCommandRequest):
-    """Execute a system command"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("Executing commands")
-    _require_admin_session(request.session_id)
-    return app_manager.execute_command(request.command, request.wait)
-
-# =========================================================
 # Task Management API
 # =========================================================
 class CreateTaskRequest(BaseModel):
@@ -4069,6 +3943,11 @@ class StopTaskRequest(BaseModel):
     task_id: str | None = None
     session_id: str | None = None
     reason: str | None = None
+
+
+class DeleteTaskByTitleRequest(BaseModel):
+    title: str
+    session_id: str | None = None
 
 @app.post("/api/stop-task")
 async def stop_task_endpoint(request: StopTaskRequest | None = None):
@@ -4118,6 +3997,24 @@ async def stop_task_endpoint(request: StopTaskRequest | None = None):
             detail="task_id is required in cloud mode",
         )
     return task_manager.stop_current_task()
+
+
+@app.post("/api/delete-task-by-title")
+async def delete_task_by_title_endpoint(request: DeleteTaskByTitleRequest):
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(request.session_id)
+        if principal.get("role") != "admin":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+        username = (principal.get("username") or "").strip().lower()
+    else:
+        principal = _require_admin_session(request.session_id)
+        username = (principal.get("username") or "admin").strip().lower() or "admin"
+
+    return task_manager.delete_tasks_by_title(
+        request.title,
+        owner=username,
+        is_admin=True,
+    )
 
 @app.get("/api/current-task")
 async def get_current_task(session_id: str | None = None):
@@ -4278,242 +4175,34 @@ async def cleanup_project_endpoint(req: dict | None = None):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# =========================================================
-# System Operations API (Digital Assistant PC Control)
-# =========================================================
-def _system_ops_unavailable():
-    """Helper function to return error when system_ops is unavailable"""
-    return {"status": "error", "message": "System operations not available on this platform"}
+app.include_router(build_telegram_router(
+    voice_only_mode=bool(VOICE_ONLY_MODE),
+    telegram_bot=telegram_bot,
+    brain=brain,
+    executor=executor,
+    env=env,
+    admin_only_action_types=ADMIN_ONLY_ACTION_TYPES,
+    user_explicitly_requested_screen_capture=_user_explicitly_requested_screen_capture,
+    build_web_context_from_action_results=_build_web_context_from_action_results,
+    persist_web_context_items=_persist_web_context_items,
+    web_lookup_found=_web_lookup_found,
+    continue_user_using_web_context=_continue_user_using_web_context,
+))
 
-@app.get("/api/system/info")
-async def get_system_info(session_id: str):
-    """Get current system information"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_authenticated_session(session_id)
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    return system_ops.get_system_info()
+app.include_router(build_internet_router(_require_voice_session))
 
-@app.get("/api/system/processes")
-async def list_processes_endpoint(session_id: str, filter: Optional[str] = None):
-    """List running processes"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_authenticated_session(session_id)
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    return system_ops.list_processes(filter)
+app.include_router(build_system_control_router(
+    cloud_mode=bool(CLOUD_MODE),
+    cloud_feature_disabled=_cloud_feature_disabled,
+    require_admin_session=_require_admin_session,
+    require_authenticated_session=_require_authenticated_session,
+    screen_access=screen_access,
+    app_manager=app_manager,
+    system_ops_available=bool(SYSTEM_OPS_AVAILABLE),
+    system_ops=system_ops if SYSTEM_OPS_AVAILABLE else None,
+))
 
-@app.post("/api/system/process-kill")
-async def kill_process_endpoint(req: dict):
-    """Kill a process by name"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    process_name = req.get("process_name")
-    if not process_name:
-        return {"status": "error", "message": "process_name required"}
-    return system_ops.kill_process(process_name)
-
-@app.post("/api/system/launch-app")
-async def launch_application_endpoint(req: dict):
-    """Launch an application"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    app_path = req.get("app_path")
-    args = req.get("args", [])
-    if not app_path:
-        return {"status": "error", "message": "app_path required"}
-    return system_ops.launch_application(app_path, args)
-
-@app.post("/api/system/execute")
-async def execute_command_endpoint(req: dict):
-    """Execute a shell command"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    command = req.get("command")
-    timeout = req.get("timeout", 30)
-    if not command:
-        return {"status": "error", "message": "command required"}
-    return system_ops.execute_command(command, timeout)
-
-@app.get("/api/system/screen")
-async def get_screen_info(session_id: str):
-    """Get screen/display information"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_authenticated_session(session_id)
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    return system_ops.get_screen_info()
-
-@app.post("/api/system/screenshot")
-async def take_screenshot(req: dict = None):
-    """Take a screenshot"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    save_path = req.get("save_path") if req else None
-    return system_ops.take_screenshot(save_path)
-
-@app.post("/api/system/mouse-move")
-async def move_mouse_endpoint(req: dict):
-    """Move mouse to position"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    x = req.get("x")
-    y = req.get("y")
-    if x is None or y is None:
-        return {"status": "error", "message": "x and y required"}
-    return system_ops.move_mouse(int(x), int(y))
-
-@app.post("/api/system/mouse-click")
-async def click_mouse_endpoint(req: dict):
-    """Click mouse at position"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    x = req.get("x")
-    y = req.get("y")
-    button = req.get("button", "left")
-    if x is None or y is None:
-        return {"status": "error", "message": "x and y required"}
-    return system_ops.click_mouse(int(x), int(y), button)
-
-@app.post("/api/system/type-text")
-async def type_text_endpoint(req: dict):
-    """Type text using keyboard"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    text = req.get("text")
-    interval = req.get("interval", 0.1)
-    if not text:
-        return {"status": "error", "message": "text required"}
-    return system_ops.type_text(text, interval)
-
-@app.post("/api/system/press-key")
-async def press_key_endpoint(req: dict):
-    """Press a keyboard key"""
-    if CLOUD_MODE:
-        _cloud_feature_disabled("System operations")
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    key = req.get("key")
-    if not key:
-        return {"status": "error", "message": "key required"}
-    return system_ops.press_key(key)
-
-@app.post("/api/system/open-file")
-async def open_file_endpoint(req: dict):
-    """Open a file with default application"""
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    file_path = req.get("file_path")
-    if not file_path:
-        return {"status": "error", "message": "file_path required"}
-    return system_ops.open_file(file_path)
-
-@app.get("/api/system/windows")
-async def get_open_windows(session_id: str):
-    """Get list of open windows"""
-    _require_authenticated_session(session_id)
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    return system_ops.get_open_windows()
-
-@app.post("/api/system/window-focus")
-async def focus_window_endpoint(req: dict):
-    """Focus a window by title"""
-    _require_admin_session((req or {}).get("session_id"))
-    if not SYSTEM_OPS_AVAILABLE:
-        return _system_ops_unavailable()
-    window_title = req.get("window_title")
-    if not window_title:
-        return {"status": "error", "message": "window_title required"}
-    return system_ops.focus_window(window_title)
-
-# =========================================================
-# Session Management Endpoints
-# =========================================================
-@app.post("/api/session/extend")
-async def extend_session_endpoint(req: dict):
-    """Extend current session on page reload"""
-    session_id = req.get("session_id")
-    if not session_id:
-        return {"status": "error", "message": "session_id required"}
-    
-    is_valid, username = session_manager.validate_session(session_id, update_activity=True)
-    if not is_valid:
-        return {
-            "status": "session_expired",
-            "message": "Session expired. Please login again.",
-            "action": "redirect_to_login"
-        }
-    
-    # Extend session
-    extended = session_manager.extend_session(session_id)
-    
-    return {
-        "status": "success" if extended else "error",
-        "message": "Session extended" if extended else "Failed to extend session",
-        "username": username,
-        "session_info": session_manager.get_session_info(session_id)
-    }
-
-@app.post("/api/session/check")
-async def check_session_endpoint(req: dict):
-    """Check if session is still valid"""
-    session_id = req.get("session_id")
-    if not session_id:
-        return {"valid": False, "message": "No session_id provided"}
-    
-    is_valid, username = session_manager.validate_session(session_id, update_activity=False)
-    
-    return {
-        "valid": is_valid,
-        "username": username,
-        "session_info": session_manager.get_session_info(session_id) if is_valid else None
-    }
-
-@app.post("/api/session/logout")
-async def logout_session_endpoint(req: dict):
-    """Logout from current session"""
-    session_id = req.get("session_id")
-    if not session_id:
-        return {"status": "error", "message": "session_id required"}
-    
-    success = session_manager.invalidate_session(session_id)
-    
-    return {
-        "status": "success" if success else "error",
-        "message": "Logged out successfully" if success else "Session not found"
-    }
-
-@app.get("/api/session/stats")
-async def get_session_stats():
-    """Get session statistics"""
-    return session_manager.get_session_stats()
+app.include_router(build_session_router(session_manager))
 
 # =========================================================
 # Startup Event

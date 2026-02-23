@@ -12,7 +12,7 @@ except Exception:
 
 
 a = Analysis(
-    ['apps\\desktop\\jarvis_web_shell.py'],
+    ['apps\\desktop\\desktop_app.py'],
     # Add repo root so the packaged exe can import app.py and src/*.
     pathex=['.'],
     binaries=[] + (_WEBVIEW_BINARIES or []),

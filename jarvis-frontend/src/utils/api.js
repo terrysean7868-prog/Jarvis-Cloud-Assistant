@@ -351,6 +351,24 @@ export async function stopTask(sessionId = null, taskId = null, timeoutMs = DEFA
   return await res.json();
 }
 
+export async function deleteTaskByTitle(sessionId, title, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = {
+    session_id: sessionId,
+    title: String(title || "").trim(),
+  };
+
+  const res = await timeoutFetch(`${API_URL}/api/delete-task-by-title`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
 export async function getTasks(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
   const qs = new URLSearchParams();
   if (sessionId) qs.set("session_id", String(sessionId));
@@ -359,6 +377,79 @@ export async function getTasks(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
   const res = await timeoutFetch(url, {
     method: "GET",
     headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getAdminUpdateHistory(sessionId, limit = 100, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  qs.set("session_id", String(sessionId || ""));
+  qs.set("limit", String(limit || 100));
+
+  const res = await timeoutFetch(`${API_URL}/api/admin/updates/history?${qs.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getAdminProgressiveUpdateReport(sessionId, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  qs.set("session_id", String(sessionId || ""));
+
+  const res = await timeoutFetch(`${API_URL}/api/admin/updates/progressive-report?${qs.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function runAdminUpdate({ sessionId, filePath, description, autoInstallDeps = null, dryRun = false }, timeoutMs = 120000) {
+  const body = {
+    session_id: sessionId,
+    file_path: filePath,
+    description,
+    dry_run: !!dryRun,
+  };
+  if (typeof autoInstallDeps === "boolean") {
+    body.auto_install_deps = autoInstallDeps;
+  }
+
+  const res = await timeoutFetch(`${API_URL}/api/admin/updates/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function rollbackAdminUpdate({ sessionId, filePath, backupPath = null }, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = {
+    session_id: sessionId,
+    file_path: filePath,
+  };
+  if (backupPath) body.backup_path = backupPath;
+
+  const res = await timeoutFetch(`${API_URL}/api/admin/updates/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   }, timeoutMs);
 
   if (!res.ok) {

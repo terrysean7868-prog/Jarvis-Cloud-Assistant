@@ -1758,6 +1758,34 @@ class LLMAdapter:
         if LLMAdapter._is_research_status_question(user_text):
             return False
 
+        # If global factual mode is enabled, default to web-first for non-local informational queries.
+        # This applies across ALL topics (not domain-specific).
+        local_action_markers = (
+            "open ",
+            "launch ",
+            "start ",
+            "close ",
+            "switch ",
+            "write ",
+            "type ",
+            "format ",
+            "rewrite ",
+            "make it ",
+            "increase ",
+            "decrease ",
+            "turn on ",
+            "turn off ",
+            "enable ",
+            "disable ",
+            "set ",
+            "adjust ",
+        )
+        if bool(getattr(rd, "GLOBAL_FACTUAL_MODE", False)):
+            # Internal orchestration/system prompts must not trigger new web loops.
+            if not (t.startswith("you are ") or ("provided web context" in t)):
+                if not any(t.startswith(m) for m in local_action_markers):
+                    return True
+
         # High-level analysis doesn't always need web (many prompts are conceptual).
         # Only trigger web for analysis when the user explicitly requests research/sources
         # or when the topic is time-sensitive.
@@ -1864,26 +1892,6 @@ class LLMAdapter:
             return True
 
         # If the user is just asking to DO something locally, default to no web.
-        local_action_markers = (
-            "open ",
-            "launch ",
-            "start ",
-            "close ",
-            "switch ",
-            "write ",
-            "type ",
-            "format ",
-            "rewrite ",
-            "make it ",
-            "increase ",
-            "decrease ",
-            "turn on ",
-            "turn off ",
-            "enable ",
-            "disable ",
-            "set ",
-            "adjust ",
-        )
         if any(t.startswith(m) for m in local_action_markers):
             return False
 

@@ -17,6 +17,8 @@ replace voice hash comparison with real voice biometrics / external service.
 
 import json
 import hashlib
+import base64
+import binascii
 import secrets
 import logging
 import threading
@@ -82,6 +84,39 @@ def _hash_password(password: str, salt: Optional[str] = None) -> Tuple[str,str]:
         salt = secrets.token_hex(8)
     hashed = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
     return salt, hashed
+
+
+def _hash_normalized_text(text: Optional[str]) -> str:
+    normalized = _norm_text(text or "")
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _normalize_voice_hash(value: Optional[str]) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    raw_lower = raw.lower()
+    for prefix in ("sha256:", "sha256-"):
+        if raw_lower.startswith(prefix):
+            raw = raw[len(prefix):].strip()
+            raw_lower = raw.lower()
+
+    compact_hex = "".join(ch for ch in raw_lower if ch in "0123456789abcdef")
+    if len(compact_hex) == 64:
+        return compact_hex
+
+    try:
+        pad = "=" * (-len(raw) % 4)
+        decoded = base64.b64decode(raw + pad, validate=True)
+        if len(decoded) == 32:
+            return decoded.hex()
+    except (binascii.Error, ValueError):
+        pass
+
+    return raw_lower
 
 class VoiceAuth:
     def __init__(self):
@@ -205,9 +240,15 @@ class VoiceAuth:
             return {"status":"error","message":"Username required"}
         existing = self.get_user(username)
 
+        normalized_hash = _normalize_voice_hash(voice_sample_hash)
+        if not normalized_hash:
+            normalized_hash = _hash_normalized_text(voice_sample_text)
+        if not normalized_hash:
+            return {"status":"error","message":"Voice sample hash or text required"}
+
         # Build new sample payload (store multiple samples to improve match success)
         sample = {
-            "hash": voice_sample_hash,
+            "hash": normalized_hash,
             "text": _norm_text(voice_sample_text) if voice_sample_text else None,
             "created_at": datetime.utcnow().isoformat(),
         }
@@ -237,7 +278,7 @@ class VoiceAuth:
             user["role"] = user.get("role") or role
         else:
             user = {
-                "voice_hash": voice_sample_hash,
+                "voice_hash": normalized_hash,
                 "voice_samples": [sample],
                 "role": role,
                 "assistant_name": "Jarvis",
@@ -307,12 +348,14 @@ class VoiceAuth:
         Default: exact match only.
         Optional: prefix match can be enabled for legacy behavior via VOICE_HASH_PREFIX_MATCH=true.
         """
-        if not stored_hash or not provided_hash:
+        stored = _normalize_voice_hash(stored_hash)
+        provided = _normalize_voice_hash(provided_hash)
+        if not stored or not provided:
             return False
-        if stored_hash == provided_hash:
+        if stored == provided:
             return True
         if VOICE_HASH_PREFIX_MATCH:
-            return stored_hash.startswith(provided_hash) or provided_hash.startswith(stored_hash)
+            return stored.startswith(provided) or provided.startswith(stored)
         return False
 
     def _voice_match(self, user: dict, voice_sample_hash: str, voice_sample_text: Optional[str] = None) -> bool:
@@ -338,9 +381,13 @@ class VoiceAuth:
             if best > 0.0:
                 logger.info("Voice transcript similarity below threshold (best=%.3f, threshold=%.3f)", best, VOICE_TEXT_SIMILARITY_THRESHOLD)
 
+        provided_hash = _normalize_voice_hash(voice_sample_hash)
+        if not provided_hash and provided_text:
+            provided_hash = _hash_normalized_text(provided_text)
+
         # Fallback to hash matching
         for s in samples:
-            if self._compare_voice_hashes(s.get("hash") or "", voice_sample_hash or ""):
+            if self._compare_voice_hashes(s.get("hash") or "", provided_hash or ""):
                 return True
         return False
 
@@ -361,7 +408,10 @@ class VoiceAuth:
             if hashed != user.get("password_hash"):
                 return False, "Password incorrect"
         # Verify voice sample
-        if not self._voice_match(user, voice_sample_hash, voice_sample_text=voice_sample_text):
+        normalized_hash = _normalize_voice_hash(voice_sample_hash)
+        if not normalized_hash and voice_sample_text:
+            normalized_hash = _hash_normalized_text(voice_sample_text)
+        if not self._voice_match(user, normalized_hash, voice_sample_text=voice_sample_text):
             return False, "Voice sample did not match (try speaking the same short phrase clearly)"
         # Create session
         session_id = self._create_session(username_l)

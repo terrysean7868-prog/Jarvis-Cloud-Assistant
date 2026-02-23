@@ -20,10 +20,12 @@ import {
   API_URL,
   getNotificationsWsUrl,
   stopTask,
+  getAdminUpdateHistory,
 } from "./utils/api";
 import "./styles/jarvis.css";
 import AuthModal from "./components/AuthModal";
 import JarvisDashboard from "./components/JarvisDashboard";
+import UpdateManagementConsole from "./components/UpdateManagementConsole";
 
 const scheduleIdle = (fn, timeout = 800) => {
   if (typeof window === "undefined") return setTimeout(fn, 0);
@@ -145,6 +147,7 @@ export default function App() {
   const [, setPermissions] = useState(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
+  const [showUpdateConsole, setShowUpdateConsole] = useState(false);
 
   useEffect(() => {
     const nm = (assistantName || "Jarvis").toString().trim() || "Jarvis";
@@ -448,6 +451,16 @@ export default function App() {
     };
   }, [isAuthenticated, sessionId, addLog]);
 
+  const refreshTasksNow = useCallback(async () => {
+    if (!isAuthenticated) return;
+    try {
+      const res = await getTasks(sessionId);
+      setTasks(Array.isArray(res?.tasks) ? res.tasks : []);
+    } catch {
+      setTasks([]);
+    }
+  }, [isAuthenticated, sessionId]);
+
   useEffect(() => {
     if (!isAuthenticated) return;
     let cancelled = false;
@@ -469,7 +482,22 @@ export default function App() {
       cancelled = true;
       try { clearInterval(id); } catch {}
     };
-  }, [isAuthenticated, sessionId]);
+  }, [isAuthenticated, sessionId, refreshTasksNow]);
+
+  useEffect(() => {
+    if (!(isAuthenticated && role === "admin" && sessionId)) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        await getAdminUpdateHistory(sessionId, 1, 12000);
+      } catch {
+        if (!cancelled) addLog("system", "Admin update console API unavailable or unauthorized.");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, role, sessionId, addLog]);
 
   const startWakeSessionWindow = useCallback(() => {
     const until = Date.now() + WAKE_SESSION_MS;
@@ -1921,6 +1949,33 @@ export default function App() {
           />
         )}
       </Suspense>
+
+      {isAuthenticated && role === "admin" && (
+        <>
+          <div style={{ position: "fixed", top: 20, left: 20, zIndex: 16 }}>
+            <button
+              onClick={() => setShowUpdateConsole((prev) => !prev)}
+              style={{
+                background: "rgba(0,234,255,0.12)",
+                border: "1px solid var(--jarvis-accent)",
+                color: "var(--jarvis-accent)",
+                borderRadius: 10,
+                padding: "8px 12px",
+                cursor: "pointer",
+              }}
+            >
+              {showUpdateConsole ? "Hide" : "Open"} Update Console
+            </button>
+          </div>
+
+          <UpdateManagementConsole
+            sessionId={sessionId}
+            isOpen={showUpdateConsole}
+            onClose={() => setShowUpdateConsole(false)}
+            onTasksChanged={refreshTasksNow}
+          />
+        </>
+      )}
 
 
       {isAuthenticated && username && (

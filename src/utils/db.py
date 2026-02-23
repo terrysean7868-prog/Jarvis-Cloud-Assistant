@@ -1,5 +1,6 @@
 from pymongo import MongoClient, ASCENDING, DESCENDING, IndexModel
-from datetime import datetime
+from pymongo.errors import PyMongoError
+from datetime import datetime, UTC
 import os
 import sqlite3
 from pathlib import Path
@@ -10,6 +11,7 @@ from bson import ObjectId
 from urllib.parse import quote_plus, urlparse
 import threading
 import time
+import atexit
 
 load_dotenv()
 
@@ -43,6 +45,17 @@ class Database:
         self._reconnect_thread = None
         self._reconnect_lock = threading.Lock()
         self._stop_reconnect = False
+        self._atexit_registered = False
+        self._register_atexit()
+
+    def _register_atexit(self):
+        if self._atexit_registered:
+            return
+        try:
+            atexit.register(self.close)
+            self._atexit_registered = True
+        except Exception:
+            self._atexit_registered = False
     
     def _ensure_connected(self):
         """Ensure database is connected before use."""
@@ -101,7 +114,7 @@ class Database:
             self._setup_collections()
             print("[DB] SUCCESS - Connected to MongoDB")
 
-        except Exception as e:
+        except (ValueError, PyMongoError, OSError) as e:
             self._error = str(e)
             print(f"[DB] ERROR: Failed to connect to MongoDB: {str(e)[:200]}")
             print(f"[DB] Make sure MongoDB is running locally or set MONGODB_URI to your Atlas cluster")
@@ -258,7 +271,7 @@ class Database:
                 if self.client:
                     print("[DB] Reconnected to MongoDB")
                     break
-            except Exception:
+            except (PyMongoError, OSError):
                 pass
             # backoff with cap
             sleep_sec = min(10 + attempt * 5, 60)
@@ -272,6 +285,18 @@ class Database:
                 self._reconnect_thread.join(timeout=1)
         except Exception:
             pass
+
+    def close(self):
+        """Stop reconnect loop and close Mongo client (best-effort)."""
+        self.stop_reconnect()
+        try:
+            if self.client is not None:
+                self.client.close()
+        except (PyMongoError, OSError):
+            pass
+        finally:
+            self.client = None
+            self.db = None
     
     def save_chat(self, user_input, bot_response, session_id=None, intent=None, context=None):
         """
@@ -289,7 +314,7 @@ class Database:
             return None
         collection = self.db.chat_history
         doc = {
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.now(UTC),
             'session_id': session_id or ObjectId(),
             'user_input': user_input,
             'bot_response': bot_response,
@@ -317,7 +342,7 @@ class Database:
             return None
         collection = self.db.system_events
         doc = {
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.now(UTC),
             'event_type': event_type,
             'description': description,
             'status': status,
@@ -423,7 +448,7 @@ class Database:
                 return False
             doc = {**state}
             doc["state_key"] = key
-            doc["updated_at"] = datetime.utcnow().isoformat()
+            doc["updated_at"] = datetime.now(UTC).isoformat()
             self.db.local_reasoner_state.update_one(
                 {"state_key": key},
                 {"$set": doc},
@@ -454,7 +479,7 @@ class Database:
 
         collection = self.db.learning_examples
         doc = {
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.now(UTC),
             "user_id": user_id,
             "prompt": prompt,
             "completion": completion,
@@ -517,7 +542,7 @@ class Database:
             if ids:
                 collection.update_many(
                     {"_id": {"$in": ids}},
-                    {"$inc": {"usage_count": 1}, "$set": {"last_used": datetime.utcnow()}},
+                    {"$inc": {"usage_count": 1}, "$set": {"last_used": datetime.now(UTC)}},
                 )
         except Exception:
             pass
@@ -640,7 +665,7 @@ class Database:
         """
         collection = self.db.voice_commands
         doc = {
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.now(UTC),
             'command_text': command_text,
             'command_type': command_type,
             'status': status,
@@ -664,7 +689,7 @@ class Database:
         """
         collection = self.db.module_changes
         doc = {
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.now(UTC),
             'module_name': module_name,
             'change_type': change_type,
             'content': content,
@@ -688,7 +713,7 @@ class Database:
         """
         collection = self.db.git_operations
         doc = {
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.now(UTC),
             'commit_hash': commit_hash,
             'message': message,
             'status': status,

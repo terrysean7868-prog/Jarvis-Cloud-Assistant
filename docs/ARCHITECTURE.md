@@ -1,6 +1,6 @@
 # Jarvis Cloud Assistant — Architecture & Working Flow
 
-Last updated: 2026-02-12
+Last updated: 2026-02-23
 
 This document is the **single high-level reference** for how the system is built (technology stack), how it runs (working flow), and where the core business logic lives. It is written to be readable by humans *and* AI agents doing maintenance.
 
@@ -17,7 +17,7 @@ This document is the **single high-level reference** for how the system is built
 
 ### LLM Providers
 - **OpenAI-compatible Chat Completions API** via `src/core/llm_adapter.py`
-  - Primary defaults: model `gpt-4o`, endpoint `https://api.openai.com/v1/chat/completions`
+  - Primary defaults: model `gpt-5.2`, endpoint `https://api.openai.com/v1/chat/completions`
   - Backup defaults: Groq OpenAI-compatible endpoint
 
 ### Frontend (Web UI)
@@ -33,8 +33,19 @@ This document is the **single high-level reference** for how the system is built
 
 ### Packaging / Desktop
 - PyInstaller specs:
-  - `JarvisDesktop.spec`: packages desktop shell and embeds frontend build
+  - `JarvisDesktop.spec`: packages desktop app from `apps/desktop/desktop_app.py` and embeds frontend build
   - `JarvisPCAgent.spec`: packages PC agent UI app
+
+Desktop app implementation update (2026-02-23):
+- The desktop runtime has been consolidated into a single implementation:
+  - `apps/desktop/desktop_app.py`
+- Legacy launch files remain as compatibility wrappers only:
+  - `apps/desktop/jarvis_web_shell.py`
+  - `apps/desktop/jarvis_desktop.py`
+- Build automation for latest desktop package:
+  - `scripts/build_desktop_app.py`
+  - `build_desktop_app.bat`
+  - This flow rebuilds frontend production assets and then runs PyInstaller, so each build includes the latest code.
 
 ### MCP (Optional)
 - Separate MCP server under `mcp_server/` (FastAPI + MCP tool registrations)
@@ -248,6 +259,7 @@ Core pipeline:
 Auth/session:
 - `src/utils/auth_tokens.py` (JWT)
 - `src/utils/session_manager.py` (legacy file-based sessions)
+- `src/api/session_routes.py` (session route composition extracted from `apps/web/app.py`)
 
 Frontend:
 - `jarvis-frontend/src/utils/api.js` (all API + WS URLs)
@@ -256,6 +268,11 @@ Frontend:
 PC agent UI / packaging:
 - `apps/pc_agent/pc_agent_app.py` (legacy alias: `pc_agent_app.py`), `assets/pc_agent_ui.html`
 - `JarvisDesktop.spec`, `JarvisPCAgent.spec`
+
+Desktop app:
+- `apps/desktop/desktop_app.py` — canonical desktop app implementation
+- `apps/desktop/jarvis_web_shell.py` — compatibility launcher
+- `apps/desktop/jarvis_desktop.py` — compatibility launcher
 
 ---
 
@@ -281,3 +298,5 @@ PC agent UI / packaging:
 
 ## 9) Change Log (keep it short)
 - 2026-02-06: Initial architecture + working-flow documentation created.
+- 2026-02-23: Replaced legacy multi-implementation desktop app with a unified `desktop_app.py` runtime and kept old desktop entrypoints as wrappers for backward compatibility.
+- 2026-02-23: Updated `JarvisDesktop.spec` to package `desktop_app.py` directly and added one-command desktop builder scripts (`scripts/build_desktop_app.py`, `build_desktop_app.bat`).

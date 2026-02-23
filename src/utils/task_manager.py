@@ -299,6 +299,67 @@ class TaskManager:
             except Exception:
                 pass
         return self.tasks
+
+    def delete_tasks_by_title(
+        self,
+        title: str,
+        *,
+        owner: Optional[str] = None,
+        is_admin: bool = False,
+    ) -> Dict:
+        """Delete tasks by title/description text match.
+
+        Title is matched case-insensitively against:
+        - task description
+        - meta.module_title
+        """
+        needle = (title or "").strip().lower()
+        if not needle:
+            return {"status": "error", "message": "title is required", "deleted": 0, "task_ids": []}
+
+        owner_norm = (owner or "").strip().lower()
+
+        removed_ids: List[str] = []
+        kept: List[Dict] = []
+
+        for task in (self.get_all_tasks() or []):
+            if not isinstance(task, dict):
+                continue
+
+            meta = task.get("meta") if isinstance(task.get("meta"), dict) else {}
+            task_owner = (meta.get("user_id") or "").strip().lower() if isinstance(meta, dict) else ""
+            if (not is_admin) and owner_norm and task_owner and task_owner != owner_norm:
+                kept.append(task)
+                continue
+
+            description = str(task.get("description") or "").strip().lower()
+            module_title = str(meta.get("module_title") or "").strip().lower() if isinstance(meta, dict) else ""
+            if (needle in description) or (needle in module_title):
+                tid = str(task.get("id") or "").strip()
+                if tid:
+                    removed_ids.append(tid)
+                continue
+
+            kept.append(task)
+
+        if not removed_ids:
+            return {"status": "error", "message": "No matching task found", "deleted": 0, "task_ids": []}
+
+        self.tasks = kept
+        if self._use_mongo():
+            try:
+                db._ensure_connected()
+                if db.db is not None:
+                    db.db.tasks.delete_many({"id": {"$in": removed_ids}})
+            except Exception:
+                pass
+        self._save_tasks()
+        return {
+            "status": "success",
+            "message": f"Deleted {len(removed_ids)} task(s)",
+            "deleted": len(removed_ids),
+            "task_ids": removed_ids,
+        }
     
     def save_wakeup_context(self, prompt: str, response: str, actions: List[Dict]):
         """Save context for wakeup command mapping"""

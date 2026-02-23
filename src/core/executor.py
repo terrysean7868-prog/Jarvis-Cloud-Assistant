@@ -326,7 +326,7 @@ class ActionExecutor:
                 description = action.get("description", "")
                 file_path = action.get("file_path", "")
                 if description and file_path:
-                    result = self_update_file(description, file_path)
+                    result = self_update_file(description, file_path, actor=(user or "user"))
                     results.append(result)
                     if result.get("status") == "success":
                         changed_files.append(result.get("path", ""))
@@ -343,7 +343,7 @@ class ActionExecutor:
                     continue
                 description = action.get("description", "")
                 feature_type = action.get("feature_type", "module")
-                result = self_add_feature(description, feature_type)
+                result = self_add_feature(description, feature_type, actor=(user or "user"))
                 results.append(result)
                 if result.get("status") == "success":
                     changed_files.append(result.get("path", ""))

@@ -55,6 +55,12 @@ AUTO_FETCH_LINKS_MODE: str = "always"  # "always" | "never" | "ask"
 AUTO_FETCH_LINKS_MAX: int = 1
 AUTO_FETCH_WIKIPEDIA_LINKS_ONLY: bool = False
 
+# Global factual mode (all topics): prefer web-backed answers over memory-only responses.
+# Note: no AI system can guarantee 100% correctness, but this mode maximizes reliability.
+GLOBAL_FACTUAL_MODE: bool = True
+GLOBAL_FACTUAL_REQUIRE_SOURCES: bool = True
+GLOBAL_FACTUAL_INCLUDE_CONFIDENCE: bool = True
+
 RETURN_ACTION_RESULTS: bool = False
 FETCH_URL_CACHE_SECONDS: int = 600
 
@@ -144,6 +150,20 @@ ENABLE_BACKGROUND_ANALYSIS_JOB: bool = True
 ENABLE_LOCAL_REASONER_PREWARM_JOB: bool = True
 ENABLE_MEMORY_OPTIMIZATION: bool = False
 ENABLE_TRAINING_DATA_JOB: bool = False
+
+# Progressive daily LLM/brain update job.
+# Goal: gradual quality improvements without requiring manual voice update each day.
+ENABLE_PROGRESSIVE_LLM_UPDATE_JOB: bool = True
+PROGRESSIVE_LLM_UPDATE_INTERVAL_SECONDS: int = 86400
+PROGRESSIVE_LLM_UPDATE_TARGET_FILES_CSV: str = "src/core/llm_adapter.py,src/core/jarvis_brain.py"
+PROGRESSIVE_LLM_UPDATE_DRY_RUN: bool = False
+PROGRESSIVE_LLM_UPDATE_AUTO_INSTALL_DEPS: bool = False
+PROGRESSIVE_LLM_UPDATE_ACTOR: str = "scheduler"
+PROGRESSIVE_LLM_UPDATE_DESCRIPTION: str = (
+    "Apply a small, safe, incremental improvement to reasoning quality, fallback reliability, "
+    "clarification quality, and response consistency while preserving existing behavior and APIs. "
+    "Avoid large refactors and keep changes minimal and production-safe."
+)
 
 WIKI_TRAINING_INTERVAL_SECONDS: int = 3600
 BACKGROUND_ANALYSIS_INTERVAL_SECONDS: int = 1800
