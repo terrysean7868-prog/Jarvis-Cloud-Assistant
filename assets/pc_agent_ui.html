@@ -444,8 +444,13 @@
                         toast('Tip: for local Shared Secret mode set Device ID to "primary"', 'warn', 3600);
                     }
                     toast('Starting agent…', 'warn', 1600);
-                    window.pywebview.api.start_agent(cfg).then(function () {
-                        toast('Starting agent…', 'good');
+                    window.pywebview.api.start_agent(cfg).then(function (res) {
+                        if (res && res.ok) {
+                            toast('Starting agent…', 'good');
+                            return;
+                        }
+                        var msg = (res && (res.message || res.error)) ? String(res.message || res.error) : 'Start failed';
+                        toast(msg, 'bad', 3800);
                     }).catch(function () {
                         toast('Start failed', 'bad');
                     });

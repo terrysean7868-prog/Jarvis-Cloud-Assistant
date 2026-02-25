@@ -426,7 +426,15 @@ export default function App() {
           if (did) localStorage.setItem("jarvis_device_id", did);
         } catch {}
         try {
-          sessionStorage.setItem(`jarvis_agent_cfg_${sessionId}`, JSON.stringify({ agent_token: nextToken, agent_shared_secret: nextSecret }));
+          sessionStorage.setItem(
+            `jarvis_agent_cfg_${sessionId}`,
+            JSON.stringify({
+              agent_token: nextToken,
+              agent_shared_secret: nextSecret,
+              server_url: nextServerUrl,
+              ws_url: nextWsUrl,
+            })
+          );
         } catch {}
       } catch (e) {
         if (cancelled) return;
@@ -1952,7 +1960,7 @@ export default function App() {
 
       {isAuthenticated && role === "admin" && (
         <>
-          <div style={{ position: "fixed", top: 20, left: 20, zIndex: 16 }}>
+          <div style={{ position: "fixed", bottom: 20, left: 20, zIndex: 16 }}>
             <button
               onClick={() => setShowUpdateConsole((prev) => !prev)}
               style={{
@@ -2063,20 +2071,31 @@ export default function App() {
             onPointerDown={(e) => {
               if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
               try { e.preventDefault(); } catch {}
+              try {
+                if (typeof e.pointerId === "number" && e.currentTarget?.setPointerCapture) {
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                }
+              } catch {}
               startHoldToTalk();
             }}
             onPointerUp={(e) => {
               if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
               try { e.preventDefault(); } catch {}
+              try {
+                if (typeof e.pointerId === "number" && e.currentTarget?.releasePointerCapture) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              } catch {}
               stopHoldToTalk();
             }}
-            onPointerCancel={() => {
+            onPointerCancel={(e) => {
               if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+              try {
+                if (typeof e.pointerId === "number" && e.currentTarget?.releasePointerCapture) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              } catch {}
               stopHoldToTalk();
-            }}
-            onPointerLeave={() => {
-              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-              if (pttHolding) stopHoldToTalk();
             }}
             onKeyDown={(e) => {
               if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;

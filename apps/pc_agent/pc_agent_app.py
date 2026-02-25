@@ -1,5 +1,6 @@
 import argparse
 import json
+import base64
 import logging
 import os
 import queue
@@ -137,6 +138,34 @@ def _clean_cfg_str(value: object) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         s = s[1:-1].strip()
     return s
+
+
+def _decode_jwt_payload_unverified(token: str) -> dict:
+    raw = str(token or "").strip()
+    if not raw or raw.count(".") < 2:
+        return {}
+    try:
+        parts = raw.split(".")
+        payload_part = parts[1]
+        pad = "=" * (-len(payload_part) % 4)
+        decoded = base64.urlsafe_b64decode((payload_part + pad).encode("utf-8"))
+        obj = json.loads(decoded.decode("utf-8", errors="ignore"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _sanitize_agent_token(token: str) -> tuple[str, str | None]:
+    cleaned = _clean_cfg_str(token)
+    if not cleaned:
+        return "", None
+
+    payload = _decode_jwt_payload_unverified(cleaned)
+    token_typ = str((payload or {}).get("typ") or "").strip().lower()
+    if token_typ and token_typ != "agent":
+        return "", "Provided token appears to be a login/session token, not an agent token. Open Jarvis -> PC agent panel and copy agent_token from /api/agent/config."
+
+    return cleaned, None
 
 
 def _find_webview2_runtime_exe() -> Optional[Path]:
@@ -1126,6 +1155,17 @@ def run_ui() -> int:
 
             def start_agent(self, cfg_dict: dict) -> dict:
                 cfg_dict = cfg_dict or {}
+                safe_token, warn = _sanitize_agent_token(str(cfg_dict.get("agent_token") or ""))
+                cfg_dict["agent_token"] = safe_token
+                if warn:
+                    try:
+                        log_q.put_nowait(f"[{_now_hms()}] WARNING: {warn}")
+                    except Exception:
+                        pass
+
+                if not safe_token and not _clean_cfg_str(cfg_dict.get("shared_secret")):
+                    return {"ok": False, "error": "missing_agent_auth", "message": "Provide agent_token (recommended) or shared_secret."}
+
                 _save_cfg(cfg_dict)
                 sup.start(_current_run_cfg(cfg_dict))
                 return {"ok": True}
@@ -1448,10 +1488,32 @@ def run_ui() -> int:
                 _toast("Saved")
 
             def _start() -> None:
-                _save()
+                raw_token = token_var.get() or ""
+                safe_token, warn = _sanitize_agent_token(raw_token)
+                if warn:
+                    try:
+                        log_q.put_nowait(f"[{_now_hms()}] WARNING: {warn}")
+                    except Exception:
+                        pass
+                    token_var.set("")
+
+                if (not safe_token) and (not _clean_cfg_str(secret_var.get())):
+                    _toast("Provide Agent token or Shared secret")
+                    return
+
+                _save_cfg(
+                    {
+                        "server_url": server_var.get(),
+                        "device_id": device_var.get(),
+                        "agent_token": safe_token,
+                        "shared_secret": secret_var.get(),
+                        "loop_mode": bool(loop_var.get()),
+                        "auto_start": bool(auto_var.get()),
+                    }
+                )
                 sup.start(
                     AgentRunConfig(
-                        token=token_var.get() or "",
+                        token=safe_token,
                         shared_secret=secret_var.get() or "",
                         server_url=server_var.get() or "",
                         device_id=device_var.get() or "",

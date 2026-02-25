@@ -5,9 +5,35 @@ import sys
 from pathlib import Path
 
 
+def resolve_executable(name: str) -> str:
+    if sys.platform.startswith("win"):
+        if name.lower() == "npm":
+            npm_cmd = shutil.which("npm.cmd")
+            if npm_cmd:
+                return npm_cmd
+        if name.lower() == "pyinstaller":
+            pyinstaller_exe = shutil.which("pyinstaller.exe")
+            if pyinstaller_exe:
+                return pyinstaller_exe
+
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+
+    raise FileNotFoundError(f"Executable not found in PATH: {name}")
+
+
 def run(cmd: list[str], cwd: Path) -> None:
+    executable = resolve_executable(cmd[0])
+    safe_cmd = [executable, *cmd[1:]]
     print(f"[RUN] {' '.join(cmd)}")
-    proc = subprocess.run(cmd, cwd=str(cwd))
+    try:
+        proc = subprocess.run(safe_cmd, cwd=str(cwd))
+    except FileNotFoundError:
+        raise SystemExit(
+            f"Required command not found: {cmd[0]}\n"
+            "Install it and ensure it is in PATH, then re-run the build."
+        )
     if proc.returncode != 0:
         raise SystemExit(proc.returncode)
 
@@ -32,7 +58,14 @@ def main() -> int:
         run(["npm", "run", "build"], cwd=frontend_dir)
 
     if not args.skip_clean:
-        for path in [repo_root / "build" / "Jarvis", repo_root / "dist" / "Jarvis", repo_root / "dist" / "Jarvis.exe"]:
+        for path in [
+            repo_root / "build" / "Jarvis",
+            repo_root / "build" / "JarvisDesktop",
+            repo_root / "dist" / "Jarvis",
+            repo_root / "dist" / "JarvisDesktop",
+            repo_root / "dist" / "Jarvis.exe",
+            repo_root / "dist" / "JarvisDesktop.exe",
+        ]:
             try:
                 if path.is_dir():
                     shutil.rmtree(path, ignore_errors=True)

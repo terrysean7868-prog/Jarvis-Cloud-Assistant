@@ -91,6 +91,10 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
       .toLowerCase()
       .replace(/\s+/g, " ")
       .trim();
+    if (!normalized) return "";
+    if (!crypto?.subtle?.digest) {
+      throw new Error("SHA-256 is not available in this browser context");
+    }
     const encoder = new TextEncoder();
     const data = encoder.encode(normalized);
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
@@ -177,11 +181,7 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
               // Fallback: hash frequency samples
               const combined = samples.flat().join('');
               try {
-                const encoder = new TextEncoder();
-                const data = encoder.encode(combined);
-                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-                const hashArray = Array.from(new Uint8Array(hashBuffer));
-                const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                const hash = await createTextHash(combined);
                 const pcm = await pcmPromise.catch(() => ({ audio_b64: null, sample_rate_hz: 16000 }));
                 resolve({
                   voice_hash: hash,
@@ -193,7 +193,7 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
                 console.error("Hash creation failed:", err);
                 const pcm = await pcmPromise.catch(() => ({ audio_b64: null, sample_rate_hz: 16000 }));
                 resolve({
-                  voice_hash: btoa(combined).substring(0, 64),
+                  voice_hash: null,
                   voice_text: null,
                   audio_b64: pcm?.audio_b64 || null,
                   sample_rate_hz: pcm?.sample_rate_hz || 16000,
@@ -223,6 +223,13 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
 
     const voiceSample = await recordVoiceSample();
     if (!voiceSample || !voiceSample.voice_hash) {
+      setError("Could not capture a stable voice hash. Please speak clearly and try again.");
+      return;
+    }
+
+    const hash = String(voiceSample.voice_hash || "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(hash)) {
+      setError("Invalid voice hash captured. Please retry voice authentication.");
       return;
     }
 
@@ -235,7 +242,7 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           username: username.trim(),
-          voice_sample_hash: voiceSample.voice_hash,
+          voice_sample_hash: hash,
           voice_sample_text: voiceSample.voice_text,
           audio_b64: voiceSample.audio_b64 || null,
           sample_rate_hz: voiceSample.sample_rate_hz || 16000,

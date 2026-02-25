@@ -10,7 +10,7 @@ import base64
 import secrets
 from datetime import timedelta, timezone
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -237,6 +237,7 @@ DEVICE_OWNER_USERNAME = env.get_str("JARVIS_DEVICE_OWNER_USERNAME", "")
 LOCAL_DEFAULT_DEVICE_FALLBACK = env.get_bool("JARVIS_LOCAL_DEFAULT_DEVICE_FALLBACK", True)
 ADMIN_USERNAME = (env.get_str("JARVIS_ADMIN_USERNAME", "admin") or "admin").strip().lower()
 ADMIN_BOOTSTRAP_SECRET = env.get_str("JARVIS_ADMIN_BOOTSTRAP_SECRET", "")
+VOICE_BIOMETRICS_STRICT_LOGIN = env.get_bool("JARVIS_VOICE_BIOMETRICS_STRICT_LOGIN", False)
 
 # =========================================================
 # Small in-memory caches for hot paths
@@ -411,8 +412,37 @@ if (not CLOUD_MODE) and (not (os.getenv("JARVIS_JWT_SECRET") or "").strip()):
 
 auth_tokens = AuthTokens()
 
-PUBLIC_SERVER_URL = (env.get_str("JARVIS_PUBLIC_SERVER_URL", "https://jarvis-cloud-assistant.onrender.com") or "https://jarvis-cloud-assistant.onrender.com").strip().rstrip("/")
+PUBLIC_SERVER_URL = (env.get_str("JARVIS_PUBLIC_SERVER_URL", "") or "").strip().rstrip("/")
 AGENT_TOKEN_TTL_SECONDS = env.get_int("JARVIS_AGENT_TOKEN_TTL_SECONDS", 2592000)  # 30d
+
+
+def _effective_server_url(request: Request | None) -> str:
+    """Best-effort server base URL for agent bootstrap payloads.
+
+    Priority:
+    1) Explicit JARVIS_PUBLIC_SERVER_URL (always wins)
+    2) In local/non-cloud mode, derive from the current request host/scheme
+    3) In cloud mode, derive from forwarded headers/request as fallback
+    """
+    if PUBLIC_SERVER_URL:
+        return PUBLIC_SERVER_URL
+
+    try:
+        if request is not None:
+            xf_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+            xf_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+            host = xf_host or (request.headers.get("host") or "").strip()
+            scheme = xf_proto or (request.url.scheme if request.url else "http")
+            if host:
+                return f"{scheme}://{host}".rstrip("/")
+            if request.base_url:
+                return str(request.base_url).rstrip("/")
+    except Exception:
+        pass
+
+    if CLOUD_MODE:
+        return "https://jarvis-cloud-assistant.onrender.com"
+    return "http://127.0.0.1:18001"
 
 def _get_principal(session_id: str | None) -> dict:
     """Return principal dict: {username, role, auth_type}.
@@ -1376,7 +1406,7 @@ class AgentConfigRequest(BaseModel):
 
 
 @app.post("/api/agent/config")
-async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTasks):
+async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTasks, request: Request):
     """Return agent connection config stored in MongoDB.
 
     This avoids keeping secrets in local .env files. The server issues a JWT agent token
@@ -1421,6 +1451,8 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
     except Exception:
         pass
 
+    server_url = _effective_server_url(request)
+
     # Record config in MongoDB (no secrets stored).
     # Do this in a background task so the UI gets the token immediately.
     def _persist_agent_cfg():
@@ -1434,7 +1466,7 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
                     "$set": {
                         "device_id": did,
                         "owner_username": username if role != "admin" else (_get_device_owner(did) or None),
-                        "server_url": PUBLIC_SERVER_URL,
+                        "server_url": server_url,
                         "updated_at": datetime.utcnow(),
                         "updated_by": username,
                     },
@@ -1451,11 +1483,11 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
         pass
 
     token = _issue_agent_token(device_id=did, owner_username=username)
-    ws_url = ("wss://" + PUBLIC_SERVER_URL[len("https://"):] + "/ws/agent") if PUBLIC_SERVER_URL.startswith("https://") else ("ws://" + PUBLIC_SERVER_URL[len("http://"):] + "/ws/agent")
+    ws_url = ("wss://" + server_url[len("https://"):] + "/ws/agent") if server_url.startswith("https://") else ("ws://" + server_url[len("http://"):] + "/ws/agent")
     payload = {
         "status": "success",
         "device_id": did,
-        "server_url": PUBLIC_SERVER_URL,
+        "server_url": server_url,
         "ws_url": ws_url,
         "agent_token": token,
         "expires_in_seconds": max(300, AGENT_TOKEN_TTL_SECONDS),
@@ -3137,12 +3169,22 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
                                 }
                             ok, score = should_accept(emb, stored_vecs, threshold=VOICE_BIOMETRICS_THRESHOLD)
                             if not ok:
-                                return {
-                                    "status": "error",
-                                    "message": "Voice biometrics did not match this account.",
-                                    "code": "biometrics_mismatch",
-                                    "score": score,
-                                }
+                                if VOICE_BIOMETRICS_STRICT_LOGIN:
+                                    return {
+                                        "status": "error",
+                                        "message": "Voice biometrics did not match this account.",
+                                        "code": "biometrics_mismatch",
+                                        "score": score,
+                                    }
+                                try:
+                                    logging.getLogger(__name__).warning(
+                                        "Biometrics mismatch tolerated for user=%s score=%.3f threshold=%.3f",
+                                        uname,
+                                        float(score or 0.0),
+                                        float(VOICE_BIOMETRICS_THRESHOLD),
+                                    )
+                                except Exception:
+                                    pass
                         except Exception:
                             return {
                                 "status": "error",

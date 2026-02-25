@@ -44,6 +44,7 @@ class BackendRunner:
             port=self.port,
             log_level="warning",
             access_log=False,
+            log_config=None,
             lifespan="on",
             workers=1,
         )
@@ -112,8 +113,8 @@ def main() -> int:
         return 2
 
     os.environ["JARVIS_CLOUD_MODE"] = "false"
-    os.environ.setdefault("JARVIS_ENABLE_PC_AGENT", "false")
-    os.environ.setdefault("JARVIS_ENABLE_SCHEDULER", "false")
+    os.environ.setdefault("JARVIS_ENABLE_PC_AGENT", "true")
+    os.environ.setdefault("JARVIS_ENABLE_SCHEDULER", "true")
     os.environ.setdefault("JARVIS_DESKTOP_API_URL", url)
 
     backend = BackendRunner(host=host, port=port)
