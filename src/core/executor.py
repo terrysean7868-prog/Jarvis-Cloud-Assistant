@@ -637,14 +637,14 @@ class ActionExecutor:
         # === Git sync after changes (opt-in only, never in cloud) ===
         if changed_files and AUTO_GIT_SYNC and (not CLOUD_MODE):
             try:
-                print(f"🧩 Applying auto-sync for {len(changed_files)} modified files...")
+                print(f"[INFO] Applying auto-sync for {len(changed_files)} modified files...")
                 await asyncio.to_thread(
                     git_sync,  # call sync in a thread (non-blocking)
                     repo_path="."
                 )
-                print("✅ Auto-synced all changes to GitHub main branch.")
+                print("[OK] Auto-synced all changes to GitHub main branch.")
             except Exception as e:
-                print(f"⚠️ Git sync failed: {e}")
+                print(f"[WARN] Git sync failed: {e}")
                 results.append({
                     "status": "git_error",
                     "error": str(e)
@@ -746,7 +746,7 @@ class ActionExecutor:
             query = action.get("query", "")
             num_results = action.get("num_results", 5)
             
-            print(f"🔍 Searching web for: {query}")
+            print(f"[INFO] Searching web for: {query}")
             internet = await get_internet()
             results = await internet.search(query, num_results=num_results)
             
@@ -759,7 +759,7 @@ class ActionExecutor:
             }
             
         except Exception as e:
-            print(f"❌ Web search failed: {str(e)}")
+            print(f"[ERROR] Web search failed: {str(e)}")
             return {
                 "status": "error",
                 "action": "web_search",
@@ -802,7 +802,7 @@ class ActionExecutor:
                         out["cached"] = True
                         return out
             
-            print(f"📥 Fetching URL: {url}")
+            print(f"[INFO] Fetching URL: {url}")
             internet = await get_internet()
             result = await internet.fetch_webpage(url, include_content=True)
             
@@ -834,7 +834,7 @@ class ActionExecutor:
                 }
                 
         except Exception as e:
-            print(f"❌ URL fetch failed: {str(e)}")
+            print(f"[ERROR] URL fetch failed: {str(e)}")
             return {
                 "status": "error",
                 "action": "fetch_url",

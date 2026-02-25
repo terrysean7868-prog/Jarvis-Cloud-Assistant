@@ -486,7 +486,32 @@ export async function recordPcm16Once(options = {}) {
         }
 
         const resampled = _resampleToTarget(flat, ctx.sampleRate, sampleRateHz);
-        const pcm16 = _floatTo16BitPCM(resampled);
+
+        // If we never crossed the start threshold, treat as no usable speech.
+        if (!started) {
+          resolve({
+            audio_b64: null,
+            sample_rate_hz: sampleRateHz,
+          });
+          return;
+        }
+
+        const trimmed = _trimLeadingTrailingSilence(resampled, sampleRateHz, {
+          threshold: Math.max(0.004, Number(silenceRms) || 0.008),
+          padMs: 150,
+          minMs: 240,
+          maxTrimMs: maxMs,
+        });
+
+        if (!trimmed || !trimmed.length) {
+          resolve({
+            audio_b64: null,
+            sample_rate_hz: sampleRateHz,
+          });
+          return;
+        }
+
+        const pcm16 = _floatTo16BitPCM(trimmed);
         resolve({
           audio_b64: _arrayBufferToBase64(pcm16.buffer),
           sample_rate_hz: sampleRateHz,
