@@ -102,6 +102,23 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
     return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
   };
 
+  const getFriendlyAuthError = (data) => {
+    const code = String(data?.code || "").trim().toLowerCase();
+    if (code === "biometrics_audio_too_short") {
+      return "Voice sample too short. Hold the button a bit longer and speak your phrase clearly.";
+    }
+    if (code === "biometrics_audio_too_silent") {
+      return "Voice sample too quiet. Check mic access, move closer, and speak a little louder.";
+    }
+    if (code === "biometrics_audio_required") {
+      return "Microphone audio is required for biometrics. Please allow mic access and try again.";
+    }
+    if (code === "biometrics_extract_failed") {
+      return "Could not analyze this voice sample. Please retry in a quieter environment.";
+    }
+    return data?.message || "Authentication failed";
+  };
+
   const recordVoiceSample = async () => {
     if (!audioDataRef.current) {
       setError("Audio not initialized");
@@ -266,7 +283,7 @@ const AuthModal = ({ onAuthSuccess, onClose }) => {
           }
         });
       } else {
-        setError(data.message || "Authentication failed");
+        setError(getFriendlyAuthError(data));
         speak("Authentication failed. Please try again.");
       }
     } catch (err) {

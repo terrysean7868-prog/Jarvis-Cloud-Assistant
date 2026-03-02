@@ -237,7 +237,7 @@ DEVICE_OWNER_USERNAME = env.get_str("JARVIS_DEVICE_OWNER_USERNAME", "")
 LOCAL_DEFAULT_DEVICE_FALLBACK = env.get_bool("JARVIS_LOCAL_DEFAULT_DEVICE_FALLBACK", True)
 ADMIN_USERNAME = (env.get_str("JARVIS_ADMIN_USERNAME", "admin") or "admin").strip().lower()
 ADMIN_BOOTSTRAP_SECRET = env.get_str("JARVIS_ADMIN_BOOTSTRAP_SECRET", "")
-VOICE_BIOMETRICS_STRICT_LOGIN = env.get_bool("JARVIS_VOICE_BIOMETRICS_STRICT_LOGIN", False)
+VOICE_BIOMETRICS_STRICT_LOGIN = False
 
 # =========================================================
 # Small in-memory caches for hot paths
@@ -3162,11 +3162,19 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
                                 }
                             emb = compute_embedding_from_pcm16(audio_bytes, int(auth_req.sample_rate_hz or 16000))
                             if emb is None:
-                                return {
-                                    "status": "error",
-                                    "message": "Could not extract voice biometrics from this sample. Try again.",
-                                    "code": "biometrics_extract_failed",
-                                }
+                                if VOICE_BIOMETRICS_STRICT_LOGIN:
+                                    return {
+                                        "status": "error",
+                                        "message": "Could not extract voice biometrics from this sample. Try again.",
+                                        "code": "biometrics_extract_failed",
+                                    }
+                                try:
+                                    logging.getLogger(__name__).warning(
+                                        "Biometrics extraction failed but tolerated for user=%s (strict_login=false)",
+                                        uname,
+                                    )
+                                except Exception:
+                                    pass
                             ok, score = should_accept(emb, stored_vecs, threshold=VOICE_BIOMETRICS_THRESHOLD)
                             if not ok:
                                 if VOICE_BIOMETRICS_STRICT_LOGIN:
