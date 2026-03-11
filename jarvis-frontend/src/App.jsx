@@ -149,6 +149,14 @@ export default function App() {
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
   const [showUpdateConsole, setShowUpdateConsole] = useState(false);
+  const [activeDisplay, setActiveDisplay] = useState(() => {
+    try {
+      const saved = (localStorage.getItem("jarvis_active_display") || "").toString().trim().toLowerCase();
+      return saved === "autonomy" ? "autonomy" : "dashboard";
+    } catch {
+      return "dashboard";
+    }
+  });
 
   useEffect(() => {
     const nm = (assistantName || "Jarvis").toString().trim() || "Jarvis";
@@ -481,6 +489,12 @@ export default function App() {
       setTasks([]);
     }
   }, [isAuthenticated, sessionId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("jarvis_active_display", activeDisplay);
+    } catch {}
+  }, [activeDisplay]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -2022,6 +2036,36 @@ export default function App() {
       {isAuthenticated && username && (
         <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 8 }}>
+              <button
+                onClick={() => setActiveDisplay("dashboard")}
+                style={{
+                  background: activeDisplay === "dashboard" ? "rgba(0,234,255,0.16)" : "transparent",
+                  border: "1px solid var(--jarvis-accent)",
+                  color: "var(--jarvis-accent)",
+                  borderRadius: 999,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                Main View
+              </button>
+              <button
+                onClick={() => setActiveDisplay("autonomy")}
+                style={{
+                  background: activeDisplay === "autonomy" ? "rgba(0,234,255,0.16)" : "transparent",
+                  border: "1px solid var(--jarvis-accent)",
+                  color: "var(--jarvis-accent)",
+                  borderRadius: 999,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                Autonomy View
+              </button>
+            </div>
             <div style={{ width: 8, height: 8, borderRadius: 8, background: "var(--jarvis-accent)", boxShadow: "0 0 10px var(--jarvis-accent-glow)" }} />
             <span style={{ color: "var(--jarvis-accent)", fontSize: 14 }}>
               {username}{role ? ` (${role})` : ""}
@@ -2068,27 +2112,29 @@ export default function App() {
         </div>
       )}
 
-      <JarvisDashboard
-        isAuthenticated={isAuthenticated}
-        logs={logs}
-        tasks={tasks}
-        emotion={emotion}
-        listening={listening}
-        speaking={speaking}
-        volume={volume}
-        agentToken={agentToken}
-        agentSharedSecret={agentSharedSecret}
-        agentServerUrl={agentServerUrl}
-        agentWsUrl={agentWsUrl}
-        agentCfgLoaded={agentCfgLoaded}
-        agentCfgError={agentCfgError}
-        onConnectPcAgent={connectPcAgent}
-        systemInfo={systemInfo}
-        themeColor={themeColor}
-        onThemeColorChange={setThemeColor}
-      />
+      {activeDisplay !== "autonomy" && (
+        <JarvisDashboard
+          isAuthenticated={isAuthenticated}
+          logs={logs}
+          tasks={tasks}
+          emotion={emotion}
+          listening={listening}
+          speaking={speaking}
+          volume={volume}
+          agentToken={agentToken}
+          agentSharedSecret={agentSharedSecret}
+          agentServerUrl={agentServerUrl}
+          agentWsUrl={agentWsUrl}
+          agentCfgLoaded={agentCfgLoaded}
+          agentCfgError={agentCfgError}
+          onConnectPcAgent={connectPcAgent}
+          systemInfo={systemInfo}
+          themeColor={themeColor}
+          onThemeColorChange={setThemeColor}
+        />
+      )}
 
-      {isAuthenticated && (
+      {isAuthenticated && activeDisplay === "autonomy" && (
         <AutonomyDashboard
           sessionId={sessionId}
           logs={logs}
