@@ -24,7 +24,7 @@ const TABS = [
   "Self-Improvement",
 ];
 
-function normalizeGraph(goal) {
+function normalizeGraph(goal, accentColor = "#00eaff") {
   const reports = Array.isArray(goal?.reports) ? goal.reports : [];
   const graphReport = reports.find((r) => r && r.graph && Array.isArray(r.graph.nodes));
   const graph = graphReport?.graph || { nodes: [] };
@@ -41,8 +41,9 @@ function normalizeGraph(goal) {
         border: "1px solid rgba(255,255,255,0.2)",
         borderRadius: 8,
         padding: 6,
-        color: "#dbf7ff",
-        background: "rgba(8, 26, 41, 0.86)",
+        color: "rgba(235, 247, 255, 0.96)",
+        background: "rgba(4, 12, 22, 0.88)",
+        boxShadow: `0 0 0 1px ${accentColor}55 inset`,
       },
     });
 
@@ -61,6 +62,14 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
   const [goalInput, setGoalInput] = useState("");
   const [selectedGoalId, setSelectedGoalId] = useState("");
   const [error, setError] = useState("");
+
+  const accentColor = useMemo(() => {
+    try {
+      return getComputedStyle(document.documentElement).getPropertyValue("--jarvis-accent").trim() || "#00eaff";
+    } catch {
+      return "#00eaff";
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -104,14 +113,14 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
       datasets: [{
         label: "Goal Status",
         data: [running, pending, completed, failed, blocked],
-        borderColor: "#42d3ff",
-        backgroundColor: "rgba(66, 211, 255, 0.2)",
+        borderColor: accentColor,
+        backgroundColor: "rgba(0, 234, 255, 0.2)",
         tension: 0.35,
       }],
     };
-  }, [goals]);
+  }, [goals, accentColor]);
 
-  const graph = useMemo(() => normalizeGraph(selectedGoal || {}), [selectedGoal]);
+  const graph = useMemo(() => normalizeGraph(selectedGoal || {}, accentColor), [selectedGoal, accentColor]);
 
   const startGoal = async () => {
     if (!goalInput.trim()) return;
@@ -155,7 +164,7 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
         <h3 className="panel-title">Task Graph</h3>
         <div className="graph-wrap">
           <ReactFlow nodes={graph.nodes} edges={graph.edges} fitView>
-            <Background />
+            <Background color={accentColor} gap={18} size={1} />
             <Controls />
           </ReactFlow>
         </div>

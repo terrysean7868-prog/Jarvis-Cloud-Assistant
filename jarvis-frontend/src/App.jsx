@@ -649,9 +649,42 @@ export default function App() {
   const normalizeWake = useCallback((s) => {
     return String(s || "")
       .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
   }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated || !sessionId) return;
+    let cancelled = false;
+
+    const syncAssistantName = async () => {
+      try {
+        const r = await fetch(`${API_URL}/api/validate-session`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId })
+        });
+        const data = await r.json().catch(() => null);
+        if (cancelled || !data?.valid) return;
+        const nameFromApi = (data?.user?.assistant_name || "").toString().trim();
+        if (nameFromApi && nameFromApi !== assistantNameRef.current) {
+          setAssistantName(nameFromApi);
+          try { localStorage.setItem("jarvis_assistant_name", nameFromApi); } catch {}
+          addLog("system", `Wake name synced: ${nameFromApi}`);
+        }
+      } catch {
+        // keep last known assistant name
+      }
+    };
+
+    syncAssistantName();
+    const id = setInterval(syncAssistantName, 60000);
+    return () => {
+      cancelled = true;
+      try { clearInterval(id); } catch {}
+    };
+  }, [isAuthenticated, sessionId, addLog]);
 
   // Unlock voice on mobile with a first user gesture (no explicit button).
   useEffect(() => {
@@ -1691,6 +1724,17 @@ export default function App() {
         const inWakeSession = Date.now() < (wakeSessionUntilRef.current || 0);
 
         const nm = normalizeWake(assistantNameRef.current || "Jarvis");
+        const genericWakeNames = ["assistant", "jarvis", "computer", "system"];
+        const genericWakeHit = genericWakeNames.some((name) =>
+          transcript === name ||
+          transcript.includes(`hey ${name}`) ||
+          transcript.includes(`ok ${name}`) ||
+          transcript.includes(`okay ${name}`) ||
+          transcript.includes(`${name} wake up`) ||
+          transcript.includes(`wake up ${name}`) ||
+          transcript.includes(`${name} wakeup`) ||
+          transcript.includes(`wakeup ${name}`)
+        );
         const wakeByPhrase = transcript.includes("wake up") || transcript.includes("wakeup");
         const wakeByNamePhrase = nm && (
           transcript.includes(`${nm} wake up`) ||
@@ -1700,6 +1744,7 @@ export default function App() {
         );
         const wakeHit =
           (nm && (transcript.includes(`hey ${nm}`) || transcript.includes(`ok ${nm}`) || transcript.includes(`okay ${nm}`) || transcript === nm)) ||
+          genericWakeHit ||
           wakeByPhrase ||
           wakeByNamePhrase;
 
@@ -2242,7 +2287,7 @@ export default function App() {
             style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)", cursor: isAuthenticated ? "pointer" : "default" }}
           >
             <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
-              {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to wake up`}
+              {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' or 'Hey Assistant' to wake up`}
             </div>
 
           </div>

@@ -1,11 +1,18 @@
 .autonomy-shell {
-  margin: 18px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  position: fixed;
+  top: 72px;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 16px;
-  background: linear-gradient(140deg, rgba(5, 22, 35, 0.84), rgba(3, 10, 22, 0.88));
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
-  color: #d7f6ff;
+  background: linear-gradient(145deg, rgba(8, 18, 30, 0.86), rgba(4, 10, 18, 0.9));
+  box-shadow: 0 22px 56px rgba(0, 0, 0, 0.38), inset 0 0 40px rgba(var(--jarvis-accent-rgb, 0, 234, 255), 0.07);
+  color: rgba(230, 245, 255, 0.96);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  z-index: 11;
 }
 
 .autonomy-tabs {
@@ -14,13 +21,13 @@
   gap: 8px;
   padding: 14px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(6, 18, 30, 0.9);
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.24), rgba(0, 0, 0, 0.34));
 }
 
 .autonomy-tab {
-  border: 1px solid rgba(130, 220, 255, 0.28);
-  background: rgba(9, 27, 42, 0.55);
-  color: #a7f0ff;
+  border: 1px solid rgba(var(--jarvis-accent-rgb, 0, 234, 255), 0.42);
+  background: rgba(0, 0, 0, 0.28);
+  color: var(--jarvis-accent, #00eaff);
   border-radius: 999px;
   padding: 8px 14px;
   font-size: 12px;
@@ -28,14 +35,18 @@
 }
 
 .autonomy-tab.active {
-  color: #052033;
-  background: linear-gradient(180deg, #6de1ff, #30c6ff);
-  border-color: #6de1ff;
+  color: #001521;
+  background: linear-gradient(180deg, rgba(var(--jarvis-accent-rgb, 0, 234, 255), 0.92), rgba(var(--jarvis-accent-rgb, 0, 234, 255), 0.74));
+  border-color: var(--jarvis-accent, #00eaff);
   font-weight: 700;
+  box-shadow: 0 0 18px var(--jarvis-accent-glow, rgba(0, 234, 255, 0.45));
 }
 
 .autonomy-body {
   padding: 14px;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
 }
 
 .panel-grid {
@@ -45,8 +56,8 @@
 }
 
 .panel-card {
-  background: rgba(7, 23, 38, 0.72);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 12px;
   padding: 12px;
 }
@@ -54,7 +65,7 @@
 .panel-title {
   margin: 0 0 10px;
   font-size: 13px;
-  color: #90e7ff;
+  color: var(--jarvis-accent, #00eaff);
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
@@ -72,16 +83,16 @@
   flex: 1;
   border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(0, 0, 0, 0.25);
-  color: #dcf7ff;
+  background: rgba(0, 0, 0, 0.32);
+  color: rgba(235, 247, 255, 0.95);
   padding: 9px;
 }
 
 .panel-btn {
   border-radius: 10px;
-  border: 1px solid rgba(122, 220, 255, 0.45);
-  color: #dcf7ff;
-  background: rgba(6, 63, 97, 0.55);
+  border: 1px solid rgba(var(--jarvis-accent-rgb, 0, 234, 255), 0.5);
+  color: rgba(235, 247, 255, 0.96);
+  background: rgba(var(--jarvis-accent-rgb, 0, 234, 255), 0.18);
   padding: 8px 11px;
   cursor: pointer;
 }
@@ -101,7 +112,7 @@
   border-radius: 999px;
   padding: 4px 8px;
   border: 1px solid rgba(255, 255, 255, 0.16);
-  color: #d7f6ff;
+  color: rgba(235, 247, 255, 0.96);
 }
 
 .panel-list {
@@ -116,7 +127,7 @@
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 10px;
   padding: 9px;
-  background: rgba(0, 0, 0, 0.22);
+  background: rgba(0, 0, 0, 0.3);
 }
 
 .panel-item h4 {
@@ -127,24 +138,34 @@
 .panel-item p {
   margin: 0;
   font-size: 12px;
-  color: #b7e9f8;
+  color: rgba(192, 224, 244, 0.95);
 }
 
 .graph-wrap {
-  height: 340px;
+  height: min(52vh, 460px);
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   overflow: hidden;
-  background: rgba(0, 0, 0, 0.35);
+  background: rgba(0, 0, 0, 0.42);
 }
 
 .log-box {
   border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(0, 0, 0, 0.32);
+  background: rgba(0, 0, 0, 0.4);
   padding: 10px;
   max-height: 190px;
   overflow: auto;
   white-space: pre-wrap;
   font-size: 12px;
+}
+
+@media (max-width: 1024px) {
+  .autonomy-shell {
+    top: 66px;
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    border-radius: 12px;
+  }
 }

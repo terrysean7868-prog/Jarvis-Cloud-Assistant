@@ -12,9 +12,9 @@
   z-index: 11;
   pointer-events: auto;
 
-  border: 1px solid rgba(255, 255, 255, 0.10);
-  background: rgba(10, 10, 12, 0.22);
-  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(180deg, rgba(7, 14, 24, 0.72), rgba(5, 11, 18, 0.82));
+  backdrop-filter: blur(7px);
 }
 
 .jd-col {
@@ -162,7 +162,7 @@
 .jd-task {
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(0, 0, 0, 0.2);
+  background: rgba(0, 0, 0, 0.34);
   padding: 10px;
 }
 
@@ -257,7 +257,7 @@
   padding: 0 10px;
   border-radius: 10px;
   border: 1px solid var(--jarvis-accent);
-  background: rgba(0, 0, 0, 0.22);
+  background: rgba(0, 0, 0, 0.36);
   color: var(--jarvis-accent);
   cursor: pointer;
   font-family: Inter, system-ui, sans-serif;
@@ -357,7 +357,7 @@
 
 .jd-metric {
   border: 1px solid rgba(255, 255, 255, 0.10);
-  background: rgba(0, 0, 0, 0.18);
+  background: rgba(0, 0, 0, 0.32);
   border-radius: 12px;
   padding: 10px;
   min-width: 0;
