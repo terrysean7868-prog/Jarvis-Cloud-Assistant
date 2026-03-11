@@ -217,10 +217,12 @@ export default function App() {
     const g = parseInt(full.slice(3, 5), 16);
     const b = parseInt(full.slice(5, 7), 16);
     const glow = `rgba(${r}, ${g}, ${b}, 0.45)`;
+    const rgb = `${r}, ${g}, ${b}`;
 
     try {
       document.documentElement.style.setProperty("--jarvis-accent", full);
       document.documentElement.style.setProperty("--jarvis-accent-glow", glow);
+      document.documentElement.style.setProperty("--jarvis-accent-rgb", rgb);
     } catch {}
 
     try {
@@ -520,19 +522,23 @@ export default function App() {
   }, [isAuthenticated, sessionId, refreshTasksNow]);
 
   useEffect(() => {
-    if (!(isAuthenticated && role === "admin" && sessionId)) return;
+    if (!(isAuthenticated && role === "admin" && sessionId && showUpdateConsole)) return;
     let cancelled = false;
     (async () => {
       try {
         await getAdminUpdateHistory(sessionId, 1, 12000);
-      } catch {
-        if (!cancelled) addLog("system", "Admin update console API unavailable or unauthorized.");
+      } catch (e) {
+        if (cancelled) return;
+        const status = Number(e?.status || 0);
+        if (status !== 401 && status !== 403) {
+          addLog("system", "Admin update console API is currently unavailable.");
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, role, sessionId, addLog]);
+  }, [isAuthenticated, role, sessionId, showUpdateConsole, addLog]);
 
   const startWakeSessionWindow = useCallback(() => {
     const until = Date.now() + WAKE_SESSION_MS;
@@ -1448,6 +1454,19 @@ export default function App() {
     // Stop wake recognizer to avoid overlap.
     try { wakeRecognizer.current?.stop(); } catch {}
 
+    const startWebSpeechFallback = () => {
+      try {
+        const ws = startWebSpeechHold({ language: voiceLang, maxMs: isMobile ? 20000 : 25000 });
+        pttControllerRef.current = { kind: "webspeech", ctrl: ws, seq };
+        if (!ws) {
+          addLog("system", "SpeechRecognition not available for push-to-talk.");
+        }
+      } catch {
+        pttControllerRef.current = null;
+        addLog("system", "Could not start SpeechRecognition.");
+      }
+    };
+
     // Prefer the server audio path when available (best accuracy + required for biometrics).
     if (voiceBiometricsActive || googleSttEnabled) {
       try {
@@ -1469,27 +1488,21 @@ export default function App() {
 
         pttInitPromiseRef.current = null;
         pttControllerRef.current = { kind: "pcm", ctrl, seq };
-        if (!ctrl) addLog("system", "Microphone is not available for push-to-talk.");
+        if (!ctrl) {
+          addLog("system", "Microphone is not available for push-to-talk. Falling back to browser recognition.");
+          startWebSpeechFallback();
+        }
         return;
       } catch {
-        pttControllerRef.current = null;
+        addLog("system", "Could not start push-to-talk recording. Falling back to browser recognition.");
         pttInitPromiseRef.current = null;
-        addLog("system", "Could not start push-to-talk recording.");
+        startWebSpeechFallback();
         return;
       }
     }
 
     // Fallback: WebSpeech hold session.
-    try {
-      const ws = startWebSpeechHold({ language: voiceLang, maxMs: isMobile ? 20000 : 25000 });
-      pttControllerRef.current = { kind: "webspeech", ctrl: ws };
-      if (!ws) {
-        addLog("system", "SpeechRecognition not available for push-to-talk.");
-      }
-    } catch {
-      pttControllerRef.current = null;
-      addLog("system", "Could not start SpeechRecognition.");
-    }
+    startWebSpeechFallback();
   }, [addLog, googleSttEnabled, isAuthenticated, isMobile, pttHolding, voiceBiometricsActive, voiceLang]);
 
   const stopHoldToTalk = useCallback(async () => {
@@ -1544,9 +1557,25 @@ export default function App() {
             text = (resp?.text || "").toString().trim() || null;
           }
         } catch (e) {
-          addLog("error", e?.message || String(e));
-          try { wakeRecognizer.current?.start(); } catch {}
-          return;
+          if (voiceBiometricsActive) {
+            addLog("error", e?.message || String(e));
+            try { wakeRecognizer.current?.start(); } catch {}
+            return;
+          }
+
+          addLog("system", "Server speech recognition unavailable. Using browser recognition fallback.");
+          try {
+            text = await listenOnce({
+              timeout: isMobile ? 12000 : 9000,
+              silenceTimeoutMs: isIOS ? 1500 : 1100,
+              interim: false,
+              language: voiceLang,
+              maxAlternatives: 1,
+            });
+            text = (text || "").toString().trim() || null;
+          } catch {
+            text = null;
+          }
         }
 
         if (!text) {
@@ -1592,7 +1621,7 @@ export default function App() {
       addLog("error", e?.message || String(e));
       try { wakeRecognizer.current?.start(); } catch {}
     }
-  }, [addLog, handleVoiceCommand, pttHolding, sessionId, voiceBiometricsActive, voiceLang, startWakeSessionWindow]);
+  }, [addLog, handleVoiceCommand, isIOS, isMobile, pttHolding, sessionId, voiceBiometricsActive, voiceLang, startWakeSessionWindow]);
 
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
@@ -1662,10 +1691,17 @@ export default function App() {
         const inWakeSession = Date.now() < (wakeSessionUntilRef.current || 0);
 
         const nm = normalizeWake(assistantNameRef.current || "Jarvis");
+        const wakeByPhrase = transcript.includes("wake up") || transcript.includes("wakeup");
+        const wakeByNamePhrase = nm && (
+          transcript.includes(`${nm} wake up`) ||
+          transcript.includes(`wake up ${nm}`) ||
+          transcript.includes(`${nm} wakeup`) ||
+          transcript.includes(`wakeup ${nm}`)
+        );
         const wakeHit =
           (nm && (transcript.includes(`hey ${nm}`) || transcript.includes(`ok ${nm}`) || transcript.includes(`okay ${nm}`) || transcript === nm)) ||
-          transcript.includes("wake up") ||
-          transcript.includes("wakeup");
+          wakeByPhrase ||
+          wakeByNamePhrase;
 
         if (wakeHit) {
           // In biometrics mode, defer wake-session start and UI pulse until
@@ -2037,34 +2073,37 @@ export default function App() {
         <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 8 }}>
-              <button
-                onClick={() => setActiveDisplay("dashboard")}
-                style={{
-                  background: activeDisplay === "dashboard" ? "rgba(0,234,255,0.16)" : "transparent",
-                  border: "1px solid var(--jarvis-accent)",
-                  color: "var(--jarvis-accent)",
-                  borderRadius: 999,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                }}
-              >
-                Main View
-              </button>
-              <button
-                onClick={() => setActiveDisplay("autonomy")}
-                style={{
-                  background: activeDisplay === "autonomy" ? "rgba(0,234,255,0.16)" : "transparent",
-                  border: "1px solid var(--jarvis-accent)",
-                  color: "var(--jarvis-accent)",
-                  borderRadius: 999,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                }}
-              >
-                Autonomy View
-              </button>
+              {activeDisplay === "autonomy" ? (
+                <button
+                  onClick={() => setActiveDisplay("dashboard")}
+                  style={{
+                    background: "rgba(0,234,255,0.16)",
+                    border: "1px solid var(--jarvis-accent)",
+                    color: "var(--jarvis-accent)",
+                    borderRadius: 999,
+                    padding: "6px 10px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  Main View
+                </button>
+              ) : (
+                <button
+                  onClick={() => setActiveDisplay("autonomy")}
+                  style={{
+                    background: "rgba(0,234,255,0.16)",
+                    border: "1px solid var(--jarvis-accent)",
+                    color: "var(--jarvis-accent)",
+                    borderRadius: 999,
+                    padding: "6px 10px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  Autonomy View
+                </button>
+              )}
             </div>
             <div style={{ width: 8, height: 8, borderRadius: 8, background: "var(--jarvis-accent)", boxShadow: "0 0 10px var(--jarvis-accent-glow)" }} />
             <span style={{ color: "var(--jarvis-accent)", fontSize: 14 }}>

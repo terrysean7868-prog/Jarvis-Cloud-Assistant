@@ -656,7 +656,7 @@ export async function startPcm16Recorder(options = {}) {
 
         const resampled = _resampleToTarget(flat, ctx.sampleRate, sampleRateHz);
         const trimmed = _trimLeadingTrailingSilence(resampled, sampleRateHz, {
-          threshold: 0.008,
+          threshold: 0.004,
           padMs: 150,
           minMs: 240,
           maxTrimMs: maxMs,
@@ -738,7 +738,7 @@ export function startWebSpeechHold(options = {}) {
   const recognition = new SpeechRecognition();
   recognition.lang = language;
   recognition.continuous = true;
-  recognition.interimResults = false;
+  recognition.interimResults = true;
   recognition.maxAlternatives = 1;
 
   let settled = false;

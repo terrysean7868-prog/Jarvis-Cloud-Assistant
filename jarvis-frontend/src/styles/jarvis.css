@@ -2,6 +2,7 @@
 :root {
   --jarvis-accent: #00eaff;
   --jarvis-accent-glow: rgba(0, 234, 255, 0.45);
+  --jarvis-accent-rgb: 0, 234, 255;
 }
 
 /* Jarvis dark base */
@@ -10,7 +11,7 @@ html, body, #root, .jarvis-root {
   padding: 0;
   width: 100%;
   height: 100%;
-  background: radial-gradient(circle at center, #020607 0%, #000 100%);
+  background: transparent;
   color: var(--jarvis-accent, #00eaff);
   overflow: hidden;
 }
@@ -46,7 +47,7 @@ html, body, #root, .jarvis-root {
   overflow: hidden;
   min-height: 100vh;
   width: 100vw;
-  background: radial-gradient(circle at center, #001018 0%, #000000 100%);
+  background: radial-gradient(circle at center, rgba(var(--jarvis-accent-rgb), 0.14) 0%, rgba(var(--jarvis-accent-rgb), 0.03) 40%, rgba(var(--jarvis-accent-rgb), 0) 78%);
   transition: transform 0.3s ease-out;
 }
 
@@ -149,7 +150,7 @@ html, body, #root, .jarvis-root {
   }
 }
 .jarvis-root {
-  background: radial-gradient(circle at center, #03090c 0%, #000 100%);
+  background: radial-gradient(circle at center, rgba(var(--jarvis-accent-rgb), 0.12) 0%, rgba(var(--jarvis-accent-rgb), 0.02) 48%, rgba(var(--jarvis-accent-rgb), 0) 82%);
   overflow: hidden;
   color: var(--jarvis-accent, #00eaff);
 }
@@ -163,6 +164,6 @@ body::before {
   content: "";
   position: fixed;
   inset: 0;
-  background: radial-gradient(circle at center, transparent 40%, rgba(0, 0, 0, 0.6) 100%);
+  background: radial-gradient(circle at center, rgba(var(--jarvis-accent-rgb), 0) 42%, rgba(var(--jarvis-accent-rgb), 0.08) 100%);
   pointer-events: none;
 }

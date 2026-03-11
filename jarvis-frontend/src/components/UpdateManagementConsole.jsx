@@ -28,7 +28,7 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
     return Array.isArray(history) ? history.slice(0, 40) : [];
   }, [history]);
 
-  const refreshHistory = async () => {
+  const refreshHistory = useCallback(async () => {
     if (!sessionId) return;
     setBusy(true);
     setStatus("Loading update history...");
@@ -45,7 +45,7 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
     } finally {
       setBusy(false);
     }
-  };
+  }, [sessionId]);
 
   const refreshProgressiveReport = useCallback(async () => {
     if (!sessionId) return;
@@ -178,8 +178,11 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
 
   useEffect(() => {
     if (!isOpen || !sessionId) return;
-    refreshProgressiveReport();
-  }, [isOpen, sessionId, refreshProgressiveReport]);
+    (async () => {
+      await refreshProgressiveReport();
+      await refreshHistory();
+    })();
+  }, [isOpen, sessionId, refreshProgressiveReport, refreshHistory]);
 
   if (!isOpen) return null;
 
