@@ -322,6 +322,8 @@ class AgentSupervisor:
         self._proc: Optional[subprocess.Popen] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._paused = False
+        self._last_cfg: Optional[AgentRunConfig] = None
 
     @property
     def pid(self) -> Optional[int]:
@@ -336,6 +338,8 @@ class AgentSupervisor:
             return
 
         self._stop.clear()
+        self._paused = False
+        self._last_cfg = cfg
 
         def _runner() -> None:
             while not self._stop.is_set():
@@ -412,6 +416,9 @@ class AgentSupervisor:
                 if not cfg.loop_mode:
                     return
 
+                if self._paused:
+                    return
+
                 self._log(f"[{_now_hms()}] Loop mode: restarting in 5s…")
                 for _ in range(10):
                     if self._stop.is_set():
@@ -445,6 +452,28 @@ class AgentSupervisor:
                 pass
 
         self._proc = None
+
+    def pause(self) -> None:
+        self._paused = True
+        self.stop()
+        self._log(f"[{_now_hms()}] Jobs paused")
+
+    def resume(self) -> None:
+        if self.is_running():
+            return
+        if self._last_cfg is None:
+            self._log(f"[{_now_hms()}] Resume skipped: no previous config")
+            return
+        self._paused = False
+        self.start(self._last_cfg)
+        self._log(f"[{_now_hms()}] Jobs resumed")
+
+    def cancel_jobs(self) -> None:
+        self.stop()
+        self._log(f"[{_now_hms()}] Active jobs cancelled")
+
+    def paused(self) -> bool:
+        return bool(self._paused)
 
     def _log(self, msg: str) -> None:
         try:
@@ -1175,7 +1204,11 @@ def run_ui() -> int:
                 return {"ok": True}
 
             def get_status(self) -> dict:
-                return {"running": sup.is_running(), "pid": sup.pid}
+                return {
+                    "running": sup.is_running(),
+                    "pid": sup.pid,
+                    "paused": sup.paused(),
+                }
 
             def get_permissions(self) -> dict:
                 return load_permissions()
@@ -1188,6 +1221,50 @@ def run_ui() -> int:
                     log_seq = 0
                 _drain_logs()
                 return {"ok": True}
+
+            def pause_jobs(self) -> dict:
+                sup.pause()
+                return {"ok": True, "paused": True}
+
+            def resume_jobs(self) -> dict:
+                sup.resume()
+                return {"ok": True, "paused": False}
+
+            def cancel_jobs(self) -> dict:
+                sup.cancel_jobs()
+                return {"ok": True}
+
+            def get_active_jobs(self) -> dict:
+                running = sup.is_running()
+                return {
+                    "jobs": [
+                        {
+                            "job_id": f"pid-{sup.pid}",
+                            "status": "running" if running else ("paused" if sup.paused() else "idle"),
+                            "pid": sup.pid,
+                        }
+                    ] if (running or sup.paused()) else [],
+                    "count": 1 if (running or sup.paused()) else 0,
+                }
+
+            def get_executed_commands(self, limit: int = 100) -> dict:
+                _drain_logs()
+                try:
+                    n = max(1, min(int(limit or 100), 500))
+                except Exception:
+                    n = 100
+
+                lines: list[str] = []
+                with log_lock:
+                    for raw in log_lines[-2000:]:
+                        s = str(raw)
+                        sep = s.find("|")
+                        if sep != -1:
+                            s = s[sep + 1:]
+                        low = s.lower()
+                        if "execute_command" in low or "command" in low or "running:" in low or "dispatch" in low:
+                            lines.append(s)
+                return {"commands": lines[-n:], "count": len(lines[-n:])}
 
             def get_logs(self, since_index: int = 0) -> dict:
                 _drain_logs()

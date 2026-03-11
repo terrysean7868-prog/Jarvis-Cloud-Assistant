@@ -1,6 +1,6 @@
 # Jarvis Cloud Assistant — Architecture & Working Flow
 
-Last updated: 2026-02-23
+Last updated: 2026-03-11
 
 This document is the **single high-level reference** for how the system is built (technology stack), how it runs (working flow), and where the core business logic lives. It is written to be readable by humans *and* AI agents doing maintenance.
 
@@ -25,6 +25,17 @@ This document is the **single high-level reference** for how the system is built
 - Uses browser **Web Speech**, mic recording + optional cloud STT path
 - Talks to backend through `jarvis-frontend/src/utils/api.js`
 - Receives server push events via WebSocket `/ws/notifications`
+- Autonomous control surfaces are implemented in:
+  - `jarvis-frontend/src/pages/AutonomyDashboard.jsx`
+  - `jarvis-frontend/src/pages/TaskManager.jsx`
+  - `jarvis-frontend/src/pages/AgentMonitor.jsx`
+  - `jarvis-frontend/src/pages/ResearchMonitor.jsx`
+  - `jarvis-frontend/src/pages/DeviceControl.jsx`
+  - `jarvis-frontend/src/pages/SystemHealth.jsx`
+  - `jarvis-frontend/src/pages/SelfImprovementPanel.jsx`
+- Visualization stack for autonomy UI:
+  - `reactflow` for task graph rendering
+  - `chart.js` + `react-chartjs-2` for runtime metrics
 
 ### Companion “PC Agent” (Remote device actions)
 - `apps/pc_agent/pc_agent.py` (legacy alias: `pc_agent.py`): runs on a user-owned machine, connects to server WebSocket `/ws/agent`
@@ -46,6 +57,11 @@ Desktop app implementation update (2026-02-23):
   - `scripts/build_desktop_app.py`
   - `build_desktop_app.bat`
   - This flow rebuilds frontend production assets and then runs PyInstaller, so each build includes the latest code.
+
+Desktop startup readiness update (2026-03-11):
+- Desktop backend probe now checks `/health` (canonical route) with `/api/health` fallback.
+- This resolved false startup failures where backend was running but desktop showed:
+  - `Backend not ready at http://127.0.0.1:18001`
 
 ### MCP (Optional)
 - Separate MCP server under `mcp_server/` (FastAPI + MCP tool registrations)
@@ -83,9 +99,13 @@ Important toggles in `apps/web/app.py` (legacy alias: `app.py`):
   - `NotificationHub` (in-process pub/sub; Redis-backed fanout when configured)
 - Implements routes:
   - Chat: `POST /api/chat` (+ alias `POST /api/message`)
+  - Health: `GET /health`
+  - Autonomy: `GET /api/autonomy/status`, `GET/POST /api/autonomy/goals`
+  - Task/agent views: `GET /api/tasks`, `GET /api/agents`
   - Notifications WS: `WS /ws/notifications`
   - PC agent WS: `WS /ws/agent`
-  - Device binding + dispatch: `/api/user/device/*`, `/api/device/dispatch`
+  - Device binding + dispatch: `/api/user/device/*`, `/api/device/dispatch`, `GET /api/device/list`
+  - Self-improvement review: `GET /api/self-improvement/proposals`, `POST /api/self-improvement/proposals/decision`
   - Skills: `/api/skills/*`
   - Voice/auth/telegram/admin endpoints (see code)
 
@@ -246,8 +266,8 @@ Entry points:
 - `apps/web/app.py` (legacy alias: `app.py`) — backend server
 - `run_local.py` — local backend run wrapper
 - `apps/pc_agent/pc_agent.py` (legacy alias: `pc_agent.py`) — PC agent runtime
-- `apps/desktop/jarvis_web_shell.py` — desktop shell (pywebview)
-- `apps/desktop/jarvis_desktop.py` — desktop UI (Qt)
+- `apps/desktop/desktop_app.py` — desktop runtime entrypoint
+- `build_desktop_app.bat` and `scripts/build_desktop_app.py` — desktop build pipeline
 - `run_pc_agent.py` — PC agent launcher wrapper
 
 Core pipeline:
@@ -264,6 +284,9 @@ Auth/session:
 Frontend:
 - `jarvis-frontend/src/utils/api.js` (all API + WS URLs)
 - `jarvis-frontend/src/App.jsx` (main UI behavior)
+- `jarvis-frontend/src/components/HUDLogs.jsx` (structured message rendering: text/plan/task_graph/code_block/research_report)
+- `jarvis-frontend/src/pages/AutonomyDashboard.jsx` (tabbed autonomy console)
+- `jarvis-frontend/src/pages/SelfImprovementPanel.jsx` (approve/reject/diff flow)
 
 PC agent UI / packaging:
 - `apps/pc_agent/pc_agent_app.py` (legacy alias: `pc_agent_app.py`), `assets/pc_agent_ui.html`
@@ -300,3 +323,6 @@ Desktop app:
 - 2026-02-06: Initial architecture + working-flow documentation created.
 - 2026-02-23: Replaced legacy multi-implementation desktop app with a unified `desktop_app.py` runtime and kept old desktop entrypoints as wrappers for backward compatibility.
 - 2026-02-23: Updated `JarvisDesktop.spec` to package `desktop_app.py` directly and added one-command desktop builder scripts (`scripts/build_desktop_app.py`, `build_desktop_app.bat`).
+- 2026-03-11: Added autonomy dashboard pages, task graph + metrics visualization, and structured chat message rendering for plan/task/research/code output types.
+- 2026-03-11: Added API surfaces for device list and self-improvement proposal review/decision.
+- 2026-03-11: Fixed desktop backend readiness probe to use `/health` (with fallback), resolving false "Backend not ready" startup errors.

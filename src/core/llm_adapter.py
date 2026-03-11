@@ -27,6 +27,7 @@ class LLMAdapter:
     """
 
     def __init__(self):
+        self.provider = str(getattr(rd, "LLM_PROVIDER", "openai_compatible") or "openai_compatible").strip().lower()
         # Primary: OpenAI (ChatGPT). Fallback: Groq (OpenAI-compatible endpoint).
         self.primary_model = rd.PRIMARY_MODEL
         # Optional smarter model for hard tasks (routing by heuristic complexity).
@@ -76,6 +77,29 @@ class LLMAdapter:
         self._local_reasoner_state_path = self._resolve_local_reasoner_state_path()
         self._local_reasoner_state = self._load_local_reasoner_state()
         self._local_reasoner_daily_maintenance()
+
+    async def _call_ollama_chat(
+        self,
+        messages,
+        *,
+        model: str | None,
+        endpoint: str | None,
+        temperature: float,
+    ):
+        await self._ensure_session()
+        url = endpoint if endpoint is not None else self.primary_endpoint
+        payload = {
+            "model": (model or self.primary_model),
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": float(temperature),
+            },
+        }
+        async with self.session.post(url, json=payload) as r:
+            if r.status != 200:
+                raise Exception(f"Ollama API error: {await r.text()}")
+            return await r.json()
 
     @staticmethod
     def _resolve_local_reasoner_state_key() -> str:
@@ -2376,17 +2400,29 @@ Return ONLY valid JSON matching:
 
             provider_source = "openai"
             try:
-                response = await self._call_openai(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    model=chosen_model,
-                    endpoint=self.primary_endpoint,
-                    api_key=self.primary_key,
-                )
+                if self.provider == "ollama":
+                    provider_source = "ollama"
+                    response = await self._call_ollama_chat(
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=temperature,
+                        model=chosen_model,
+                        endpoint=self.primary_endpoint,
+                    )
+                else:
+                    response = await self._call_openai(
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        model=chosen_model,
+                        endpoint=self.primary_endpoint,
+                        api_key=self.primary_key,
+                    )
             except Exception as e_primary:
                 print(f"[LLM WARN] Primary provider failed: {e_primary}")
                 if not self.backup_key:
@@ -2403,7 +2439,11 @@ Return ONLY valid JSON matching:
                     endpoint=self.backup_endpoint,
                     api_key=self.backup_key,
                 )
-            content = response["choices"][0]["message"]["content"].strip()
+            if self.provider == "ollama" and isinstance(response, dict):
+                msg = response.get("message") or {}
+                content = str(msg.get("content") or "").strip()
+            else:
+                content = response["choices"][0]["message"]["content"].strip()
 
             # Attempt to parse JSON safely
             try:

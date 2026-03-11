@@ -78,6 +78,8 @@
         .toolbar .spacer { -ms-flex: 1 1 auto; flex: 1 1 auto; }
         .checkboxes label { display: inline-block; margin-right: 12px; }
         .notice { margin-top: 10px; padding: 10px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.10); background: rgba(0,0,0,0.18); }
+        .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+        @media (max-width: 980px) { .split { grid-template-columns: 1fr; } }
 
         .toast {
             position: fixed;
@@ -167,9 +169,25 @@
                             <span class="spacer"></span>
                             <div class="muted" id="pid">PID: —</div>
                         </div>
+                        <div class="toolbar" style="margin-top:10px">
+                            <button class="btn" id="pauseJobs">Pause Jobs</button>
+                            <button class="btn" id="resumeJobs">Resume Jobs</button>
+                            <button class="btn bad" id="cancelJobs">Cancel Jobs</button>
+                        </div>
                         <div class="kv" id="perms"></div>
                         <div class="muted" style="margin-top:12px">Permissions are set from the cloud UI per device.</div>
                     </div>
+                </div>
+            </div>
+
+            <div class="split">
+                <div class="card">
+                    <h3>Active Jobs</h3>
+                    <div id="activeJobs" class="logs" style="height:180px"></div>
+                </div>
+                <div class="card">
+                    <h3>Executed Commands</h3>
+                    <div id="executedCommands" class="logs" style="height:180px"></div>
                 </div>
             </div>
 
@@ -257,13 +275,47 @@
                 );
             }
 
-            function setStatus(running, pid) {
+            function setStatus(running, pid, paused) {
                 var pill = $('statusPill');
-                pill.textContent = running ? 'Running' : 'Not running';
-                pill.className = 'pill ' + (running ? 'good' : 'bad');
+                if (paused) {
+                    pill.textContent = 'Paused';
+                    pill.className = 'pill bad';
+                } else {
+                    pill.textContent = running ? 'Running' : 'Not running';
+                    pill.className = 'pill ' + (running ? 'good' : 'bad');
+                }
                 $('pid').textContent = 'PID: ' + (pid || '—');
                 $('start').disabled = !!running;
                 $('stop').disabled = !running;
+            }
+
+            function renderActiveJobs(rows) {
+                var el = $('activeJobs');
+                if (!el) return;
+                if (!rows || !rows.length) {
+                    el.textContent = 'No active jobs';
+                    return;
+                }
+                var out = [];
+                for (var i = 0; i < rows.length; i++) {
+                    var j = rows[i] || {};
+                    out.push('Job: ' + (j.job_id || 'unknown'));
+                    out.push('Status: ' + (j.status || 'unknown'));
+                    out.push('PID: ' + (j.pid || '—'));
+                    out.push('---');
+                }
+                el.textContent = out.join('\n');
+            }
+
+            function renderExecutedCommands(rows) {
+                var el = $('executedCommands');
+                if (!el) return;
+                if (!rows || !rows.length) {
+                    el.textContent = 'No executed commands detected';
+                    return;
+                }
+                el.textContent = rows.join('\n');
+                el.scrollTop = el.scrollHeight;
             }
 
             function renderPerms(p) {
@@ -336,14 +388,20 @@
                 return Promise.all([
                     api.get_status(),
                     api.get_permissions(),
-                    api.get_logs(logSeq)
+                    api.get_logs(logSeq),
+                    api.get_active_jobs(),
+                    api.get_executed_commands(120)
                 ]).then(function (res) {
                     var st = res[0];
                     var perms = res[1];
                     var logs = res[2];
+                    var jobs = res[3];
+                    var cmds = res[4];
 
-                    setStatus(!!(st && st.running), st ? st.pid : null);
+                    setStatus(!!(st && st.running), st ? st.pid : null, !!(st && st.paused));
                     renderPerms(perms || {});
+                    renderActiveJobs((jobs && jobs.jobs) ? jobs.jobs : []);
+                    renderExecutedCommands((cmds && cmds.commands) ? cmds.commands : []);
 
                     if (logs && logs.lines && logs.lines.length) {
                         var box = $('logs');
@@ -510,6 +568,36 @@
                         }
                     }).catch(function () {
                         toast('Local discovery failed', 'bad');
+                    });
+                };
+
+                $('pauseJobs').onclick = function () {
+                    if (!ensureReady()) return;
+                    window.pywebview.api.pause_jobs().then(function () {
+                        toast('Jobs paused', 'warn', 1600);
+                        safeRefresh(false);
+                    }).catch(function () {
+                        toast('Pause failed', 'bad');
+                    });
+                };
+
+                $('resumeJobs').onclick = function () {
+                    if (!ensureReady()) return;
+                    window.pywebview.api.resume_jobs().then(function () {
+                        toast('Jobs resumed', 'good', 1600);
+                        safeRefresh(false);
+                    }).catch(function () {
+                        toast('Resume failed', 'bad');
+                    });
+                };
+
+                $('cancelJobs').onclick = function () {
+                    if (!ensureReady()) return;
+                    window.pywebview.api.cancel_jobs().then(function () {
+                        toast('Active jobs cancelled', 'warn', 1800);
+                        safeRefresh(false);
+                    }).catch(function () {
+                        toast('Cancel failed', 'bad');
                     });
                 };
 

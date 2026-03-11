@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from fastapi import WebSocket
 
 from src.config.settings import settings
+from src.utils.db import db
 
 try:
     from src.broker.redis_broker import RedisBroker
@@ -85,6 +86,27 @@ class DeviceHub:
 
     async def _set_registry(self, device_id: str, conn: AgentConnection) -> None:
         """Persist device->instance mapping in broker so dispatch can route across workers."""
+        try:
+            db._ensure_connected()
+            if db.db is not None:
+                db.db["device_registry"].update_one(
+                    {"device_id": device_id},
+                    {
+                        "$set": {
+                            "device_id": device_id,
+                            "instance_id": self._instance_id,
+                            "connected": True,
+                            "connected_at": conn.connected_at,
+                            "last_seen_at": conn.last_seen_at,
+                            "capabilities": conn.capabilities or {},
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    },
+                    upsert=True,
+                )
+        except Exception:
+            pass
+
         if not self._broker:
             return
         try:
@@ -104,6 +126,22 @@ class DeviceHub:
             return
 
     async def _del_registry(self, device_id: str) -> None:
+        try:
+            db._ensure_connected()
+            if db.db is not None:
+                db.db["device_registry"].update_one(
+                    {"device_id": device_id},
+                    {
+                        "$set": {
+                            "connected": False,
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    },
+                    upsert=True,
+                )
+        except Exception:
+            pass
+
         if not self._broker:
             return
         try:

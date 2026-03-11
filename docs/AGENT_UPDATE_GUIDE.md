@@ -1,6 +1,6 @@
 # Agent Update Guide (Maintenance Playbook)
 
-Last updated: 2026-02-06
+Last updated: 2026-03-11
 
 Purpose: When an AI agent (or engineer) needs to update Jarvis, this file tells you **where to look first**, what is “contractual” (must stay consistent), and the minimal checklist to make changes safely.
 
@@ -12,6 +12,8 @@ If you are new to the repo, read these in order:
 3) `src/core/chat_orchestrator.py` (policy + web/research pipeline)
 4) `src/core/jarvis_brain.py` and `src/core/llm_adapter.py` (LLM + actions)
 5) `src/core/executor.py` and `apps/pc_agent/pc_agent.py` (legacy alias: `pc_agent.py`) (action execution)
+6) `apps/desktop/desktop_app.py` (desktop startup/runtime integration)
+7) `jarvis-frontend/src/pages/AutonomyDashboard.jsx` + `jarvis-frontend/src/utils/api.js` (autonomy UI/API integration)
 
 ## 2) “Source of Truth” Rules
 
@@ -86,6 +88,15 @@ Checklist:
 - Legacy sessions (file) are in `src/utils/session_manager.py`
 - Principal resolution is in `app.py` (`_get_principal`) and affects authorization everywhere
 
+### F) Desktop runtime / packaged app behavior
+Checklist:
+- Desktop entrypoint is `apps/desktop/desktop_app.py` (PyInstaller target via `JarvisDesktop.spec`)
+- Backend readiness probe should validate `GET /health` (canonical), with compatibility fallback allowed
+- If you change backend boot/health logic, rebuild desktop package:
+  - `build_desktop_app.bat`
+  - or `python scripts/build_desktop_app.py --skip-frontend`
+- Keep user-facing startup errors specific (port conflict vs missing dependency vs backend exception)
+
 ## 4) Quick Debug Map (Where to Look When Something Breaks)
 
 - UI cannot chat:
@@ -110,6 +121,12 @@ Checklist:
   - `src/core/chat_orchestrator.py` research pipeline
   - `src/core/executor.py` web_search/fetch_url behavior
 
+- Desktop says "Backend not ready":
+  - Verify desktop probe path is `/health` in `apps/desktop/desktop_app.py`
+  - Verify backend health route exists in `apps/web/app.py`
+  - Verify local port availability (`18001` by default)
+  - Rebuild `dist/Jarvis.exe` after desktop runtime changes
+
 ## 5) Minimal Validation (Do Before You Ship)
 
 - Run unit tests:
@@ -118,6 +135,10 @@ Checklist:
   - Verify `/api/chat` returns a stable shape (`text`, `actions`, optional `task_id`)
 - If you changed device actions:
   - Verify agent connects (`/ws/agent`) and a test dispatch (`/api/device/dispatch`) returns `queued`
+- If you changed desktop runtime:
+  - Launch `python apps/desktop/desktop_app.py` locally
+  - Build and launch packaged `dist/Jarvis.exe`
+  - Confirm app starts without "Backend not ready" timeout
 
 ## 6) Notes for AI Agents
 

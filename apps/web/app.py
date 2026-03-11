@@ -33,6 +33,7 @@ from src.core.executor import ActionExecutor
 from src.core.chat_orchestrator import ChatOrchestrator
 from src.core.module_update_cycle import ModuleUpdateCycleService
 from src.core.notification_hub import notification_hub
+from src.autonomy.runtime import AutonomyRuntime
 from src.utils.git_sync import git_sync, setup_ssh_trust
 
 # Self-update is optional and may pull in extra dependencies. Keep API boot resilient.
@@ -132,6 +133,12 @@ async def lifespan(_app: FastAPI):
     except Exception as e:
         print(f"[INFO] Could not start session cleanup (already running): {e}")
 
+    try:
+        await autonomy_runtime.start()
+        print("[OK] Autonomous runtime started")
+    except Exception as e:
+        print(f"[INFO] Autonomous runtime start failed: {e}")
+
     if ENABLE_SCHEDULER and SCHEDULER_AVAILABLE and initialize_scheduler:
         try:
             initialize_scheduler()
@@ -169,6 +176,11 @@ async def lifespan(_app: FastAPI):
         try:
             if _BROKER is not None:
                 await _BROKER.close()
+        except Exception:
+            pass
+
+        try:
+            await autonomy_runtime.stop()
         except Exception:
             pass
 
@@ -2622,6 +2634,11 @@ llm = LLMAdapter()
 brain = JarvisBrain(llm=llm)
 executor = ActionExecutor(brain=brain)
 module_cycle_service = ModuleUpdateCycleService(executor=executor, self_add_feature=self_add_feature)
+autonomy_runtime = AutonomyRuntime(
+    device_hub=device_hub,
+    enabled=bool(getattr(rd, "AUTONOMY_ENABLED", True)),
+    poll_interval_seconds=int(getattr(rd, "AUTONOMY_POLL_INTERVAL_SECONDS", 20)),
+)
 
 
 async def _shutdown_cleanup():
@@ -3024,6 +3041,50 @@ class VoiceAuthRequest(BaseModel):
     password: str | None = None
     action: str  # "register" or "login"
     role: str | None = None  # optional: 'admin' or 'user'
+
+
+class GoalCreateRequest(BaseModel):
+    goal: str
+    session_id: str | None = None
+    priority: int = 5
+
+
+@app.post("/api/autonomy/goals")
+async def create_autonomy_goal(req: GoalCreateRequest):
+    principal = _get_principal(req.session_id) if req.session_id else {"username": "system", "role": "anonymous"}
+    if CLOUD_MODE and not req.session_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(req.session_id)
+
+    owner = str(principal.get("username") or "system")
+    goal_id = autonomy_runtime.goals.create_goal(
+        goal=req.goal,
+        owner=owner,
+        priority=req.priority,
+        metadata={"origin": "api"},
+    )
+    return {"status": "ok", "goal_id": goal_id}
+
+
+@app.get("/api/autonomy/goals")
+async def list_autonomy_goals(statuses: str = "pending,running,failed,completed", limit: int = 25):
+    status_list = [s.strip() for s in statuses.split(",") if s.strip()]
+    goals = autonomy_runtime.goals.list_goals(statuses=status_list, limit=max(1, min(limit, 100)))
+    return {"status": "ok", "goals": goals}
+
+
+@app.get("/api/autonomy/status")
+async def autonomy_status():
+    return {
+        "status": "ok",
+        "runtime": {
+            "enabled": bool(getattr(rd, "AUTONOMY_ENABLED", True)),
+            "poll_interval_seconds": int(getattr(rd, "AUTONOMY_POLL_INTERVAL_SECONDS", 20)),
+        },
+        "health": autonomy_runtime._health_check(),
+        "tools": autonomy_runtime.tools.list_tools(),
+    }
 
 
 class VoiceBiometricsRequest(BaseModel):
@@ -4098,6 +4159,165 @@ async def get_all_tasks(session_id: str | None = None):
         except Exception:
             continue
     return {"tasks": filtered}
+
+
+@app.get("/api/agents")
+async def list_autonomy_agents(session_id: str | None = None):
+    """List autonomous agent definitions and currently connected device agents."""
+    if CLOUD_MODE:
+        _require_authenticated_session(session_id)
+
+    connected = await device_hub.list_agents()
+    return {
+        "status": "ok",
+        "agents": autonomy_runtime.controller.list_agents(),
+        "connected_device_agents": list(connected.values()),
+        "count": len(autonomy_runtime.controller.list_agents()),
+    }
+
+
+@app.get("/api/device/list")
+async def list_devices(session_id: str | None = None):
+    """List connected device agents and persisted registry rows."""
+    if CLOUD_MODE:
+        _require_authenticated_session(session_id)
+
+    connected = await device_hub.list_agents()
+    rows: list[dict[str, Any]] = []
+    try:
+        database._ensure_connected()
+        if database.db is not None:
+            rows = list(database.db["device_registry"].find({}, {"_id": 0}).sort("updated_at", -1).limit(200))
+    except Exception:
+        rows = []
+
+    connected_ids = {str(v.get("device_id") or k) for k, v in connected.items()}
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for row in rows:
+        device_id = str(row.get("device_id") or "").strip()
+        if not device_id:
+            continue
+        seen.add(device_id)
+        merged.append(
+            {
+                **row,
+                "device_id": device_id,
+                "connected": bool(row.get("connected") or (device_id in connected_ids)),
+            }
+        )
+
+    for key, conn in connected.items():
+        device_id = str(conn.get("device_id") or key).strip()
+        if not device_id or device_id in seen:
+            continue
+        merged.append(
+            {
+                "device_id": device_id,
+                "connected": True,
+                "capabilities": conn.get("capabilities") if isinstance(conn, dict) else {},
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    return {
+        "status": "ok",
+        "devices": merged,
+        "count": len(merged),
+    }
+
+
+class SelfImprovementDecisionRequest(BaseModel):
+    proposal_id: str
+    decision: str
+    session_id: str | None = None
+
+
+@app.get("/api/self-improvement/proposals")
+async def list_self_improvement_proposals(session_id: str | None = None):
+    """Return pending self-improvement proposals for explicit human approval."""
+    principal = None
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(session_id)
+    elif session_id:
+        principal = _get_principal(session_id)
+
+    role = str((principal or {}).get("role") or "user").lower()
+    if CLOUD_MODE and role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    proposals: list[dict[str, Any]] = []
+    try:
+        database._ensure_connected()
+        if database.db is not None:
+            proposals = list(
+                database.db["self_improvement_proposals"]
+                .find({"status": "pending"}, {"_id": 0})
+                .sort("created_at", -1)
+                .limit(200)
+            )
+    except Exception:
+        proposals = []
+
+    # Provide deterministic fallback for fresh deployments where no proposals exist yet.
+    if not proposals:
+        proposals = [
+            {
+                "proposal_id": "sample-proposal-1",
+                "title": "Refactor autonomy task scoring heuristics",
+                "risk_score": 0.32,
+                "generated_tools": [],
+                "diff": "--- a/src/planning/task_planner.py\n+++ b/src/planning/task_planner.py\n@@\n- heuristic = 1\n+ heuristic = 2",
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+
+    return {"status": "ok", "proposals": proposals, "count": len(proposals)}
+
+
+@app.post("/api/self-improvement/proposals/decision")
+async def decide_self_improvement_proposal(req: SelfImprovementDecisionRequest):
+    principal = None
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(req.session_id)
+    elif req.session_id:
+        principal = _get_principal(req.session_id)
+
+    role = str((principal or {}).get("role") or "user").lower()
+    if role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    decision = str(req.decision or "").strip().lower()
+    if decision not in {"approve", "reject"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="decision must be approve or reject")
+
+    updated = False
+    try:
+        database._ensure_connected()
+        if database.db is not None:
+            result = database.db["self_improvement_proposals"].update_one(
+                {"proposal_id": req.proposal_id},
+                {
+                    "$set": {
+                        "status": decision,
+                        "reviewed_at": datetime.now(timezone.utc),
+                        "reviewed_by": str((principal or {}).get("username") or "admin"),
+                    }
+                },
+                upsert=False,
+            )
+            updated = bool(result.modified_count or result.matched_count)
+    except Exception:
+        updated = False
+
+    return {
+        "status": "ok",
+        "message": f"Proposal {decision}",
+        "proposal_id": req.proposal_id,
+        "updated": updated,
+    }
 
 @app.get("/api/wakeup-context")
 async def get_wakeup_context(session_id: str | None = None):

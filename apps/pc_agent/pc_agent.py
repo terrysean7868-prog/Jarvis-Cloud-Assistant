@@ -13,6 +13,11 @@ from datetime import datetime, UTC
 
 import aiohttp
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -167,6 +172,34 @@ def _current_capabilities() -> dict:
         "allow_file_ops": bool(ALLOW_FILE_OPS),
         "platform": platform.system().lower(),
         "hostname": platform.node(),
+        "actions": [
+            "inspect_system_state",
+            "monitor_performance",
+            "analyze_screen",
+            "list_device_actions",
+        ],
+    }
+
+
+def _inspect_system_state() -> dict:
+    cpu_percent = None
+    memory_percent = None
+    disk_percent = None
+    if psutil is not None:
+        try:
+            cpu_percent = psutil.cpu_percent(interval=0.2)
+            memory_percent = psutil.virtual_memory().percent
+            disk_percent = psutil.disk_usage(str(PROJECT_ROOT)).percent
+        except Exception:
+            pass
+
+    return {
+        "platform": platform.platform(),
+        "python_version": sys.version.split()[0],
+        "hostname": platform.node(),
+        "cpu_percent": cpu_percent,
+        "memory_percent": memory_percent,
+        "disk_percent": disk_percent,
     }
 
 
@@ -676,8 +709,54 @@ async def _execute_action(action: dict) -> dict:
                 "alt_tab",
                 "save_screenshot",
                 "find_files",
+                "inspect_system_state",
+                "monitor_performance",
+                "analyze_screen",
             ]),
         }
+
+    if t == "inspect_system_state":
+        return {
+            "status": "success",
+            "action_type": t,
+            "state": _inspect_system_state(),
+        }
+
+    if t == "monitor_performance":
+        samples = int((action or {}).get("samples") or 5)
+        interval = float((action or {}).get("interval") or 0.5)
+        samples = max(1, min(30, samples))
+        interval = max(0.1, min(5.0, interval))
+
+        if psutil is None:
+            return {"status": "error", "action_type": t, "message": "psutil not available"}
+
+        data = []
+        for _ in range(samples):
+            data.append(
+                {
+                    "cpu_percent": psutil.cpu_percent(interval=interval),
+                    "memory_percent": psutil.virtual_memory().percent,
+                }
+            )
+        return {"status": "success", "action_type": t, "samples": data}
+
+    if t == "analyze_screen":
+        if not ALLOW_SCREEN:
+            return {"status": "forbidden", "action_type": t, "message": "Screen features disabled on agent"}
+        sa = _get_screen_access()
+        if not sa:
+            return {"status": "error", "action_type": t, "message": "Screen features not available on this agent"}
+        try:
+            text = sa.read_screen_text()
+            return {
+                "status": "success",
+                "action_type": t,
+                "text_excerpt": (text or "")[:1200],
+                "length": len(text or ""),
+            }
+        except Exception as e:
+            return {"status": "error", "action_type": t, "message": str(e)}
 
     if ACTION_ALLOWLIST is not None and t not in ACTION_ALLOWLIST:
         return {"status": "forbidden", "action_type": t, "message": "Action blocked by agent allowlist"}

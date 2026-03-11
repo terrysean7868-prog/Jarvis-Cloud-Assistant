@@ -102,11 +102,12 @@ AGENTIC_MAX_SUBTASKS: int = 6
 # -------------------------
 # LLM defaults (non-secret)
 # -------------------------
-PRIMARY_MODEL: str = "gpt-5.2"
-PRIMARY_ENDPOINT: str = "https://api.openai.com/v1/chat/completions"
+LLM_PROVIDER: str = "ollama"  # "ollama" | "openai_compatible"
+PRIMARY_MODEL: str = "llama3.1:8b"
+PRIMARY_ENDPOINT: str = "http://127.0.0.1:11434/api/chat"
 
-BACKUP_MODEL: str = "llama-3.3-70b-versatile"
-BACKUP_ENDPOINT: str = "https://api.groq.com/openai/v1/chat/completions"
+BACKUP_MODEL: str = ""
+BACKUP_ENDPOINT: str = ""
 
 PERSONA: str = "formal-gentle"
 SMART_MODEL: str = ""  # optional
@@ -164,6 +165,20 @@ PROGRESSIVE_LLM_UPDATE_DESCRIPTION: str = (
     "clarification quality, and response consistency while preserving existing behavior and APIs. "
     "Avoid large refactors and keep changes minimal and production-safe."
 )
+
+
+# -------------------------
+# Autonomous engineer runtime
+# -------------------------
+AUTONOMY_ENABLED: bool = True
+AUTONOMY_POLL_INTERVAL_SECONDS: int = 20
+
+# OSS integrations (all optional)
+ENABLE_OLLAMA: bool = True
+ENABLE_CHROMADB: bool = True
+ENABLE_WHISPER: bool = False
+ENABLE_OPENCV: bool = True
+CHROMADB_PATH: str = "data/chromadb"
 
 WIKI_TRAINING_INTERVAL_SECONDS: int = 3600
 BACKGROUND_ANALYSIS_INTERVAL_SECONDS: int = 1800

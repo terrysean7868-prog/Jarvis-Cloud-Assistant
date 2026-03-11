@@ -385,6 +385,124 @@ export async function getTasks(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
   return await res.json();
 }
 
+export async function getAutonomyStatus(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  if (sessionId) qs.set("session_id", String(sessionId));
+  const url = `${API_URL}/api/autonomy/status${qs.toString() ? `?${qs.toString()}` : ""}`;
+  const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function createAutonomyGoal(goal, sessionId = null, priority = 5, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = {
+    goal: String(goal || "").trim(),
+    priority: Number(priority || 5),
+  };
+  if (sessionId) body.session_id = sessionId;
+
+  const res = await timeoutFetch(`${API_URL}/api/autonomy/goals`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getAutonomyGoals({ sessionId = null, statuses = "pending,running,failed,completed", limit = 25, timeoutMs = DEFAULT_TIMEOUT } = {}) {
+  const qs = new URLSearchParams();
+  qs.set("statuses", String(statuses || "pending,running,failed,completed"));
+  qs.set("limit", String(limit || 25));
+  if (sessionId) qs.set("session_id", String(sessionId));
+
+  const res = await timeoutFetch(`${API_URL}/api/autonomy/goals?${qs.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getAgents(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  if (sessionId) qs.set("session_id", String(sessionId));
+  const url = `${API_URL}/api/agents${qs.toString() ? `?${qs.toString()}` : ""}`;
+
+  const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getDeviceList(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  if (sessionId) qs.set("session_id", String(sessionId));
+  const url = `${API_URL}/api/device/list${qs.toString() ? `?${qs.toString()}` : ""}`;
+
+  const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getSelfImprovementProposals(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  if (sessionId) qs.set("session_id", String(sessionId));
+  const url = `${API_URL}/api/self-improvement/proposals${qs.toString() ? `?${qs.toString()}` : ""}`;
+
+  const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function decideSelfImprovementProposal(proposalId, decision, sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = {
+    proposal_id: String(proposalId || "").trim(),
+    decision: String(decision || "").trim().toLowerCase(),
+  };
+  if (sessionId) body.session_id = sessionId;
+
+  const res = await timeoutFetch(`${API_URL}/api/self-improvement/proposals/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
 export async function getAdminUpdateHistory(sessionId, limit = 100, timeoutMs = DEFAULT_TIMEOUT) {
   const qs = new URLSearchParams();
   qs.set("session_id", String(sessionId || ""));
