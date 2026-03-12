@@ -196,6 +196,7 @@ class LLMAdapter:
                 "learn_events": 0,
                 "hits": 0,
             },
+            "cycles": [],  # Goal→Plan→Execute→Evaluate→Improve cycle feedback
         }
 
     def _load_local_reasoner_state(self) -> dict:
@@ -451,6 +452,335 @@ class LLMAdapter:
                 self._save_local_reasoner_state()
         except Exception:
             pass
+
+    def evaluate_execution_results(self, goal: str, planned_actions: list[dict], execution_results: list[dict]) -> dict:
+        """
+        EVALUATE phase: Assess if the executed actions achieved the goal.
+        
+        Returns {
+            "goal_achieved": bool,
+            "success_rate": float (0-1),
+            "failed_actions": [action indices],
+            "evaluation_notes": str,
+            "outcome_summary": str,
+        }
+        """
+        try:
+            if not goal or not execution_results:
+                return {
+                    "goal_achieved": False,
+                    "success_rate": 0.0,
+                    "failed_actions": [],
+                    "evaluation_notes": "Missing goal or execution results",
+                    "outcome_summary": "Cannot evaluate without data",
+                }
+
+            success_statuses = {"success", "opened", "written", "typed", "sent", "completed", "done"}
+            total_actions = len(execution_results)
+            successful_actions = 0
+            failed_indices = []
+
+            for i, result in enumerate(execution_results):
+                if not isinstance(result, dict):
+                    failed_indices.append(i)
+                    continue
+                
+                status = (result.get("status") or "").lower()
+                if status in success_statuses:
+                    successful_actions += 1
+                else:
+                    failed_indices.append(i)
+
+            success_rate = successful_actions / total_actions if total_actions > 0 else 0.0
+            # Heuristic: if >80% actions succeeded and goal keywords appear in results
+            achieved = success_rate >= 0.8
+            
+            evaluation_notes = f"Executed {total_actions} actions: {successful_actions} succeeded, {len(failed_indices)} failed."
+            
+            if failed_indices:
+                evaluation_notes += f" Failed action indices: {failed_indices}."
+            
+            if achieved:
+                outcome_summary = f"Goal '{goal[:50]}...' appears achieved ({success_rate*100:.0f}% success rate)."
+            else:
+                outcome_summary = f"Goal '{goal[:50]}...' partially achieved ({success_rate*100:.0f}% success rate). Needs improvement."
+
+            return {
+                "goal_achieved": achieved,
+                "success_rate": round(success_rate, 2),
+                "failed_actions": failed_indices,
+                "evaluation_notes": evaluation_notes,
+                "outcome_summary": outcome_summary,
+            }
+        except Exception as e:
+            return {
+                "goal_achieved": False,
+                "success_rate": 0.0,
+                "failed_actions": [],
+                "evaluation_notes": f"Evaluation error: {str(e)}",
+                "outcome_summary": "Could not evaluate execution",
+            }
+
+    def generate_improvement_feedback(self, goal: str, evaluation: dict, execution_results: list[dict]) -> dict:
+        """
+        IMPROVE phase: Generate feedback to improve future planning.
+        
+        Returns {
+            "action_feedbacks": [{"index": int, "feedback": str, "suggestion": str}],
+            "retry_strategy": str,
+            "improved_plan": [suggested actions],
+            "learning_note": str,
+        }
+        """
+        try:
+            if not evaluation or not execution_results:
+                return {
+                    "action_feedbacks": [],
+                    "retry_strategy": "RETRY_SAME",
+                    "improved_plan": [],
+                    "learning_note": "No evaluation data for improvement",
+                }
+
+            failed_indices = evaluation.get("failed_actions") or []
+            action_feedbacks = []
+
+            for idx in failed_indices:
+                if 0 <= idx < len(execution_results):
+                    result = execution_results[idx]
+                    action_status = result.get("status", "unknown")
+                    error_msg = result.get("error", "No error message")
+                    
+                    feedback = f"Action {idx} failed with status '{action_status}': {error_msg}"
+                    suggestion = self._suggest_action_improvement(result, idx)
+                    
+                    action_feedbacks.append({
+                        "index": idx,
+                        "feedback": feedback,
+                        "suggestion": suggestion,
+                    })
+
+            # Determine retry strategy
+            success_rate = evaluation.get("success_rate", 0.0)
+            if success_rate == 1.0:
+                retry_strategy = "SUCCESS"
+            elif success_rate >= 0.7:
+                retry_strategy = "RETRY_FAILED_ONLY"
+            elif success_rate >= 0.3:
+                retry_strategy = "RETRY_WITH_DELAYS"
+            else:
+                retry_strategy = "REPLAN_REQUIRED"
+
+            # Generate improved plan
+            improved_plan = self._generate_improved_plan(goal, execution_results, action_feedbacks)
+
+            learning_note = (
+                f"Completed cycle for goal '{goal[:50]}...': Success rate {evaluation.get('success_rate', 0)*100:.0f}%. "
+                f"Strategy: {retry_strategy}. Failed actions: {len(failed_indices)}."
+            )
+
+            return {
+                "action_feedbacks": action_feedbacks,
+                "retry_strategy": retry_strategy,
+                "improved_plan": improved_plan,
+                "learning_note": learning_note,
+            }
+        except Exception as e:
+            return {
+                "action_feedbacks": [],
+                "retry_strategy": "RETRY_SAME",
+                "improved_plan": [],
+                "learning_note": f"Improvement generation error: {str(e)}",
+            }
+
+    def _suggest_action_improvement(self, failed_result: dict, action_index: int) -> str:
+        """Generate specific improvement suggestion for a failed action."""
+        status = (failed_result.get("status") or "").lower()
+        action_type = (failed_result.get("action_type") or "").lower()
+        error = (failed_result.get("error") or "").lower()
+
+        if "not found" in error or "not installed" in error:
+            return f"Action {action_index}: Verify {action_type} is available/installed. Consider fallback."
+        elif "permission" in error or "denied" in error:
+            return f"Action {action_index}: {action_type} requires elevated permissions. Request may be needed."
+        elif "timeout" in error:
+            return f"Action {action_index}: {action_type} timed out. Increase delay or reduce complexity."
+        elif action_type == "type_text" and error:
+            return f"Action {action_index}: Typing failed. Increase 'before_ms' delay or reduce text length."
+        else:
+            return f"Action {action_index}: {action_type} failed. Review error: {error[:60]}"
+
+    def _generate_improved_plan(self, goal: str, execution_results: list[dict], feedbacks: list[dict]) -> list[dict]:
+        """Generate an improved action plan based on failures."""
+        # Enhanced plan adds delays and fallbacks
+        improved = []
+        for i, result in enumerate(execution_results):
+            status = (result.get("status") or "").lower()
+            if status in {"success", "opened", "written", "typed", "sent", "completed"}:
+                # Keep successful actions, but add a small delay after them
+                action = dict(result)  # shallow copy
+                if "before_ms" not in action:
+                    action["before_ms"] = 500
+                improved.append(action)
+            else:
+                # For failed actions, add retry with longer delay
+                action = dict(result)
+                action["before_ms"] = max(2000, action.get("before_ms", 1000) + 500)
+                action["retry_count"] = action.get("retry_count", 1)
+                improved.append(action)
+
+        return improved
+
+    def _save_cycle_feedback(self, user_id: str, goal: str, evaluation: dict, improvement: dict) -> None:
+        """Save cycle feedback for learning and future improvements."""
+        try:
+            feedback_record = {
+                "user_id": user_id,
+                "goal": goal,
+                "evaluation": evaluation,
+                "improvement": improvement,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "cycle_timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            
+            # Store in local reasoner state for retrieval
+            if hasattr(self, "_local_reasoner_state"):
+                cycles = self._local_reasoner_state.get("cycles", [])
+                if not isinstance(cycles, list):
+                    cycles = []
+                cycles.append(feedback_record)
+                # Keep last 50 cycles
+                self._local_reasoner_state["cycles"] = cycles[-50:]
+                self._save_local_reasoner_state()
+        except Exception:
+            pass
+
+    def process_goal_plan_execute_cycle(self, goal: str, user_id: str, planned_response: dict, execution_results: list[dict]) -> dict:
+        """
+        PUBLIC method: Complete the Goal → Plan → Execute → Evaluate → Improve cycle.
+        
+        Called AFTER the agent executes the planned actions.
+        
+        Args:
+            goal: Original user intent/goal
+            user_id: User identifier for feedback persistence
+            planned_response: Response from generate_response (Plan phase)
+            execution_results: Results from agent execution (Execute phase)
+        
+        Returns: Enhanced response with evaluation and improvement data:
+        {
+            "evaluation": {...},
+            "improvement_feedback": {...},
+            "recommendations": str,
+            "next_steps": [suggested actions],
+        }
+        """
+        # EVALUATE PHASE
+        evaluation = self.evaluate_execution_results(goal, planned_response.get("actions", []), execution_results)
+        
+        # IMPROVE PHASE
+        improvement_feedback = self.generate_improvement_feedback(goal, evaluation, execution_results)
+        
+        # SAVE FEEDBACK FOR LEARNING
+        self._save_cycle_feedback(user_id, goal, evaluation, improvement_feedback)
+        
+        # Generate recommendations
+        recommendations = self._generate_cycle_recommendations(evaluation, improvement_feedback)
+        
+        return {
+            "evaluation": evaluation,
+            "improvement_feedback": improvement_feedback,
+            "recommendations": recommendations,
+            "next_steps": improvement_feedback.get("improved_plan", []),
+            "cycle_status": "complete",
+        }
+
+    def _generate_cycle_recommendations(self, evaluation: dict, improvement: dict) -> str:
+        """Generate user-facing recommendations from the cycle."""
+        retry_strategy = improvement.get("retry_strategy", "UNKNOWN")
+        outcome = evaluation.get("outcome_summary", "Cycle completed")
+        
+        if retry_strategy == "SUCCESS":
+            return f"✓ {outcome} Goal achieved successfully!"
+        elif retry_strategy == "RETRY_FAILED_ONLY":
+            failed = ', '.join(str(i) for i in evaluation.get("failed_actions", []))
+            return f"⚠ {outcome} Some actions failed. Will retry: {failed}"
+        elif retry_strategy == "RETRY_WITH_DELAYS":
+            return f"⚠ {outcome} Some actions need timing adjustments. Retrying with longer delays."
+        elif retry_strategy == "REPLAN_REQUIRED":
+            return f"✗ {outcome} Many actions failed. Needs replanning."
+        else:
+            return outcome
+
+    def _get_cycle_context_for_goal(self, goal: str, max_records: int = 5) -> str:
+        """
+        Universal learning context: retrieve prior cycle feedback for goals similar to the
+        current one and format it as a context string injected into the LLM system prompt.
+
+        This is the mechanism that makes the LLM self-adaptive WITHOUT adding new
+        deterministic if-blocks — the model learns from past successes/failures through
+        the Goal → Plan → Execute → Evaluate → Improve cycle.
+        """
+        try:
+            cycles = self._local_reasoner_state.get("cycles", [])
+            if not isinstance(cycles, list) or not cycles:
+                return ""
+
+            goal_words = set(re.findall(r'\b\w{3,}\b', goal.lower()))
+            if not goal_words:
+                return ""
+
+            # Score each record by keyword overlap with the current goal.
+            scored: list[tuple[int, dict]] = []
+            for record in reversed(cycles):  # most-recent-first
+                rec_goal = (record.get("goal") or "").lower()
+                rec_words = set(re.findall(r'\b\w{3,}\b', rec_goal))
+                overlap = len(goal_words & rec_words)
+                if overlap > 0:
+                    scored.append((overlap, record))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top = [r for _, r in scored[:max_records]]
+            if not top:
+                return ""
+
+            lines: list[str] = []
+            for record in top:
+                rec_goal = record.get("goal", "")
+                evaluation = record.get("evaluation") or {}
+                improvement = record.get("improvement") or {}
+                retry_strategy = improvement.get("retry_strategy", "")
+                success_rate = float(evaluation.get("success_rate") or 0)
+                actions_planned = evaluation.get("actions_planned") or []
+                action_names = [
+                    str(a.get("type", a) if isinstance(a, dict) else a)
+                    for a in actions_planned
+                ]
+
+                if retry_strategy == "SUCCESS" or success_rate >= 0.8:
+                    lines.append(
+                        f"PAST SUCCESS: goal='{rec_goal}' → actions={action_names} "
+                        f"(success_rate={success_rate:.0%})"
+                    )
+                else:
+                    failed = evaluation.get("failed_actions") or []
+                    improved = [
+                        str(a.get("type", a) if isinstance(a, dict) else a)
+                        for a in (improvement.get("improved_plan") or [])
+                    ]
+                    lines.append(
+                        f"PAST ATTEMPT: goal='{rec_goal}' → tried={action_names} "
+                        f"failed={failed} strategy={retry_strategy} improved_plan={improved}"
+                    )
+
+            if not lines:
+                return ""
+
+            return (
+                "CYCLE LEARNING CONTEXT (use to improve action planning):\n"
+                + "\n".join(lines)
+            )
+        except Exception:
+            return ""
 
     async def _ensure_session(self):
         if not self.session:
@@ -913,6 +1243,24 @@ class LLMAdapter:
         tl = t.lower().strip()
 
         # Skill invocation: "run skill X" / "use X skill" / "skill X"
+
+        # Fast-path: greetings and simple small-talk → instant response, no LLM needed.
+        _GREETING_PATTERNS = {
+            r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day)|what'?s\s+up|sup|yo)[\s!?.,]*$": "Hey! How can I help you?",
+            r"^how\s+are\s+you[\s!?.,]*$": "I'm running great! What can I do for you?",
+            r"^(what'?s\s+your\s+name|who\s+are\s+you)[\s!?.,]*$": "I'm Jarvis, your AI assistant.",
+            r"^(thanks|thank\s+you|ty|cheers|thx)[\s!?.,]*$": "You're welcome! Anything else?",
+            r"^(bye|goodbye|see\s+you|cya|take\s+care)[\s!?.,]*$": "Goodbye! Have a great day.",
+            r"^(ok|okay|got\s+it|sure|alright|fine|noted)[\s!?.,]*$": "Got it!",
+            r"^(what\s+can\s+you\s+do|what\s+are\s+your\s+capabilities|help|show\s+(me\s+)?commands?)[\s!?.,]*$":
+                "I can open apps, search the web, send WhatsApp messages, take screenshots, set volume, do research, learn from you, and much more. Just ask!",
+        }
+        try:
+            for pattern, reply in _GREETING_PATTERNS.items():
+                if re.match(pattern, tl, re.IGNORECASE):
+                    return {"text": reply, "actions": [], "source": "deterministic-greeting"}
+        except Exception:
+            pass
         try:
             skill = LLMAdapter._match_skill_command(tl)
             if skill:
@@ -1090,6 +1438,98 @@ class LLMAdapter:
         except Exception:
             pass
 
+        # Deterministic: screenshot / screen capture
+        # "Take a screenshot", "capture my screen", "screenshot"
+        try:
+            if re.search(r"\b(take|capture|grab|snap)\b", tl) and re.search(r"\b(screenshot|screen\s*shot|screen)\b", tl) \
+                    or tl.strip() in {"screenshot", "take screenshot", "grab screenshot"}:
+                return {
+                    "text": "Taking a screenshot.",
+                    "actions": [{"type": "capture_screen"}],
+                    "source": "deterministic-voice-screenshot",
+                }
+        except Exception:
+            pass
+
+        # High-confidence WhatsApp messaging intent: deterministic parsing
+        # Supports: phone number → "Open WhatsApp send message to +918460217965 message is 'Hello'"
+        #           contact name → "Send WhatsApp to John saying Meeting at 5pm"
+        # Architecture: Intent → Mode Selection (app vs web) → Plan Actions → Execute
+        try:
+            wants_whatsapp = bool(re.search(r"\b(watsapp|whatsapp)\b", tl))
+            wants_send = bool(re.search(r"\b(send|message|msg)\b", tl))
+            if wants_whatsapp and wants_send:
+                # Extract phone number from the text
+                phone_match = re.search(r"(?<!\w)(\+?\d[\d\s\-]{7,18}\d)(?!\w)", t)
+                phone_raw = (phone_match.group(1).strip() if phone_match else "")
+                phone_digits = re.sub(r"[^0-9+]", "", phone_raw)
+                if phone_digits.startswith("+"):
+                    phone_digits = phone_digits[1:]
+
+                # Extract contact name when no phone number: "to John", "to My Friend"
+                contact_name = ""
+                if not phone_digits:
+                    name_match = re.search(
+                        r"\bto\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\b",
+                        t,
+                    )
+                    contact_name = (name_match.group(1).strip() if name_match else "")
+
+                # Extract message: "message/msg is ...", "saying ..."
+                msg_match = re.search(
+                    r"(?:l?message|msg)\s*(?:is|:)?\s*[\"'\u201c\u201d]?\s*([^\"'\u201c\u201d]+?)(?:[\"'\u201c\u201d]\s*)?$",
+                    t,
+                    flags=re.IGNORECASE,
+                ) or re.search(
+                    r"\bsaying\s+[\"'\u201c\u201d]?(.+?)[\"'\u201c\u201d]?\s*$",
+                    t,
+                    flags=re.IGNORECASE,
+                )
+                message_text = (msg_match.group(1).strip() if msg_match else "")
+                message_text = re.sub(r"\s+", " ", message_text).strip()
+
+                # Choose recipient label for TTS
+                recipient = phone_raw or contact_name or "the contact"
+                # Choose search term to type in WhatsApp: phone takes priority, else name
+                search_term = phone_raw if phone_digits else contact_name
+
+                if (phone_digits or contact_name) and message_text:
+                    # Desktop app first; agent falls back automatically if not installed.
+                    out_actions = [
+                        {"type": "open_app", "app_name": "WhatsApp"},
+                        {"type": "type_text", "text": search_term, "before_ms": 1500},
+                        {"type": "press_key", "key": "enter", "presses": 1, "before_ms": 500},
+                        {"type": "type_text", "text": message_text, "before_ms": 800},
+                        {"type": "press_key", "key": "enter", "presses": 1, "before_ms": 200},
+                    ]
+                    return {
+                        "text": f"Opening WhatsApp and sending message to {recipient}.",
+                        "actions": out_actions,
+                        "source": "deterministic-voice-whatsapp",
+                    }
+                elif phone_digits:
+                    # Phone only, no message: open WhatsApp web for the contact
+                    wa_url = f"https://web.whatsapp.com/send?phone={phone_digits}"
+                    return {
+                        "text": f"Opening WhatsApp for {phone_raw}.",
+                        "actions": [{"type": "open_url", "url": wa_url}],
+                        "source": "deterministic-voice-whatsapp-web-fallback",
+                    }
+                elif contact_name:
+                    # Name only, no message: open WhatsApp and search contact
+                    out_actions = [
+                        {"type": "open_app", "app_name": "WhatsApp"},
+                        {"type": "type_text", "text": contact_name, "before_ms": 1500},
+                        {"type": "press_key", "key": "enter", "presses": 1, "before_ms": 500},
+                    ]
+                    return {
+                        "text": f"Opening WhatsApp and searching for {contact_name}.",
+                        "actions": out_actions,
+                        "source": "deterministic-voice-whatsapp",
+                    }
+        except Exception:
+            pass
+
         # Avoid hijacking internet/research tasks.
         if re.search(r"\b(latest|today|current|news|download|install|update|documentation|docs|how\s+to)\b", tl):
             return None
@@ -1194,15 +1634,16 @@ class LLMAdapter:
                 # Provide a short deterministic user-facing line.
                 first = actions[0] if isinstance(actions[0], dict) else {}
                 at = (first.get("type") or "").strip()
-                if at == "open_app":
-                    name = str(first.get("app_name") or "").strip() or "the app"
-                    parsed["text"] = f"Opening {name}."
-                elif at == "open_url":
-                    parsed["text"] = "Opening it."
-                elif at == "web_search":
-                    parsed["text"] = "Looking it up online."
-                else:
-                    parsed["text"] = "Done."
+                if not str(parsed.get("text") or "").strip():
+                    if at == "open_app":
+                        name = str(first.get("app_name") or "").strip() or "the app"
+                        parsed["text"] = f"Opening {name}."
+                    elif at == "open_url":
+                        parsed["text"] = "Opening it."
+                    elif at == "web_search":
+                        parsed["text"] = "Looking it up online."
+                    else:
+                        parsed["text"] = "Done."
                 parsed["source"] = "deterministic-voice"
                 return parsed
 
@@ -1782,6 +2223,21 @@ class LLMAdapter:
         if LLMAdapter._is_research_status_question(user_text):
             return False
 
+        # Internal/self-management requests should not be routed to web lookup.
+        self_system_markers = (
+            "update yourself",
+            "improve yourself",
+            "fix yourself",
+            "about yourself",
+            "your architecture",
+            "your system",
+            "my assistant",
+            "this assistant",
+            "my jarvis",
+        )
+        if any(m in t for m in self_system_markers):
+            return False
+
         # If global factual mode is enabled, default to web-first for non-local informational queries.
         # This applies across ALL topics (not domain-specific).
         local_action_markers = (
@@ -2056,7 +2512,13 @@ class LLMAdapter:
             return parsed
 
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
-        """Generate a rich, humanlike structured response."""
+        """
+        Generate a rich, humanlike structured response.
+        
+        Architecture: Goal → Plan → Execute → Evaluate → Improve
+        This method handles: Goal (detect intent) + Plan (generate actions)
+        Execution, evaluation, and improvement are handled by callers after agent runs.
+        """
         try:
             self._ensure_local_reasoner_state_scope(user_prefs)
         except Exception:
@@ -2381,11 +2843,23 @@ Safety rules for actions:
 Style tone: {tone}.
 """
 
+        # Universal learning: inject prior cycle feedback so the LLM adapts to
+        # past successes/failures for ANY scenario without new deterministic handlers.
+        cycle_ctx = ""
+        try:
+            cycle_ctx = self._get_cycle_context_for_goal(text)
+        except Exception:
+            cycle_ctx = ""
+
+        effective_context = context or ""
+        if cycle_ctx:
+            effective_context = (cycle_ctx + "\n\n" + effective_context).strip()
+
         user_prompt = f"""
 User said: "{text}"
 
 Context:
-    {context[-1800:] if context else '(none)'}
+    {effective_context[-2400:] if effective_context else '(none)'}
 
 Return ONLY valid JSON matching:
 {{
@@ -2770,6 +3244,61 @@ Return ONLY valid JSON matching:
             "pypi": "https://pypi.org",
         }
 
+        # High-confidence messaging intent: WhatsApp send message to a number.
+        # Emit device_action wrappers so execution is routed to the PC agent
+        # (instead of local UI-only open_url handling in the frontend).
+        try:
+            raw_text = (user_text or "").strip()
+            tl_full = raw_text.lower()
+            wants_whatsapp = bool(re.search(r"\b(watsapp|whatsapp)\b", tl_full))
+            wants_send = bool(re.search(r"\b(send|message|msg)\b", tl_full))
+            if wants_whatsapp and wants_send:
+                phone_match = re.search(r"(?<!\w)(\+?\d[\d\s\-]{7,18}\d)(?!\w)", raw_text)
+                msg_match = re.search(
+                    r"\b(?:l?message|msg)\s*(?:is|:)?\s*[\"\u201c\u201d']?(.+?)[\"\u201c\u201d']?\s*$",
+                    raw_text,
+                    flags=re.IGNORECASE,
+                )
+
+                phone_raw = (phone_match.group(1).strip() if phone_match else "")
+                phone_digits = re.sub(r"[^0-9+]", "", phone_raw)
+                if phone_digits.startswith("+"):
+                    phone_digits = phone_digits[1:]
+
+                message_text = (msg_match.group(1).strip() if msg_match else "")
+                message_text = re.sub(r"\s+", " ", message_text).strip()
+
+                wa_url = "https://web.whatsapp.com"
+                if phone_digits:
+                    if message_text:
+                        try:
+                            from urllib.parse import quote_plus
+
+                            encoded_msg = quote_plus(message_text)
+                        except Exception:
+                            encoded_msg = re.sub(r"\s+", "+", message_text)
+                        wa_url = f"https://web.whatsapp.com/send?phone={phone_digits}&text={encoded_msg}"
+                    else:
+                        wa_url = f"https://web.whatsapp.com/send?phone={phone_digits}"
+
+                out_actions = [{"type": "device_action", "action": "open_url", "url": wa_url}]
+
+                # Only auto-press Enter when the user explicitly asked to send and provided message text.
+                if message_text and re.search(r"\bsend\b", tl_full):
+                    out_actions.append({
+                        "type": "device_action",
+                        "action": "press_key",
+                        "key": "enter",
+                        "presses": 1,
+                        "before_ms": 2200,
+                    })
+
+                parsed["actions"] = out_actions
+                parsed["text"] = "Opening WhatsApp and sending your message."
+                return parsed
+        except Exception:
+            pass
+
         # If the user said "open/visit/go to ...", capture the target phrase.
         # We'll use this for safer search fallbacks (instead of trusting guessed URLs).
         user_target = ""
@@ -3017,12 +3546,24 @@ Return ONLY valid JSON matching:
 
         # Show the draft to the user AND type it into the opened app.
         # Keep interval conservative to reduce risk of missed keystrokes (especially for long drafts).
+        before_ms = 650
+        try:
+            app_for_delay = str(open_app.get("app_name") or "").strip().lower()
+            if any(k in app_for_delay for k in ("word", "winword")):
+                before_ms = 1800
+            if len(draft) > 500:
+                before_ms = max(before_ms, 2300)
+        except Exception:
+            before_ms = 650
+
         actions.append({
             "type": "type_text",
             "text": draft,
             "interval": 0.05,
             # Give the OS time to focus the newly opened window before typing.
-            "before_ms": 650,
+            "before_ms": int(before_ms),
+            # Mark deterministic drafts so ambiguity filters don't remove them.
+            "auto_generated": True,
         })
         parsed["actions"] = actions
 
@@ -3046,7 +3587,11 @@ Return ONLY valid JSON matching:
 
         has_recipient = bool(
             re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", tl)
-            or re.search(r"\b(to|for)\s+(hr|human\s+resources|recruiter|hiring\s+manager|team|manager|boss)\b", tl)
+            or re.search(
+                r"\b(?:to|for)\b(?:\s+[a-z0-9&._-]+){0,6}\s+"
+                r"(?:hr|human\s+resources|recruiter|hiring\s+manager|team|manager|boss)\b",
+                tl,
+            )
         )
 
         has_purpose = bool(
@@ -3060,7 +3605,13 @@ Return ONLY valid JSON matching:
             )
         )
 
-        return not (has_recipient and has_purpose)
+        # Treat common voice phrasing as sufficiently specific for a usable first draft.
+        has_style_or_business_context = bool(
+            re.search(r"\b(formal|professional|official)\b", tl)
+            or re.search(r"\b(it\s+company|company|corporate|hr\s+team)\b", tl)
+        )
+
+        return not (has_recipient and (has_purpose or has_style_or_business_context))
 
     @staticmethod
     def _postprocess_email_clarification_actions(user_text: str, parsed: dict) -> dict:
@@ -3089,7 +3640,12 @@ Return ONLY valid JSON matching:
 
         base_text = (parsed.get("text") or "").strip()
         question = "What should the email be about, and who should it go to? If it’s HR, which company and which role?"
-        parsed["text"] = question if not base_text else (base_text + "\n\n" + question)
+        if not base_text:
+            parsed["text"] = question
+        elif question.lower() in base_text.lower():
+            parsed["text"] = base_text
+        else:
+            parsed["text"] = base_text + "\n\n" + question
         parsed["actions"] = filtered
         parsed["clarification"] = {
             "kind": "email",
@@ -3226,6 +3782,14 @@ Return ONLY valid JSON matching:
 
         vague_queries = {"research", "market research", "market", "analysis", "summary"}
 
+        def _terms(s: str) -> set[str]:
+            toks = re.findall(r"[a-z0-9]+", (s or "").lower())
+            stop = {
+                "the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "with", "this", "that",
+                "please", "research", "analysis", "summary", "find", "search", "look", "up", "online",
+            }
+            return {t for t in toks if t and t not in stop and len(t) >= 3}
+
         def _ask(question: str, filtered_actions: list[dict]) -> dict:
             base_text = (parsed.get("text") or "").strip()
             parsed["text"] = question if not base_text else (base_text + "\n\n" + question)
@@ -3255,6 +3819,16 @@ Return ONLY valid JSON matching:
             if not query or query in vague_queries or len(re.findall(r"[a-z0-9]+", query)) < 3:
                 if re.search(r"\b(research|market research|analysis|summary|report)\b", tl):
                     return _ask("What topic should I research, and which region or time range?", filtered)
+
+            # Avoid low-signal web searches that are likely unrelated to user intent.
+            if at == "web_search":
+                q_terms = _terms(query)
+                u_terms = _terms(tl)
+                if q_terms and u_terms and len(q_terms.intersection(u_terms)) == 0:
+                    return _ask(
+                        "I need one specific topic before I search. What exact subject should I focus on?",
+                        filtered,
+                    )
 
             filtered.append(a)
 
@@ -3372,6 +3946,11 @@ Return ONLY valid JSON matching:
                 continue
             at = str(a.get("type") or "").strip().lower()
             if at != "type_text":
+                filtered.append(a)
+                continue
+
+            # Keep deterministic drafts that were explicitly generated by the assistant.
+            if bool(a.get("auto_generated")):
                 filtered.append(a)
                 continue
 

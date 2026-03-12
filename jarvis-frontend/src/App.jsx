@@ -242,6 +242,200 @@ export default function App() {
     ]);
   }, []);
 
+  const buildDeviceCompletionSpeech = useCallback((results, sourceText) => {
+    const rows = Array.isArray(results) ? results : [];
+    const successStates = new Set(["success", "opened", "edited", "written", "copied", "moved", "deleted"]);
+
+    const statusOf = (r) => (r?.status || "").toString().trim().toLowerCase();
+    const actionOf = (r) => (r?.action_type || r?.action || r?.type || "").toString().trim().toLowerCase();
+
+    const successRows = rows.filter((r) => successStates.has(statusOf(r)));
+    const failedRows = rows.filter((r) => {
+      const st = statusOf(r);
+      return st && !successStates.has(st);
+    });
+
+    const labelMap = {
+      open_app: "open app",
+      close_app: "close app",
+      switch_app: "switch app",
+      open_url: "open link",
+      open_path: "open folder",
+      type_text: "type text",
+      press_key: "press keys",
+      hotkey: "use shortcut",
+      set_volume: "set volume",
+      set_mute: "set mute",
+      set_brightness: "set brightness",
+      set_power_plan: "set power plan",
+      set_wifi: "set Wi-Fi",
+      set_bluetooth: "set Bluetooth",
+      set_airplane_mode: "set airplane mode",
+      execute_command: "run command",
+      list_processes: "list processes",
+      kill_process: "stop process",
+      self_update: "apply update",
+    };
+
+    const humanize = (actionType) => {
+      const t = (actionType || "").toString().trim().toLowerCase();
+      if (!t) return "complete the task";
+      if (labelMap[t]) return labelMap[t];
+      return t.replace(/_/g, " ");
+    };
+
+    if (successRows.length === 0) {
+      if (failedRows.length > 0) {
+        return "I couldn't complete that request.";
+      }
+      return "Your request is completed.";
+    }
+
+    const uniqueActions = [];
+    const seen = new Set();
+    for (const r of successRows) {
+      const a = actionOf(r);
+      const key = a || "unknown";
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueActions.push(humanize(a));
+      if (uniqueActions.length >= 3) break;
+    }
+
+    const actionPart = uniqueActions.length
+      ? uniqueActions.join(", ")
+      : "your task";
+
+    if (failedRows.length > 0) {
+      return `I completed ${successRows.length} action${successRows.length > 1 ? "s" : ""}, but ${failedRows.length} need attention.`;
+    }
+
+    const src = (sourceText || "").toString().trim();
+    if (src) {
+      return `Done. I completed ${actionPart}.`;
+    }
+    return `Done. I completed ${actionPart}.`;
+  }, []);
+
+  const speakNotificationCompletion = useCallback((text) => {
+    const spoken = (text || "").toString().trim();
+    if (!spoken) return;
+    try {
+      setSpeaking(true);
+      speak(spoken, () => {
+        setSpeaking(false);
+        try { wakeRecognizer.current?.start(); } catch {}
+      });
+    } catch {}
+  }, []);
+
+  const buildResearchCompletionSpeech = useCallback((msg, state = "complete") => {
+    const topic = (msg?.topic || "").toString().trim();
+    if (state === "failed") {
+      return topic
+        ? `Research failed for ${topic}. Please check the details.`
+        : "Research failed. Please check the details.";
+    }
+    if (state === "cancelled") {
+      return topic ? `Research cancelled for ${topic}.` : "Research cancelled.";
+    }
+    return topic ? `Research complete for ${topic}.` : "Research complete.";
+  }, []);
+
+  const buildWorkflowCompletionSpeech = useCallback((msg) => {
+    const type = (msg?.type || "").toString().trim().toLowerCase();
+    const status = (msg?.status || "").toString().trim().toLowerCase();
+    const summary = (msg?.summary || msg?.message || msg?.result || "").toString().trim();
+
+    const isFailure =
+      ["failed", "error", "forbidden", "denied"].includes(status) ||
+      /failed|error|denied|forbidden/.test(type);
+    const isCancelled = ["cancelled", "canceled", "stopped"].includes(status) || /cancelled|canceled|stopped/.test(type);
+
+    const area = (() => {
+      if (/self[_-]?update|update/.test(type)) return "self update";
+      if (/improvement|improve/.test(type)) return "improvement";
+      if (/learning|learn/.test(type)) return "learning";
+      if (/research/.test(type)) return "research";
+      return "operation";
+    })();
+
+    if (isCancelled) {
+      return `The ${area} operation was cancelled.`;
+    }
+    if (isFailure) {
+      return `The ${area} operation needs attention.`;
+    }
+
+    const hasCompletionSignal =
+      ["success", "completed", "done", "ok", "saved", "applied", "learned"].includes(status) ||
+      /complete|completed|done|success|saved|applied|learned/.test(type) ||
+      /complete|completed|done|saved|applied|learned/.test(summary.toLowerCase());
+
+    if (!hasCompletionSignal) return "";
+
+    if (summary) {
+      return `Done. ${summary.length > 120 ? `${summary.slice(0, 117)}...` : summary}`;
+    }
+    return `Done. The ${area} operation is completed.`;
+  }, []);
+
+  const buildDirectChatCompletionSpeech = useCallback((res) => {
+    const response = res && typeof res === "object" ? res : {};
+    const text = (response?.text || "").toString().trim();
+    const textLower = text.toLowerCase();
+
+    const actions = Array.isArray(response?.actions) ? response.actions : [];
+    const actionResults = Array.isArray(response?.action_results) ? response.action_results : [];
+
+    const actionTypeOf = (row) => (row?.type || row?.action_type || row?.action || "").toString().trim().toLowerCase();
+    const statusOf = (row) => (row?.status || "").toString().trim().toLowerCase();
+
+    const types = new Set();
+    for (const a of actions) {
+      const t = actionTypeOf(a);
+      if (t) types.add(t);
+    }
+    for (const r of actionResults) {
+      const t = actionTypeOf(r);
+      if (t) types.add(t);
+    }
+
+    const hasTypeLike = (re) => Array.from(types).some((t) => re.test(t));
+    const hasResearchPayload = !!(response?.research_report || (response?.research && (response.research?.summary || response.research?.sources)));
+    const isResearch =
+      hasResearchPayload ||
+      hasTypeLike(/research|web_search|fetch_url/) ||
+      /research complete|research finished|research ready/.test(textLower);
+
+    if (isResearch) {
+      const topic = (response?.research_report?.topic || response?.research?.topic || "").toString().trim();
+      return buildResearchCompletionSpeech({ topic }, "complete");
+    }
+
+    const isWorkflow = hasTypeLike(/self[_-]?update|improvement|improve|learning|learn/);
+    if (!isWorkflow) return "";
+
+    const succeededStates = new Set(["success", "completed", "done", "ok", "saved", "applied", "learned"]);
+    let ok = 0;
+    let bad = 0;
+    for (const r of actionResults) {
+      const st = statusOf(r);
+      if (!st) continue;
+      if (succeededStates.has(st)) ok += 1;
+      else bad += 1;
+    }
+
+    const status = bad > 0 ? "failed" : (ok > 0 ? "success" : "");
+    const typeHint = hasTypeLike(/self[_-]?update/) ? "self_update" : (hasTypeLike(/improvement|improve/) ? "improvement" : "learning");
+    return buildWorkflowCompletionSpeech({
+      type: typeHint,
+      status,
+      summary: text,
+      message: text,
+    });
+  }, [buildResearchCompletionSpeech, buildWorkflowCompletionSpeech]);
+
   useEffect(() => {
     try {
       // Keep small, fast cache for refresh (session-only).
@@ -311,6 +505,7 @@ export default function App() {
               summary,
               sources: msg?.sources || [],
             });
+            speakNotificationCompletion(buildResearchCompletionSpeech(msg, "complete"));
             return;
           }
 
@@ -320,12 +515,14 @@ export default function App() {
             const taskId = (msg?.task_id || "").toString();
             if (taskId) latestResearchTaskIdRef.current = taskId;
             addLog("error", `Research failed${topic ? `: ${topic}` : ""}. ${err || ""}`.trim());
+            speakNotificationCompletion(buildResearchCompletionSpeech(msg, "failed"));
             return;
           }
 
           if (type === "research_cancelled") {
             const topic = (msg?.topic || "").toString();
             addLog("system", `Research cancelled${topic ? `: ${topic}` : ""}.`);
+            speakNotificationCompletion(buildResearchCompletionSpeech(msg, "cancelled"));
             return;
           }
 
@@ -349,7 +546,28 @@ export default function App() {
             const summary = `Results: ${ok} ok, ${err} error, ${forbidden} forbidden.`;
             const details = sourceText ? `Source: ${sourceText}` : "";
             addLog("system", [header, summary, details].filter(Boolean).join("\n"));
+
+            // Voice UX: confirm completion when all actions succeeded.
+            try {
+              const allGood = ok > 0 && err === 0 && forbidden === 0;
+              if (allGood) {
+                const spoken = buildDeviceCompletionSpeech(results, sourceText);
+
+                setSpeaking(true);
+                speak(spoken, () => {
+                  setSpeaking(false);
+                  try { wakeRecognizer.current?.start(); } catch {}
+                });
+              }
+            } catch {}
             return;
+          }
+
+          if (/self[_-]?update|improvement|learn|learning/.test(type)) {
+            try {
+              const spoken = buildWorkflowCompletionSpeech(msg);
+              if (spoken) speakNotificationCompletion(spoken);
+            } catch {}
           }
 
           addLog("system", `${type}: ${JSON.stringify(msg)}`);
@@ -378,7 +596,15 @@ export default function App() {
 
     connect();
     return cleanup;
-  }, [isAuthenticated, sessionId, addLog, addStructuredLog]);
+  }, [
+    isAuthenticated,
+    sessionId,
+    addLog,
+    addStructuredLog,
+    buildResearchCompletionSpeech,
+    buildWorkflowCompletionSpeech,
+    speakNotificationCompletion,
+  ]);
 
   useEffect(() => {
     if (!isAuthenticated || !sessionId) return;
@@ -1353,8 +1579,9 @@ export default function App() {
         }
       }
 
+      const spokenResponse = buildDirectChatCompletionSpeech(res) || res.text || "Done.";
       setSpeaking(true);
-      speak(res.text || "Done.", () => {
+      speak(spokenResponse, () => {
         setSpeaking(false);
         setEmotion("calm");
         try { wakeRecognizer.current?.start(); } catch {}
@@ -1467,7 +1694,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, addStructuredLog, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow]);
+  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow]);
 
   const startHoldToTalk = useCallback(async () => {
     if (!isAuthenticated) {
@@ -1724,29 +1951,9 @@ export default function App() {
         const inWakeSession = Date.now() < (wakeSessionUntilRef.current || 0);
 
         const nm = normalizeWake(assistantNameRef.current || "Jarvis");
-        const genericWakeNames = ["assistant", "jarvis", "computer", "system"];
-        const genericWakeHit = genericWakeNames.some((name) =>
-          transcript === name ||
-          transcript.includes(`hey ${name}`) ||
-          transcript.includes(`ok ${name}`) ||
-          transcript.includes(`okay ${name}`) ||
-          transcript.includes(`${name} wake up`) ||
-          transcript.includes(`wake up ${name}`) ||
-          transcript.includes(`${name} wakeup`) ||
-          transcript.includes(`wakeup ${name}`)
-        );
-        const wakeByPhrase = transcript.includes("wake up") || transcript.includes("wakeup");
-        const wakeByNamePhrase = nm && (
-          transcript.includes(`${nm} wake up`) ||
-          transcript.includes(`wake up ${nm}`) ||
-          transcript.includes(`${nm} wakeup`) ||
-          transcript.includes(`wakeup ${nm}`)
-        );
-        const wakeHit =
-          (nm && (transcript.includes(`hey ${nm}`) || transcript.includes(`ok ${nm}`) || transcript.includes(`okay ${nm}`) || transcript === nm)) ||
-          genericWakeHit ||
-          wakeByPhrase ||
-          wakeByNamePhrase;
+        // Strict wake phrase: "Hey {AssistantName}".
+        // This prevents accidental activation on generic terms like "assistant".
+        const wakeHit = !!(nm && transcript === `hey ${nm}`);
 
         if (wakeHit) {
           // In biometrics mode, defer wake-session start and UI pulse until

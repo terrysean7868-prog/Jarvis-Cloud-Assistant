@@ -436,6 +436,50 @@ export async function getAutonomyGoals({ sessionId = null, statuses = "pending,r
   return await res.json();
 }
 
+export async function updateAutonomyGoalGraph(goalId, payload = {}, timeoutMs = DEFAULT_TIMEOUT) {
+  const gid = String(goalId || "").trim();
+  if (!gid) throw new Error("goalId is required");
+
+  const res = await timeoutFetch(`${API_URL}/api/autonomy/goals/${encodeURIComponent(gid)}/graph`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function controlAutonomyRuntime(action, sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const res = await timeoutFetch(`${API_URL}/api/autonomy/control`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: String(action || "").trim().toLowerCase(), session_id: sessionId || null }),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getAnatomyState(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  if (sessionId) qs.set("session_id", String(sessionId));
+  const url = `${API_URL}/api/anatomy/state${qs.toString() ? `?${qs.toString()}` : ""}`;
+  const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
 export async function getAgents(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
   const qs = new URLSearchParams();
   if (sessionId) qs.set("session_id", String(sessionId));
@@ -526,6 +570,42 @@ export async function getAdminProgressiveUpdateReport(sessionId, timeoutMs = DEF
   const res = await timeoutFetch(`${API_URL}/api/admin/updates/progressive-report?${qs.toString()}`, {
     method: "GET",
     headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getAdminUpdateConfig(sessionId, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  qs.set("session_id", String(sessionId || ""));
+
+  const res = await timeoutFetch(`${API_URL}/api/admin/updates/config?${qs.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function runAdminAutoUpdate({ sessionId, description, scopes = null, autoInstallDeps = null, dryRun = false }, timeoutMs = 180000) {
+  const body = {
+    session_id: sessionId,
+    description: String(description || "").trim(),
+    dry_run: !!dryRun,
+  };
+  if (Array.isArray(scopes) && scopes.length) body.scopes = scopes;
+  if (typeof autoInstallDeps === "boolean") body.auto_install_deps = autoInstallDeps;
+
+  const res = await timeoutFetch(`${API_URL}/api/admin/updates/auto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   }, timeoutMs);
 
   if (!res.ok) {

@@ -33,6 +33,25 @@ class GoalManager:
         except Exception:
             return
 
+    def _to_jsonable(self, value: Any) -> Any:
+        """Best-effort conversion for Mongo/BSON values before API responses."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, ObjectId):
+            return str(value)
+        if isinstance(value, dict):
+            out: dict[str, Any] = {}
+            for k, v in value.items():
+                out[str(k)] = self._to_jsonable(v)
+            return out
+        if isinstance(value, (list, tuple, set)):
+            return [self._to_jsonable(v) for v in value]
+
+        # Keep API robust even when a nested value is an unexpected object.
+        return str(value)
+
     def create_goal(self, *, goal: str, owner: str = "system", priority: int = 5, metadata: dict[str, Any] | None = None) -> str:
         payload = {
             "goal": goal,
@@ -71,7 +90,7 @@ class GoalManager:
                 rows = list(coll.find(query).sort("updated_at", -1).limit(max(1, limit)))
                 for row in rows:
                     row["_id"] = str(row.get("_id"))
-                return rows
+                return [self._to_jsonable(r) for r in rows]
             except Exception:
                 pass
 
@@ -79,7 +98,7 @@ class GoalManager:
         if statuses:
             rows = [r for r in rows if r.get("status") in statuses]
         rows.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
-        return rows[: max(1, limit)]
+        return [self._to_jsonable(r) for r in rows[: max(1, limit)]]
 
     def get_goal(self, goal_id: str) -> dict[str, Any] | None:
         coll = self._collection()
@@ -89,10 +108,11 @@ class GoalManager:
                 row = coll.find_one({"_id": oid})
                 if row:
                     row["_id"] = str(row.get("_id"))
-                return row
+                return self._to_jsonable(row)
             except Exception:
                 pass
-        return self._in_memory_goals.get(goal_id)
+        row = self._in_memory_goals.get(goal_id)
+        return self._to_jsonable(row) if row else None
 
     def update_goal_status(self, goal_id: str, status: str, *, last_error: str | None = None) -> bool:
         coll = self._collection()

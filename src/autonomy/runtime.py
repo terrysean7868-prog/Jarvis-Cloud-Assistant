@@ -76,3 +76,15 @@ class AutonomyRuntime:
 
     async def stop(self) -> None:
         await self.loop.stop()
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self.loop.pause()
+        else:
+            self.loop.resume()
+
+    def control_state(self) -> dict:
+        return self.loop.control_state()
+
+    async def run_tick_once(self) -> None:
+        await self.loop.tick_once()

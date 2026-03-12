@@ -680,8 +680,11 @@ def _pick_best_source_url(action_results: list[dict]) -> str | None:
                     urls.append(u)
                 continue
             if action in {"web_search", "search"}:
+                query = str(r.get("query") or "").strip()
                 for item in (r.get("results") or [])[:5]:
                     if not isinstance(item, dict):
+                        continue
+                    if not _web_result_is_relevant(query, item):
                         continue
                     u = str(item.get("url") or "").strip()
                     if u:
@@ -697,6 +700,40 @@ def _pick_best_source_url(action_results: list[dict]) -> str | None:
         return urls[0]
     except Exception:
         return None
+
+
+def _web_query_terms(query: str) -> set[str]:
+    raw = (query or "").strip().lower()
+    toks = re.findall(r"[a-z0-9]+", raw)
+    if not toks:
+        return set()
+    stop = {
+        "the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "with", "is", "are",
+        "what", "how", "when", "where", "who", "why", "this", "that", "these", "those", "please",
+        "search", "find", "look", "up", "online", "internet", "research", "analysis", "summary",
+    }
+    return {t for t in toks if t and t not in stop and len(t) >= 3}
+
+
+def _web_result_is_relevant(query: str, item: dict) -> bool:
+    terms = _web_query_terms(query)
+    if not terms:
+        return True
+
+    title = str(item.get("title") or "").lower()
+    snippet = str(item.get("snippet") or "").lower()
+    url = str(item.get("url") or "").lower()
+    blob = f"{title} {snippet} {url}"
+
+    hit_count = sum(1 for t in terms if t in blob)
+    if hit_count >= 2:
+        return True
+
+    # For short precise queries, a single strong hit can be acceptable.
+    if len(terms) <= 3 and hit_count >= 1:
+        return True
+
+    return False
 
 
 
@@ -1252,6 +1289,56 @@ async def _dispatch_actions_to_device(device_id: str, username: str, actions: li
     return job
 
 
+async def _run_device_cycle_evaluation(goal: str, user_id: str, device_id: str, execution_results: list[dict]) -> None:
+    """
+    Run the Goal → Plan → Execute → Evaluate → Improve cycle for device actions.
+    
+    This runs in the background after the device executes actions, enabling:
+    - Automatic evaluation of goal achievement
+    - Improvement recommendations
+    - Learning feedback persistence for future refinements
+    """
+    try:
+        if not goal or not user_id or not execution_results:
+            return
+        
+        # Reconstruct a minimal planned_response from execution results.
+        # We don't have the original actions list, but we can infer it from the results.
+        planned_response = {
+            "actions": [{"type": r.get("action_type")} for r in execution_results if isinstance(r, dict)]
+        }
+        
+        # Invoke the full cycle: Evaluate phase + Improve phase
+        cycle_result = llm.process_goal_plan_execute_cycle(
+            goal=goal,
+            user_id=user_id,
+            planned_response=planned_response,
+            execution_results=execution_results,
+        )
+        
+        logger = __import__('logging').getLogger(__name__)
+        logger.info(
+            "[CYCLE RESULT] goal=%s, user=%s, device=%s, "
+            "achieved=%s, success_rate=%s, retry_strategy=%s",
+            goal[:50],
+            user_id,
+            device_id,
+            cycle_result.get("evaluation", {}).get("goal_achieved"),
+            cycle_result.get("evaluation", {}).get("success_rate"),
+            cycle_result.get("improvement_feedback", {}).get("retry_strategy"),
+        )
+        
+        # TODO: Implement auto-retry if retry_strategy suggests it
+        # retry_strategy = cycle_result.get("improvement_feedback", {}).get("retry_strategy")
+        # if retry_strategy in {"RETRY_FAILED_ONLY", "RETRY_WITH_DELAYS"}:
+        #     improved_plan = cycle_result.get("improvement_feedback", {}).get("improved_plan")
+        #     # Requeue with improved plan + adjusted delays
+        
+    except Exception as e:
+        logger = __import__('logging').getLogger(__name__)
+        logger.error("[CYCLE EVAL ERROR] %s", e)
+
+
 # =========================================================
 # Remote Agent (WebSocket)
 # =========================================================
@@ -1383,6 +1470,7 @@ async def agent_ws(ws: WebSocket):
                 try:
                     jid = (payload or {}).get("job_id")
                     user, did, source_text = _pop_job_owner(jid)
+                    execution_results = (payload or {}).get("results") or []
                     if user:
                         await notification_hub.publish(
                             user,
@@ -1391,9 +1479,20 @@ async def agent_ws(ws: WebSocket):
                                 "job_id": str(jid or ""),
                                 "device_id": did or device_id,
                                 "source_text": source_text,
-                                "results": _truncate_notification_payload((payload or {}).get("results") or []),
+                                "results": _truncate_notification_payload(execution_results),
                                 "received_at": datetime.now(timezone.utc).isoformat(),
                             },
+                        )
+                        
+                        # CONTINUOUS IMPROVEMENT: Run cycle evaluation & improvement in background.
+                        # This enables automatic refinement for each device action across all scenarios.
+                        asyncio.create_task(
+                            _run_device_cycle_evaluation(
+                                goal=source_text,
+                                user_id=user,
+                                device_id=did or device_id,
+                                execution_results=execution_results,
+                            )
                         )
                 except Exception:
                     pass
@@ -2684,8 +2783,11 @@ def _build_web_context_from_action_results(action_results: list[dict], max_chars
             lines: list[str] = []
             if query:
                 lines.append(f"Web results for: {query}")
+            kept = 0
             for idx, item in enumerate(results[:3], start=1):
                 if not isinstance(item, dict):
+                    continue
+                if not _web_result_is_relevant(query, item):
                     continue
                 title = (item.get("title") or "").strip()
                 url = (item.get("url") or "").strip()
@@ -2698,8 +2800,9 @@ def _build_web_context_from_action_results(action_results: list[dict], max_chars
                 if url:
                     parts.append(url)
                 if parts:
-                    lines.append(f"{idx}) " + " | ".join(parts))
-            if len(lines) > 1:
+                    kept += 1
+                    lines.append(f"{kept}) " + " | ".join(parts))
+            if len(lines) > 1 and kept > 0:
                 blocks.append("\n".join(lines))
             continue
 
@@ -2736,11 +2839,15 @@ def _web_lookup_found(action_results: list[dict]) -> bool:
         action = (r.get("action") or r.get("action_type") or "").lower()
         if action in {"web_search", "search"}:
             results = r.get("results") or []
-            if isinstance(results, list) and len(results) > 0:
+            query = str(r.get("query") or "").strip()
+            if isinstance(results, list) and any(_web_result_is_relevant(query, i) for i in results if isinstance(i, dict)):
                 return True
             try:
-                if int(r.get("results_count") or 0) > 0:
-                    return True
+                if int(r.get("results_count") or 0) > 0 and isinstance(results, list):
+                    # If we got count>0 but none are relevant, keep found=False to avoid random sources.
+                    if any(_web_result_is_relevant(query, i) for i in results if isinstance(i, dict)):
+                        return True
+                    return False
             except Exception:
                 pass
         if action == "fetch_url":
@@ -3049,6 +3156,39 @@ class GoalCreateRequest(BaseModel):
     priority: int = 5
 
 
+class GoalGraphNodePatch(BaseModel):
+    task_id: str
+    title: str | None = None
+    description: str | None = None
+    dependencies: List[str] | None = None
+    status: str | None = None
+
+
+class GoalGraphMoveRequest(BaseModel):
+    task_id: str
+    to_index: int
+
+
+class GoalGraphUpdateRequest(BaseModel):
+    session_id: str | None = None
+    nodes: List[GoalGraphNodePatch] | None = None
+    move: GoalGraphMoveRequest | None = None
+    rerun_failed: bool = False
+
+
+class AutonomyControlRequest(BaseModel):
+    session_id: str | None = None
+    action: str
+
+
+class AdminAutoUpdateRunRequest(BaseModel):
+    session_id: str
+    description: str
+    scopes: List[str] | None = None
+    auto_install_deps: bool | None = None
+    dry_run: bool = False
+
+
 @app.post("/api/autonomy/goals")
 async def create_autonomy_goal(req: GoalCreateRequest):
     principal = _get_principal(req.session_id) if req.session_id else {"username": "system", "role": "anonymous"}
@@ -3069,21 +3209,244 @@ async def create_autonomy_goal(req: GoalCreateRequest):
 
 @app.get("/api/autonomy/goals")
 async def list_autonomy_goals(statuses: str = "pending,running,failed,completed", limit: int = 25):
-    status_list = [s.strip() for s in statuses.split(",") if s.strip()]
-    goals = autonomy_runtime.goals.list_goals(statuses=status_list, limit=max(1, min(limit, 100)))
-    return {"status": "ok", "goals": goals}
+    try:
+        status_list = [s.strip() for s in statuses.split(",") if s.strip()]
+        goals = autonomy_runtime.goals.list_goals(statuses=status_list, limit=max(1, min(limit, 100)))
+        return {"status": "ok", "goals": goals}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "goals": []}
 
 
 @app.get("/api/autonomy/status")
 async def autonomy_status():
+    try:
+        return {
+            "status": "ok",
+            "runtime": {
+                "enabled": bool(getattr(rd, "AUTONOMY_ENABLED", True)),
+                "poll_interval_seconds": int(getattr(rd, "AUTONOMY_POLL_INTERVAL_SECONDS", 20)),
+                "control": autonomy_runtime.control_state(),
+            },
+            "health": autonomy_runtime._health_check(),
+            "tools": autonomy_runtime.tools.list_tools(),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "runtime": {
+                "enabled": bool(getattr(rd, "AUTONOMY_ENABLED", True)),
+                "poll_interval_seconds": int(getattr(rd, "AUTONOMY_POLL_INTERVAL_SECONDS", 20)),
+                "control": autonomy_runtime.control_state(),
+            },
+            "health": {"status": "error", "message": str(e)},
+            "tools": [],
+            "message": str(e),
+        }
+
+
+def _extract_graph_from_goal(goal: dict | None) -> dict:
+    reports = (goal or {}).get("reports") if isinstance(goal, dict) else None
+    if not isinstance(reports, list):
+        return {"goal": str((goal or {}).get("goal") or ""), "nodes": []}
+    for r in reversed(reports):
+        if isinstance(r, dict) and isinstance(r.get("graph"), dict):
+            graph = dict(r.get("graph") or {})
+            if not isinstance(graph.get("nodes"), list):
+                graph["nodes"] = []
+            if "goal" not in graph:
+                graph["goal"] = str((goal or {}).get("goal") or "")
+            return graph
+    return {"goal": str((goal or {}).get("goal") or ""), "nodes": []}
+
+
+@app.patch("/api/autonomy/goals/{goal_id}/graph")
+async def update_autonomy_goal_graph(goal_id: str, req: GoalGraphUpdateRequest):
+    principal = _get_principal(req.session_id) if req.session_id else {"username": "system", "role": "anonymous"}
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(req.session_id)
+
+    goal = autonomy_runtime.goals.get_goal(goal_id)
+    if not goal:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found")
+
+    owner = str(goal.get("owner") or "").strip().lower()
+    username = str(principal.get("username") or "").strip().lower()
+    is_admin = str(principal.get("role") or "").strip().lower() == "admin"
+    if owner and username and owner != username and not is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to edit this goal graph")
+
+    graph = _extract_graph_from_goal(goal)
+    nodes = graph.get("nodes") if isinstance(graph, dict) else []
+    if not isinstance(nodes, list):
+        nodes = []
+
+    by_id: dict[str, dict] = {}
+    for n in nodes:
+        if isinstance(n, dict):
+            tid = str(n.get("task_id") or "").strip()
+            if tid:
+                by_id[tid] = n
+
+    for patch in (req.nodes or []):
+        tid = str(patch.task_id or "").strip()
+        if not tid:
+            continue
+        node = by_id.get(tid)
+        if not node:
+            continue
+        if patch.title is not None:
+            node["title"] = str(patch.title).strip() or node.get("title")
+        if patch.description is not None:
+            node["description"] = str(patch.description).strip() or node.get("description")
+        if patch.status is not None:
+            node["status"] = str(patch.status).strip().lower() or node.get("status")
+        if patch.dependencies is not None:
+            deps = [str(d).strip() for d in patch.dependencies if str(d).strip() and str(d).strip() != tid]
+            deps = [d for d in deps if d in by_id]
+            node["dependencies"] = deps
+
+    if req.move is not None and nodes:
+        move_tid = str(req.move.task_id or "").strip()
+        target_idx = max(0, min(int(req.move.to_index), len(nodes) - 1))
+        cur_idx = next((i for i, n in enumerate(nodes) if str((n or {}).get("task_id") or "") == move_tid), None)
+        if cur_idx is not None:
+            item = nodes.pop(cur_idx)
+            nodes.insert(target_idx, item)
+
+    rerun_count = 0
+    if bool(req.rerun_failed):
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            st = str(n.get("status") or "").strip().lower()
+            if st in {"failed", "blocked"}:
+                n["status"] = "pending"
+                n["result"] = None
+                rerun_count += 1
+        if rerun_count:
+            autonomy_runtime.goals.update_goal_status(goal_id, "pending", last_error=None)
+            autonomy_runtime.goals.append_report(
+                goal_id,
+                {
+                    "type": "graph_rerun_requested",
+                    "requested_by": username or "system",
+                    "rerun_count": rerun_count,
+                },
+            )
+
+    graph["nodes"] = nodes
+    autonomy_runtime.goals.append_report(
+        goal_id,
+        {
+            "type": "graph_updated",
+            "updated_by": username or "system",
+            "graph": graph,
+        },
+    )
+
     return {
         "status": "ok",
+        "goal_id": goal_id,
+        "graph": graph,
+        "rerun_count": rerun_count,
+    }
+
+
+@app.post("/api/autonomy/control")
+async def autonomy_control(req: AutonomyControlRequest):
+    principal = _get_principal(req.session_id) if req.session_id else {"username": "system", "role": "anonymous"}
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(req.session_id)
+
+    if str(principal.get("role") or "").lower() != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    action = str(req.action or "").strip().lower()
+    if action == "pause":
+        autonomy_runtime.set_paused(True)
+    elif action == "resume":
+        autonomy_runtime.set_paused(False)
+    elif action == "tick":
+        await autonomy_runtime.run_tick_once()
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported action")
+
+    return {"status": "ok", "control": autonomy_runtime.control_state()}
+
+
+@app.get("/api/anatomy/state")
+async def anatomy_state(session_id: str | None = None):
+    if CLOUD_MODE:
+        _require_authenticated_session(session_id)
+
+    goals = autonomy_runtime.goals.list_goals(statuses=["pending", "running", "awaiting_confirmation", "failed", "completed", "blocked"], limit=120)
+    goal_counts = {
+        "pending": 0,
+        "running": 0,
+        "awaiting_confirmation": 0,
+        "failed": 0,
+        "completed": 0,
+        "blocked": 0,
+    }
+    for g in goals:
+        s = str((g or {}).get("status") or "").strip().lower()
+        if s in goal_counts:
+            goal_counts[s] += 1
+
+    tasks = task_manager.get_all_tasks() or []
+    task_counts = {
+        "pending": 0,
+        "in_progress": 0,
+        "running": 0,
+        "completed": 0,
+        "failed": 0,
+        "blocked": 0,
+    }
+    for t in tasks:
+        s = str((t or {}).get("status") or "").strip().lower()
+        if s in task_counts:
+            task_counts[s] += 1
+
+    connected = await device_hub.list_agents()
+    knowledge = {
+        "learning_examples": 0,
+        "web_training_items": 0,
+    }
+    try:
+        database._ensure_connected()
+        if database.db is not None:
+            knowledge["learning_examples"] = int(database.db["learning_examples"].count_documents({}))
+            knowledge["web_training_items"] = int(database.db["web_training_data"].count_documents({}))
+    except Exception:
+        pass
+
+    health = autonomy_runtime._health_check()
+    return {
+        "status": "ok",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
         "runtime": {
-            "enabled": bool(getattr(rd, "AUTONOMY_ENABLED", True)),
-            "poll_interval_seconds": int(getattr(rd, "AUTONOMY_POLL_INTERVAL_SECONDS", 20)),
+            "health": health,
+            "control": autonomy_runtime.control_state(),
         },
-        "health": autonomy_runtime._health_check(),
-        "tools": autonomy_runtime.tools.list_tools(),
+        "agents": {
+            "definitions": autonomy_runtime.controller.list_agents(),
+            "count": len(autonomy_runtime.controller.list_agents()),
+        },
+        "task_graph": {
+            "goals": goal_counts,
+            "tasks": task_counts,
+            "recent_goals": goals[:20],
+        },
+        "knowledge_store": knowledge,
+        "runtime_services": {
+            "tools": autonomy_runtime.tools.list_tools(),
+            "tool_count": len(autonomy_runtime.tools.list_tools()),
+            "self_improvement": health.get("self_improvement") if isinstance(health, dict) else {},
+        },
+        "device_connections": {
+            "connected_count": len(connected),
+            "devices": list(connected.values()),
+        },
     }
 
 
@@ -3889,6 +4252,32 @@ class AdminRollbackRequest(BaseModel):
     backup_path: str | None = None
     session_id: str
 
+
+def _admin_update_target_map() -> dict[str, list[str]]:
+    return {
+        "backend": [
+            "apps/web/app.py",
+            "src/core/chat_orchestrator.py",
+            "src/core/llm_adapter.py",
+            "src/core/jarvis_brain.py",
+        ],
+        "frontend": [
+            "jarvis-frontend/src/App.jsx",
+            "jarvis-frontend/src/pages/AutonomyDashboard.jsx",
+            "jarvis-frontend/src/components/UpdateManagementConsole.jsx",
+        ],
+        "agents": [
+            "apps/pc_agent/pc_agent.py",
+            "src/agents/agent_controller.py",
+            "src/autonomy/runtime.py",
+        ],
+        "tools": [
+            "src/tools/tool_registry.py",
+            "mcp_server/server.py",
+            "src/internet/internet.py",
+        ],
+    }
+
 @app.post("/api/self-update")
 async def handle_self_update(request: SelfUpdateRequest):
     """Handle self-update commands from voice input."""
@@ -3991,6 +4380,66 @@ async def admin_progressive_update_report(session_id: str):
             "report": None,
         }
     return get_progressive_llm_update_report()
+
+
+@app.get("/api/admin/updates/config")
+async def admin_updates_config(session_id: str):
+    _require_admin_session(session_id)
+    return {
+        "status": "success",
+        "llm": {
+            "provider": str(getattr(rd, "LLM_PROVIDER", "openai_compatible") or "openai_compatible"),
+            "primary_model": str(getattr(rd, "PRIMARY_MODEL", "") or ""),
+            "primary_endpoint": str(getattr(rd, "PRIMARY_ENDPOINT", "") or ""),
+            "smart_model": str(getattr(rd, "SMART_MODEL", "") or ""),
+        },
+        "targets": _admin_update_target_map(),
+    }
+
+
+@app.post("/api/admin/updates/auto")
+async def admin_updates_auto(req: AdminAutoUpdateRunRequest):
+    principal = _require_admin_session(req.session_id)
+    if not SELF_UPDATE_AVAILABLE or self_update_file is None:
+        return {"status": "error", "message": "Self-update is unavailable", "results": []}
+
+    actor = (principal.get("username") or "admin").strip().lower() or "admin"
+    scopes = [str(s).strip().lower() for s in (req.scopes or ["backend", "frontend", "agents", "tools"]) if str(s).strip()]
+    target_map = _admin_update_target_map()
+
+    selected_files: list[str] = []
+    for scope in scopes:
+        selected_files.extend(target_map.get(scope, []))
+
+    # Keep deterministic order and avoid duplicates.
+    seen: set[str] = set()
+    ordered_files: list[str] = []
+    for fp in selected_files:
+        if fp not in seen:
+            seen.add(fp)
+            ordered_files.append(fp)
+
+    results: list[dict] = []
+    for fp in ordered_files:
+        try:
+            out = self_update_file(
+                req.description,
+                fp,
+                actor=actor,
+                auto_install_deps=req.auto_install_deps,
+                dry_run=bool(req.dry_run),
+            )
+            results.append({"file_path": fp, **(out or {})})
+        except Exception as e:
+            results.append({"file_path": fp, "status": "error", "message": str(e)})
+
+    ok = all(str(r.get("status") or "").lower() == "success" for r in results) if results else False
+    return {
+        "status": "success" if ok else "partial",
+        "message": "Auto-update run complete" if ok else "Auto-update completed with errors",
+        "scopes": scopes,
+        "results": results,
+    }
 
 # =========================================================
 # Email Generation API

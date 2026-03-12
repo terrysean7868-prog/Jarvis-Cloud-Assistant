@@ -3,13 +3,20 @@ import ReactFlow, { Background, Controls } from "reactflow";
 import "reactflow/dist/style.css";
 import { Line } from "react-chartjs-2";
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend } from "chart.js";
-import { createAutonomyGoal, getAutonomyGoals, getAutonomyStatus } from "../utils/api";
+import {
+  controlAutonomyRuntime,
+  createAutonomyGoal,
+  getAutonomyGoals,
+  getAutonomyStatus,
+  updateAutonomyGoalGraph,
+} from "../utils/api";
 import TaskManager from "./TaskManager";
 import AgentMonitor from "./AgentMonitor";
 import ResearchMonitor from "./ResearchMonitor";
 import DeviceControl from "./DeviceControl";
 import SystemHealth from "./SystemHealth";
 import SelfImprovementPanel from "./SelfImprovementPanel";
+import AnatomyView from "./AnatomyView";
 import "./autonomyPanel.css";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend);
@@ -22,6 +29,7 @@ const TABS = [
   "Devices",
   "Health",
   "Self-Improvement",
+  "Anatomy",
 ];
 
 function normalizeGraph(goal, accentColor = "#00eaff") {
@@ -61,6 +69,9 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
   const [status, setStatus] = useState(null);
   const [goalInput, setGoalInput] = useState("");
   const [selectedGoalId, setSelectedGoalId] = useState("");
+  const [selectedNodeId, setSelectedNodeId] = useState("");
+  const [editTitle, setEditTitle] = useState("");
+  const [editDeps, setEditDeps] = useState("");
   const [error, setError] = useState("");
 
   const accentColor = useMemo(() => {
@@ -73,17 +84,30 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
 
   const refresh = useCallback(async () => {
     try {
-      const [g, s] = await Promise.all([
+      const [gRes, sRes] = await Promise.allSettled([
         getAutonomyGoals({ sessionId, statuses: "pending,running,awaiting_confirmation,failed,completed", limit: 80 }),
         getAutonomyStatus(sessionId),
       ]);
+
+      const g = gRes.status === "fulfilled" ? gRes.value : null;
+      const s = sRes.status === "fulfilled" ? sRes.value : null;
       const rows = Array.isArray(g?.goals) ? g.goals : [];
       setGoals(rows);
       setStatus(s || null);
+
+      if (gRes.status === "rejected") {
+        const msg = gRes.reason?.message || String(gRes.reason || "Failed to load goals");
+        setError(msg);
+      } else if (sRes.status === "rejected") {
+        const msg = sRes.reason?.message || String(sRes.reason || "Failed to load runtime status");
+        setError(msg);
+      } else {
+        setError("");
+      }
+
       if (!selectedGoalId && rows.length) {
         setSelectedGoalId(String(rows[0]?._id || ""));
       }
-      setError("");
     } catch (e) {
       setError(e?.message || String(e));
     }
@@ -121,6 +145,22 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
   }, [goals, accentColor]);
 
   const graph = useMemo(() => normalizeGraph(selectedGoal || {}, accentColor), [selectedGoal, accentColor]);
+  const selectedGraphNode = useMemo(() => {
+    const reports = Array.isArray(selectedGoal?.reports) ? selectedGoal.reports : [];
+    const graphReport = [...reports].reverse().find((r) => r && r.graph && Array.isArray(r.graph.nodes));
+    const nodes = Array.isArray(graphReport?.graph?.nodes) ? graphReport.graph.nodes : [];
+    return nodes.find((n) => String(n?.task_id || "") === String(selectedNodeId || "")) || null;
+  }, [selectedGoal, selectedNodeId]);
+
+  useEffect(() => {
+    if (!selectedGraphNode) {
+      setEditTitle("");
+      setEditDeps("");
+      return;
+    }
+    setEditTitle(String(selectedGraphNode?.title || ""));
+    setEditDeps(Array.isArray(selectedGraphNode?.dependencies) ? selectedGraphNode.dependencies.join(",") : "");
+  }, [selectedGraphNode]);
 
   const startGoal = async () => {
     if (!goalInput.trim()) return;
@@ -137,6 +177,68 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
     setError("Cancel endpoint is not available yet in this build; use task cancellation controls.");
   };
 
+  const runtimeControl = async (action) => {
+    try {
+      await controlAutonomyRuntime(action, sessionId);
+      await refresh();
+      setError("");
+    } catch (e) {
+      setError(e?.message || String(e));
+    }
+  };
+
+  const saveNodeEdit = async () => {
+    if (!selectedGoalId || !selectedNodeId) return;
+    const deps = String(editDeps || "")
+      .split(",")
+      .map((d) => d.trim())
+      .filter(Boolean);
+    try {
+      await updateAutonomyGoalGraph(selectedGoalId, {
+        session_id: sessionId,
+        nodes: [{ task_id: selectedNodeId, title: editTitle.trim(), dependencies: deps }],
+      });
+      await refresh();
+      setError("");
+    } catch (e) {
+      setError(e?.message || String(e));
+    }
+  };
+
+  const moveNode = async (dir) => {
+    const reports = Array.isArray(selectedGoal?.reports) ? selectedGoal.reports : [];
+    const graphReport = [...reports].reverse().find((r) => r && r.graph && Array.isArray(r.graph.nodes));
+    const nodes = Array.isArray(graphReport?.graph?.nodes) ? graphReport.graph.nodes : [];
+    const idx = nodes.findIndex((n) => String(n?.task_id || "") === String(selectedNodeId || ""));
+    if (idx < 0) return;
+    const to = dir === "up" ? idx - 1 : idx + 1;
+    if (to < 0 || to >= nodes.length) return;
+    try {
+      await updateAutonomyGoalGraph(selectedGoalId, {
+        session_id: sessionId,
+        move: { task_id: selectedNodeId, to_index: to },
+      });
+      await refresh();
+      setError("");
+    } catch (e) {
+      setError(e?.message || String(e));
+    }
+  };
+
+  const rerunFailed = async () => {
+    if (!selectedGoalId) return;
+    try {
+      await updateAutonomyGoalGraph(selectedGoalId, {
+        session_id: sessionId,
+        rerun_failed: true,
+      });
+      await refresh();
+      setError("");
+    } catch (e) {
+      setError(e?.message || String(e));
+    }
+  };
+
   const renderAutonomy = () => (
     <div className="panel-grid">
       <div className="panel-card">
@@ -145,6 +247,9 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
           <input value={goalInput} onChange={(e) => setGoalInput(e.target.value)} placeholder="Start a new autonomous goal" />
           <button className="panel-btn" onClick={startGoal}>Start Goal</button>
           <button className="panel-btn danger" onClick={cancelGoal}>Cancel Goal</button>
+          <button className="panel-btn" onClick={() => runtimeControl("pause")}>Pause</button>
+          <button className="panel-btn" onClick={() => runtimeControl("resume")}>Resume</button>
+          <button className="panel-btn" onClick={() => runtimeControl("tick")}>Tick</button>
         </div>
         <div className="panel-list" style={{ marginTop: 10 }}>
           {goals.map((g, idx) => (
@@ -163,10 +268,34 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
       <div className="panel-card">
         <h3 className="panel-title">Task Graph</h3>
         <div className="graph-wrap">
-          <ReactFlow nodes={graph.nodes} edges={graph.edges} fitView>
+          <ReactFlow
+            nodes={graph.nodes.map((n) => ({
+              ...n,
+              selected: String(n.id) === String(selectedNodeId || ""),
+              style: {
+                ...(n.style || {}),
+                border: String(n.id) === String(selectedNodeId || "")
+                  ? `1px solid ${accentColor}`
+                  : (n.style?.border || "1px solid rgba(255,255,255,0.2)"),
+              },
+            }))}
+            edges={graph.edges}
+            fitView
+            onNodeClick={(_, node) => setSelectedNodeId(String(node?.id || ""))}
+          >
             <Background color={accentColor} gap={18} size={1} />
             <Controls />
           </ReactFlow>
+        </div>
+        <div className="panel-row" style={{ marginTop: 10 }}>
+          <input value={editTitle} onChange={(e) => setEditTitle(e.target.value)} placeholder="Edit node title" />
+          <input value={editDeps} onChange={(e) => setEditDeps(e.target.value)} placeholder="Dependencies (comma-separated task_ids)" />
+        </div>
+        <div className="panel-row" style={{ marginTop: 8 }}>
+          <button className="panel-btn" onClick={saveNodeEdit}>Save Node</button>
+          <button className="panel-btn" onClick={() => moveNode("up")}>Move Up</button>
+          <button className="panel-btn" onClick={() => moveNode("down")}>Move Down</button>
+          <button className="panel-btn warn" onClick={rerunFailed}>Re-run Failed</button>
         </div>
       </div>
       <div className="panel-card">
@@ -202,6 +331,7 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
         {tab === "Devices" && <DeviceControl sessionId={sessionId} />}
         {tab === "Health" && <SystemHealth sessionId={sessionId} logs={logs} />}
         {tab === "Self-Improvement" && <SelfImprovementPanel sessionId={sessionId} />}
+        {tab === "Anatomy" && <AnatomyView sessionId={sessionId} />}
       </div>
     </div>
   );

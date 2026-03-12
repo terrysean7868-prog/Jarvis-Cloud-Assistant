@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
+  getAdminUpdateConfig,
   getAdminUpdateHistory,
   getAdminProgressiveUpdateReport,
+  runAdminAutoUpdate,
   runAdminUpdate,
   rollbackAdminUpdate,
   sendMessage,
@@ -19,6 +21,8 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
   const [moduleInstruction, setModuleInstruction] = useState("Use exchangerate.host, add caching, retries, and tests.");
   const [deleteTaskTitle, setDeleteTaskTitle] = useState("");
   const [progressiveReport, setProgressiveReport] = useState(null);
+  const [updateConfig, setUpdateConfig] = useState(null);
+  const [autoScopes, setAutoScopes] = useState(["backend", "frontend", "agents", "tools"]);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -27,6 +31,23 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
   const historyPreview = useMemo(() => {
     return Array.isArray(history) ? history.slice(0, 40) : [];
   }, [history]);
+
+  const kanban = useMemo(() => {
+    const lanes = {
+      queued: [],
+      in_progress: [],
+      completed: [],
+      failed: [],
+    };
+    for (const row of historyPreview) {
+      const s = String(row?.status || "").toLowerCase();
+      if (["success", "completed", "done", "rolled_back"].includes(s)) lanes.completed.push(row);
+      else if (["running", "in_progress", "started"].includes(s)) lanes.in_progress.push(row);
+      else if (["error", "failed"].includes(s)) lanes.failed.push(row);
+      else lanes.queued.push(row);
+    }
+    return lanes;
+  }, [historyPreview]);
 
   const refreshHistory = useCallback(async () => {
     if (!sessionId) return;
@@ -61,6 +82,18 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
     }
   }, [sessionId]);
 
+  const refreshConfig = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const res = await getAdminUpdateConfig(sessionId, 12000);
+      if (res?.status === "success") {
+        setUpdateConfig(res);
+      }
+    } catch {
+      setUpdateConfig(null);
+    }
+  }, [sessionId]);
+
   const runUpdate = async (dryRun = false) => {
     if (!sessionId) return;
     if (!filePath.trim() || !description.trim()) {
@@ -87,6 +120,34 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
       await refreshHistory();
     } catch (e) {
       setStatus(e?.message || `${dryRun ? "Dry-run" : "Update"} failed.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runAuto = async (dryRun = false) => {
+    if (!sessionId) return;
+    const desc = description.trim();
+    if (!desc) {
+      setStatus("Description is required for auto-update.");
+      return;
+    }
+    setBusy(true);
+    setStatus(dryRun ? "Running auto dry-run..." : "Running auto-update workflow...");
+    try {
+      const res = await runAdminAutoUpdate({
+        sessionId,
+        description: desc,
+        scopes: autoScopes,
+        autoInstallDeps,
+        dryRun,
+      });
+      const rows = Array.isArray(res?.results) ? res.results : [];
+      const okCount = rows.filter((r) => String(r?.status || "").toLowerCase() === "success").length;
+      setStatus(`${res?.message || "Auto-update complete"}. Successful files: ${okCount}/${rows.length}.`);
+      await refreshHistory();
+    } catch (e) {
+      setStatus(e?.message || "Auto-update failed.");
     } finally {
       setBusy(false);
     }
@@ -179,10 +240,11 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
   useEffect(() => {
     if (!isOpen || !sessionId) return;
     (async () => {
+      await refreshConfig();
       await refreshProgressiveReport();
       await refreshHistory();
     })();
-  }, [isOpen, sessionId, refreshProgressiveReport, refreshHistory]);
+  }, [isOpen, sessionId, refreshConfig, refreshProgressiveReport, refreshHistory]);
 
   if (!isOpen) return null;
 
@@ -207,9 +269,39 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
           Auto-install missing Python dependencies
         </label>
 
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", color: "#9ecfe0", fontSize: 12 }}>
+          {["backend", "frontend", "agents", "tools"].map((scope) => (
+            <label key={scope} style={{ display: "flex", gap: 6, alignItems: "center", border: "1px solid #2f3a40", borderRadius: 8, padding: "4px 8px" }}>
+              <input
+                type="checkbox"
+                checked={autoScopes.includes(scope)}
+                onChange={(e) => {
+                  setAutoScopes((prev) => {
+                    if (e.target.checked) return Array.from(new Set([...prev, scope]));
+                    return prev.filter((s) => s !== scope);
+                  });
+                }}
+              />
+              {scope}
+            </label>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 12, color: "#9ecfe0", border: "1px solid #23303a", borderRadius: 8, padding: 8 }}>
+          <strong>LLM Config:</strong>{" "}
+          {updateConfig?.llm
+            ? `${updateConfig.llm.provider || "-"} | ${updateConfig.llm.primary_model || "-"}`
+            : "Unavailable"}
+          <div style={{ color: "#7ea0ad", marginTop: 4 }}>
+            Path is optional for auto-update. Target files are selected from backend configuration.
+          </div>
+        </div>
+
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button disabled={disabled} onClick={() => runUpdate(true)} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #2f3a40", background: "#1b1f24", color: "#e8f7ff", cursor: disabled ? "not-allowed" : "pointer" }}>Validate (Dry-run)</button>
           <button disabled={disabled} onClick={() => runUpdate(false)} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid var(--jarvis-accent)", background: "rgba(0,234,255,0.12)", color: "var(--jarvis-accent)", cursor: disabled ? "not-allowed" : "pointer" }}>Run Update</button>
+          <button disabled={disabled} onClick={() => runAuto(true)} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #6fdca5", background: "rgba(111,220,165,0.12)", color: "#cdf7e1", cursor: disabled ? "not-allowed" : "pointer" }}>Auto Dry-run</button>
+          <button disabled={disabled} onClick={() => runAuto(false)} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #85ffa8", background: "rgba(133,255,168,0.14)", color: "#dcffe7", cursor: disabled ? "not-allowed" : "pointer" }}>Run Auto Workflow</button>
           <button disabled={disabled} onClick={rollback} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #dca86a", background: "rgba(220,168,106,0.12)", color: "#ffd4a0", cursor: disabled ? "not-allowed" : "pointer" }}>Rollback</button>
           <button disabled={disabled} onClick={continueModuleCycle} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #67c6ff", background: "rgba(103,198,255,0.12)", color: "#c9ecff", cursor: disabled ? "not-allowed" : "pointer" }}>Continue Module Cycle</button>
           <button disabled={disabled} onClick={deleteByTitle} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ff8f8f", background: "rgba(255,143,143,0.12)", color: "#ffd2d2", cursor: disabled ? "not-allowed" : "pointer" }}>Delete Task by Title</button>
@@ -246,6 +338,24 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
       </div>
 
       <div style={{ marginTop: 10, maxHeight: 260, overflowY: "auto", borderTop: "1px solid #2a3138", paddingTop: 8 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
+          {[
+            ["Queued", kanban.queued],
+            ["In Progress", kanban.in_progress],
+            ["Completed", kanban.completed],
+            ["Failed", kanban.failed],
+          ].map(([title, rows]) => (
+            <div key={title} style={{ border: "1px solid #23303a", borderRadius: 8, padding: 6, minHeight: 90 }}>
+              <div style={{ color: "#b7d9e8", fontSize: 12, marginBottom: 6 }}><strong>{title}</strong> ({rows.length})</div>
+              {(rows || []).slice(0, 6).map((row, idx) => (
+                <div key={`${title}-${idx}`} style={{ fontSize: 11, color: "#9ab8c4", marginBottom: 4 }}>
+                  {String(row?.target_file || row?.action || "update")}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+
         {historyPreview.length === 0 ? (
           <div style={{ color: "#8da3ad", fontSize: 12 }}>No update events yet.</div>
         ) : (

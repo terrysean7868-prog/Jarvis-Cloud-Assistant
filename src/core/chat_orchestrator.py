@@ -618,6 +618,40 @@ class ChatOrchestrator:
         preview = "\n".join(lines[:3])
         return (headline + ("\n" + preview if preview else "")).strip()
 
+    async def _run_deferred_actions_with_cycle(
+        self,
+        *,
+        goal: str,
+        user_id: str,
+        planned_actions: List[dict],
+        acting_user: str,
+    ) -> None:
+        """Execute deferred actions and run the universal Goal→Plan→Execute→Evaluate→Improve cycle.
+
+        Called as a background task so the HTTP response is not blocked.
+        Results are stored in the LLM's local_reasoner_state["cycles"] so next call
+        gets smarter without any new deterministic if-blocks.
+        """
+        try:
+            results = await self.executor.process_actions(planned_actions, acting_user)
+        except Exception:
+            results = []
+
+        try:
+            _cycle_fn = (
+                getattr(getattr(self.brain, "llm", None), "process_goal_plan_execute_cycle", None)
+                or getattr(self.brain, "process_goal_plan_execute_cycle", None)
+            )
+            if callable(_cycle_fn) and user_id and results:
+                _cycle_fn(
+                    goal=goal,
+                    user_id=user_id,
+                    planned_response={"actions": list(planned_actions)},
+                    execution_results=list(results) if isinstance(results, list) else [],
+                )
+        except Exception:
+            pass
+
     async def _run_inline_non_web_actions(
         self,
         *,
@@ -997,10 +1031,41 @@ class ChatOrchestrator:
             acting_user=(acting_user or "user"),
         )
 
-        # Defer remaining actions.
+        # UNIVERSAL CYCLE — Evaluate + Improve for all inline actions.
+        # The cycle stores feedback in _local_reasoner_state["cycles"], which is
+        # then injected as context on the next generate_response() call so the LLM
+        # adapts to any scenario without adding new deterministic handlers.
+        inline_results = response.get("action_results") or []
+        if inline_results and user_id:
+            try:
+                _cycle_fn = (
+                    getattr(getattr(self.brain, "llm", None), "process_goal_plan_execute_cycle", None)
+                    or getattr(self.brain, "process_goal_plan_execute_cycle", None)
+                )
+                if callable(_cycle_fn):
+                    background_tasks.add_task(
+                        _cycle_fn,
+                        goal=text,
+                        user_id=user_id,
+                        planned_response=dict(response),
+                        execution_results=list(inline_results),
+                    )
+            except Exception:
+                pass
+
+        # Defer remaining actions (with universal cycle evaluation on completion).
         if actions and not self.cloud_mode:
             try:
-                background_tasks.add_task(self.executor.process_actions, actions, (acting_user or "user"))
+                if user_id:
+                    background_tasks.add_task(
+                        self._run_deferred_actions_with_cycle,
+                        goal=text,
+                        user_id=user_id,
+                        planned_actions=list(actions),
+                        acting_user=(acting_user or "user"),
+                    )
+                else:
+                    background_tasks.add_task(self.executor.process_actions, actions, (acting_user or "user"))
             except Exception:
                 # If background_tasks is unavailable, best-effort ignore.
                 pass

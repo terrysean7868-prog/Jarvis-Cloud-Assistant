@@ -44,8 +44,26 @@ class AutonomousLoopService:
         self.enabled = bool(enabled)
         self._task: asyncio.Task | None = None
         self._stopping = False
+        self._paused = False
         self._scheduler = None
         self._processing_goal_ids: set[str] = set()
+
+    def pause(self) -> None:
+        self._paused = True
+
+    def resume(self) -> None:
+        self._paused = False
+
+    def control_state(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "paused": bool(self._paused),
+            "poll_interval_seconds": int(self.poll_interval_seconds),
+            "processing_goal_ids": sorted(list(self._processing_goal_ids)),
+        }
+
+    async def tick_once(self) -> None:
+        await self._tick()
 
     async def start(self) -> None:
         if not self.enabled:
@@ -95,6 +113,8 @@ class AutonomousLoopService:
             await asyncio.sleep(self.poll_interval_seconds)
 
     async def _tick(self) -> None:
+        if self._paused:
+            return
         goals = self.goal_manager.list_goals(statuses=["pending", "running"], limit=5)
         for goal in goals:
             goal_id = str(goal.get("_id") or "")

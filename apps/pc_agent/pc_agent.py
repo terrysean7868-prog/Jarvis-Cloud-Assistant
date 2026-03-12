@@ -163,6 +163,79 @@ def _save_permissions() -> None:
         return
 
 
+def _supported_actions_catalog() -> list[str]:
+    # Keep this in sync with _execute_action handlers so backend/frontend can reason
+    # about agent capabilities without stale hard-coded lists.
+    return sorted([
+        "inspect_system_state",
+        "monitor_performance",
+        "analyze_screen",
+        "list_device_actions",
+        "set_brightness",
+        "set_power_plan",
+        "set_volume",
+        "set_mute",
+        "lock_screen",
+        "open_settings",
+        "sleep",
+        "hibernate",
+        "shutdown",
+        "restart",
+        "logoff",
+        "open_url",
+        "open_path",
+        "get_clipboard",
+        "set_clipboard",
+        "list_processes",
+        "kill_process",
+        "set_wifi",
+        "set_bluetooth",
+        "set_airplane_mode",
+        # UI automation (requires allow_screen)
+        "show_desktop",
+        "open_task_manager",
+        "open_run_dialog",
+        "open_start_menu",
+        "open_quick_settings",
+        "open_notification_center",
+        "window_snap_left",
+        "window_snap_right",
+        "window_maximize",
+        "window_minimize",
+        "media_play_pause",
+        "media_next_track",
+        "media_prev_track",
+        "media_stop",
+        "alt_tab",
+        "save_screenshot",
+        "find_files",
+        # Existing compatibility action types routed in _execute_action.
+        "open_app",
+        "close_app",
+        "switch_app",
+        "execute_command",
+        "capture_screen",
+        "screen_navigation",
+        "type_text",
+        "press_key",
+        "hotkey",
+        "read",
+        "write",
+        "edit",
+        "delete",
+        "move",
+        "copy",
+        "list",
+        "mkdir",
+        "cleanup",
+        "self_update",
+        "self_add",
+        "agent_set_permissions",
+        "agent_stop",
+        "agent_shutdown",
+    ])
+
+
 def _current_capabilities() -> dict:
     return {
         "allow_execute_command": bool(ALLOW_EXECUTE_COMMAND),
@@ -172,12 +245,7 @@ def _current_capabilities() -> dict:
         "allow_file_ops": bool(ALLOW_FILE_OPS),
         "platform": platform.system().lower(),
         "hostname": platform.node(),
-        "actions": [
-            "inspect_system_state",
-            "monitor_performance",
-            "analyze_screen",
-            "list_device_actions",
-        ],
+        "actions": _supported_actions_catalog(),
     }
 
 
@@ -361,6 +429,20 @@ def _run_powershell(command: str, timeout_s: float = 10.0) -> tuple[int, str, st
         return int(p.returncode), (p.stdout or ""), (p.stderr or "")
     except Exception as e:
         return 1, "", str(e)
+
+
+async def _type_text_with_timeout(sa, text: str, interval: float, timeout_s: float) -> tuple[bool, str]:
+    """Run UI typing with a bounded timeout so action results never hang forever."""
+    try:
+        ok = await asyncio.wait_for(
+            asyncio.to_thread(sa.type_text, text, interval=interval),
+            timeout=max(1.0, float(timeout_s)),
+        )
+        return bool(ok), ""
+    except asyncio.TimeoutError:
+        return False, f"Typing timed out after {float(timeout_s):.1f}s"
+    except Exception as e:
+        return False, str(e)
 
 
 def _get_windows_brightness() -> int | None:
@@ -549,6 +631,31 @@ def _set_windows_power_plan(plan_name: str) -> tuple[bool, str, str | None]:
     return True, f"Set power plan to '{name}'.", guid
 
 
+def _get_windows_active_power_plan() -> tuple[str | None, str | None, str]:
+    """Return active power scheme as (guid, name, err)."""
+    if platform.system() != "Windows":
+        return None, None, "Power plan state is only available on Windows agents."
+    try:
+        p = subprocess.run(["powercfg", "/getactivescheme"], capture_output=True, text=True, timeout=8.0)
+    except Exception as e:
+        return None, None, str(e)
+
+    text_out = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+    m = re.search(r"Power Scheme GUID:\s*([0-9a-fA-F\-]{36})\s*\(([^\)]+)\)", text_out)
+    if not m:
+        return None, None, text_out[:200]
+    return m.group(1).lower(), m.group(2).strip(), ""
+
+
+def _within_tolerance(actual: int | None, target: int, tolerance: int = 3) -> bool:
+    if actual is None:
+        return False
+    try:
+        return abs(int(actual) - int(target)) <= max(0, int(tolerance))
+    except Exception:
+        return False
+
+
 def _open_windows_settings(uri: str) -> None:
     if platform.system() != "Windows":
         return
@@ -671,48 +778,7 @@ async def _execute_action(action: dict) -> dict:
         return {
             "status": "success",
             "action_type": t,
-            "actions": sorted([
-                "set_brightness",
-                "set_power_plan",
-                "set_volume",
-                "set_mute",
-                "lock_screen",
-                "open_settings",
-                "sleep",
-                "hibernate",
-                "shutdown",
-                "restart",
-                "logoff",
-                "open_url",
-                "open_path",
-                "get_clipboard",
-                "set_clipboard",
-                "list_processes",
-                "kill_process",
-                "set_wifi",
-                "set_bluetooth",
-                # UI automation (requires allow_screen)
-                "show_desktop",
-                "open_task_manager",
-                "open_run_dialog",
-                "open_start_menu",
-                "open_quick_settings",
-                "open_notification_center",
-                "window_snap_left",
-                "window_snap_right",
-                "window_maximize",
-                "window_minimize",
-                "media_play_pause",
-                "media_next_track",
-                "media_prev_track",
-                "media_stop",
-                "alt_tab",
-                "save_screenshot",
-                "find_files",
-                "inspect_system_state",
-                "monitor_performance",
-                "analyze_screen",
-            ]),
+            "actions": _supported_actions_catalog(),
         }
 
     if t == "inspect_system_state":
@@ -1158,6 +1224,20 @@ async def _execute_action(action: dict) -> dict:
             return {"status": "error", "action_type": t, "enabled": enabled, "message": (err + " (Opened Bluetooth settings.)").strip()}
         return {"status": "success", "action_type": t, "enabled": enabled}
 
+    if t == "set_airplane_mode":
+        if not ALLOW_EXECUTE_COMMAND:
+            return {"status": "forbidden", "action_type": t, "message": "System control disabled on agent (enable execute_command permission)."}
+        enabled = bool((action or {}).get("enabled", True))
+        # There is no stable, universally safe Windows CLI toggle for Airplane Mode.
+        # Fall back to opening Network settings and report guided/manual step required.
+        _open_windows_settings("ms-settings:network")
+        return {
+            "status": "error",
+            "action_type": t,
+            "enabled": enabled,
+            "message": "Airplane mode toggle is not directly supported on this agent. Opened Network settings.",
+        }
+
     if t in ("show_desktop", "open_task_manager", "open_run_dialog", "open_start_menu"):
         if not ALLOW_SCREEN:
             return {"status": "forbidden", "action_type": t, "message": "Screen features disabled on agent"}
@@ -1233,6 +1313,8 @@ async def _execute_action(action: dict) -> dict:
         if not ALLOW_EXECUTE_COMMAND:
             return {"status": "forbidden", "action_type": t, "message": "System control disabled on agent (enable execute_command permission)."}
 
+        before_value = _get_windows_brightness()
+
         # Accept either absolute value (0-100) or delta.
         try:
             value = action.get("value", None)
@@ -1275,13 +1357,25 @@ async def _execute_action(action: dict) -> dict:
                 "status": "error",
                 "action_type": t,
                 "message": (msg + " (Opened Display settings.)").strip(),
+                "before_value": before_value,
                 "value": target,
             }
-        return {"status": "success", "action_type": "set_brightness", "value": target}
+        after_value = _get_windows_brightness()
+        verified = _within_tolerance(after_value, target, tolerance=4)
+        return {
+            "status": "success" if verified else "partial",
+            "action_type": "set_brightness",
+            "before_value": before_value,
+            "value": target,
+            "after_value": after_value,
+            "verified": verified,
+        }
 
     if t in ("set_volume", "adjust_volume"):
         if not ALLOW_EXECUTE_COMMAND:
             return {"status": "forbidden", "action_type": t, "message": "System control disabled on agent (enable execute_command permission)."}
+
+        before_value, _before_err = _get_windows_volume_percent()
 
         try:
             value = action.get("value", None)
@@ -1324,13 +1418,25 @@ async def _execute_action(action: dict) -> dict:
                 "status": "error",
                 "action_type": t,
                 "message": (msg + " (Opened Sound settings.)").strip(),
+                "before_value": before_value,
                 "value": target,
             }
-        return {"status": "success", "action_type": "set_volume", "value": target}
+        after_value, _after_err = _get_windows_volume_percent()
+        verified = _within_tolerance(after_value, target, tolerance=4)
+        return {
+            "status": "success" if verified else "partial",
+            "action_type": "set_volume",
+            "before_value": before_value,
+            "value": target,
+            "after_value": after_value,
+            "verified": verified,
+        }
 
     if t in ("set_mute", "toggle_mute"):
         if not ALLOW_EXECUTE_COMMAND:
             return {"status": "forbidden", "action_type": t, "message": "System control disabled on agent (enable execute_command permission)."}
+
+        before_mute, _before_err = _get_windows_mute()
 
         muted = (action or {}).get("muted", None)
         if muted is None and t == "toggle_mute":
@@ -1351,20 +1457,54 @@ async def _execute_action(action: dict) -> dict:
                 "status": "error",
                 "action_type": t,
                 "message": (msg + " (Opened Sound settings.)").strip(),
+                "before_muted": before_mute,
                 "muted": bool(muted),
             }
 
-        return {"status": "success", "action_type": "set_mute", "muted": bool(muted)}
+        after_mute, _after_err = _get_windows_mute()
+        verified = (after_mute is not None) and (bool(after_mute) == bool(muted))
+        return {
+            "status": "success" if verified else "partial",
+            "action_type": "set_mute",
+            "before_muted": before_mute,
+            "muted": bool(muted),
+            "after_muted": after_mute,
+            "verified": verified,
+        }
 
     if t in ("set_power_plan", "set_energy_saver"):
         if not ALLOW_EXECUTE_COMMAND:
             return {"status": "forbidden", "action_type": t, "message": "System control disabled on agent (enable execute_command permission)."}
+        before_guid, before_name, _before_err = _get_windows_active_power_plan()
         plan = (action or {}).get("plan") or ("power saver" if bool((action or {}).get("enabled", True)) else "balanced")
         ok, msg, guid = _set_windows_power_plan(str(plan))
         if not ok:
             _open_windows_settings("ms-settings:powersleep")
             msg = (msg + " (Opened Power & sleep settings.)").strip()
-        return {"status": "success" if ok else "error", "action_type": "set_power_plan", "plan": str(plan), "guid": guid, "message": msg}
+            return {
+                "status": "error",
+                "action_type": "set_power_plan",
+                "plan": str(plan),
+                "guid": guid,
+                "before_guid": before_guid,
+                "before_name": before_name,
+                "message": msg,
+            }
+
+        after_guid, after_name, _after_err = _get_windows_active_power_plan()
+        verified = bool(after_guid and guid and (str(after_guid).lower() == str(guid).lower()))
+        return {
+            "status": "success" if verified else "partial",
+            "action_type": "set_power_plan",
+            "plan": str(plan),
+            "guid": guid,
+            "before_guid": before_guid,
+            "before_name": before_name,
+            "after_guid": after_guid,
+            "after_name": after_name,
+            "verified": verified,
+            "message": msg,
+        }
 
     if t in ("capture_screen", "screen_navigation"):
         if not ALLOW_SCREEN:
@@ -1550,16 +1690,33 @@ async def _execute_action(action: dict) -> dict:
             # Chunk long text to reduce missed keystrokes (common in Notepad with fast typing).
             if len(text) > 500:
                 interval = max(interval, 0.04)
-                ok_all = True
+                typed = 0
                 chunk = 220
                 for i in range(0, len(text), chunk):
                     part = text[i:i + chunk]
-                    ok_all = bool(sa.type_text(part, interval=interval)) and ok_all
+                    timeout_s = max(6.0, min(45.0, (len(part) * interval * 2.5) + 3.0))
+                    ok_part, err_part = await _type_text_with_timeout(sa, part, interval=interval, timeout_s=timeout_s)
+                    if not ok_part:
+                        return {
+                            "status": "error",
+                            "action_type": t,
+                            "typed": typed,
+                            "message": err_part or "Typing failed",
+                        }
+                    typed += len(part)
                     await asyncio.sleep(0.08)
-                return {"status": "success" if ok_all else "error", "action_type": t, "typed": len(text)}
+                return {"status": "success", "action_type": t, "typed": typed}
 
-            ok = bool(sa.type_text(text, interval=interval))
-            return {"status": "success" if ok else "error", "action_type": t, "typed": len(text)}
+            timeout_s = max(6.0, min(120.0, (len(text) * interval * 2.5) + 4.0))
+            ok, err = await _type_text_with_timeout(sa, text, interval=interval, timeout_s=timeout_s)
+            if not ok:
+                return {
+                    "status": "error",
+                    "action_type": t,
+                    "typed": 0,
+                    "message": err or "Typing failed",
+                }
+            return {"status": "success", "action_type": t, "typed": len(text)}
 
         if t == "hotkey":
             keys = (action or {}).get("keys")
@@ -1593,6 +1750,28 @@ async def _execute_action(action: dict) -> dict:
             return {"status": "error", "action_type": t, "message": "Self-update not available on this agent"}
         description = action.get("description", "")
         file_path = action.get("file_path", "")
+        if not file_path:
+            dl = str(description or "").strip().lower()
+            if any(k in dl for k in ("anatomy", "architecture view", "anatomy view")):
+                file_path = "jarvis-frontend/src/pages/AnatomyView.jsx"
+            elif any(k in dl for k in ("autonomy dashboard", "task graph", "goal graph", "graph editor", "node editor")):
+                file_path = "jarvis-frontend/src/pages/AutonomyDashboard.jsx"
+            elif any(k in dl for k in ("update console", "management console", "kanban")):
+                file_path = "jarvis-frontend/src/components/UpdateManagementConsole.jsx"
+            elif any(k in dl for k in ("frontend api", "api client", "utils api")):
+                file_path = "jarvis-frontend/src/utils/api.js"
+            elif any(k in dl for k in ("frontend", "ui", "react", "dashboard")):
+                file_path = "jarvis-frontend/src/App.jsx"
+            elif any(k in dl for k in ("pc agent", "device action", "agent runtime")):
+                file_path = "apps/pc_agent/pc_agent.py"
+            elif any(k in dl for k in ("background loop", "runtime control", "pause resume", "tick once")):
+                file_path = "src/autonomy/background_loop.py"
+            elif any(k in dl for k in ("autonomy runtime", "runtime", "control state")):
+                file_path = "src/autonomy/runtime.py"
+            elif any(k in dl for k in ("autonomy", "task graph", "goal", "backend api", "anatomy state")):
+                file_path = "apps/web/app.py"
+            else:
+                file_path = "src/core/llm_adapter.py"
         return self_update_file(description, file_path)
 
     if t == "self_add":
@@ -1680,6 +1859,9 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _stop)
 
+    # Best-effort resend buffer for transient websocket disconnects.
+    pending_results: list[dict] = []
+
     async with aiohttp.ClientSession() as session:
         while not stop_event.is_set():
             try:
@@ -1736,6 +1918,16 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                     except Exception:
                         pass
 
+                    # Flush any buffered results from prior disconnected sends.
+                    if pending_results:
+                        still_pending: list[dict] = []
+                        for item in pending_results:
+                            try:
+                                await ws.send_str(json.dumps(item))
+                            except Exception:
+                                still_pending.append(item)
+                        pending_results = still_pending
+
                     async def pinger():
                         while True:
                             await asyncio.sleep(PING_INTERVAL_S)
@@ -1781,13 +1973,17 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                                 except Exception:
                                     pass
 
-                                await ws.send_str(json.dumps({
+                                result_payload = {
                                     "type": "result",
                                     "device_id": effective_device_id,
                                     "job_id": job_id,
                                     "results": results,
                                     "completed_at": _now_utc_iso(),
-                                }))
+                                }
+                                try:
+                                    await ws.send_str(json.dumps(result_payload))
+                                except Exception:
+                                    pending_results.append(result_payload)
 
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
