@@ -1,6 +1,6 @@
 # Agent Update Guide (Maintenance Playbook)
 
-Last updated: 2026-03-11
+Last updated: 2026-03-12
 
 Purpose: When an AI agent (or engineer) needs to update Jarvis, this file tells you **where to look first**, what is “contractual” (must stay consistent), and the minimal checklist to make changes safely.
 
@@ -63,9 +63,11 @@ Checklist:
 Checklist:
 - `src/core/llm_adapter.py`:
   - Any change in model selection, response schema, action parsing/dedupe
+  - **Universal planning mode:** deterministic voice handlers are disabled; the LLM is the sole planner
 - `src/core/chat_orchestrator.py`:
   - Research detection, async research background job
   - Two-pass web context continuation logic
+  - Cycle evaluation hooks after inline/deferred action execution
 - `app.py`:
   - Explicit screenshot guard behavior
   - Cloud-mode “server actions only” behavior

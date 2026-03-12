@@ -6,6 +6,17 @@
 const isDev = process.env.NODE_ENV === "development";
 const envBase = process.env.REACT_APP_API_URL;
 
+let queryBase = "";
+try {
+  if (typeof window !== "undefined" && window.location && window.location.search) {
+    const params = new URLSearchParams(window.location.search);
+    queryBase = String(params.get("api_url") || "").trim();
+  }
+} catch {}
+
+const isHttpUrl = (value) => /^https?:\/\//i.test(String(value || "").trim());
+const queryApi = isHttpUrl(queryBase) ? queryBase.replace(/\/$/, "") : "";
+
 let prodBase = "https://jarvis-cloud-assistant.onrender.com";
 try {
   if (typeof window !== "undefined" && window.location && window.location.origin) {
@@ -20,7 +31,7 @@ try {
   }
 } catch {}
 
-export const API_URL = envBase || (isDev ? "" : prodBase);
+export const API_URL = envBase || queryApi || (isDev ? "" : prodBase);
 
 const DEFAULT_TIMEOUT = parseInt(process.env.REACT_APP_API_TIMEOUT_MS || "20000", 10); // 20s
 

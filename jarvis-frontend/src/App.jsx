@@ -601,6 +601,7 @@ export default function App() {
     sessionId,
     addLog,
     addStructuredLog,
+    buildDeviceCompletionSpeech,
     buildResearchCompletionSpeech,
     buildWorkflowCompletionSpeech,
     speakNotificationCompletion,

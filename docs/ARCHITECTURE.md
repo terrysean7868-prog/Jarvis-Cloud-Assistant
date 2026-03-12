@@ -1,6 +1,6 @@
 # Jarvis Cloud Assistant — Architecture & Working Flow
 
-Last updated: 2026-03-11
+Last updated: 2026-03-12
 
 This document is the **single high-level reference** for how the system is built (technology stack), how it runs (working flow), and where the core business logic lives. It is written to be readable by humans *and* AI agents doing maintenance.
 
@@ -120,6 +120,8 @@ Important toggles in `apps/web/app.py` (legacy alias: `app.py`):
 - Routes to smart model if configured (complexity heuristic)
 - Loads “skills catalog” (MongoDB preferred, fallback `data/skills.json`) and injects into prompt
 - Dedupe/filter actions, normalizes app names, etc.
+- **Universal planning mode:** deterministic voice handlers are disabled; the LLM is the sole planner.
+- Cycle feedback from prior executions is injected into the prompt to improve future plans.
 
 ### `src/core/chat_orchestrator.py` (Pipeline / policy)
 - Orchestrates the message flow without adding routes:
@@ -128,6 +130,8 @@ Important toggles in `apps/web/app.py` (legacy alias: `app.py`):
   3) Execute immediate web actions inline (2-pass web pipeline)
   4) Schedule deferred actions in background
   5) Supports async “research jobs” (web_search → fetch_url → synthesize) with cancellation polling
+- After inline and deferred action execution, the Goal → Plan → Execute → Evaluate → Improve cycle
+  runs and persists feedback to the local reasoner state for future requests.
 
 ### `src/core/executor.py` (Action execution)
 - Executes the `actions` emitted by the brain

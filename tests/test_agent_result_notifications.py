@@ -74,7 +74,23 @@ def test_agent_job_results_published_to_notifications_ws():
                 job_id = job["job_id"]
 
                 # Agent receives the job.
-                incoming = ws_agent.receive_json()
+                # Drain any preamble jobs (e.g. auto_apply_permissions from saved
+                # device permissions) until we find our test job.
+                incoming = None
+                for _ in range(5):
+                    msg = ws_agent.receive_json()
+                    if msg.get("type") == "job" and msg.get("job_id") == job_id:
+                        incoming = msg
+                        break
+                    # Send a dummy result so the server doesn't block waiting for completion.
+                    if msg.get("type") == "job":
+                        ws_agent.send_text(json.dumps({
+                            "type": "result",
+                            "device_id": "primary",
+                            "job_id": msg.get("job_id"),
+                            "results": [{"status": "success", "action_type": "agent_set_permissions"}],
+                        }))
+                assert incoming is not None, "Did not receive expected job within 5 messages"
                 assert incoming.get("type") == "job"
                 assert incoming.get("job_id") == job_id
 

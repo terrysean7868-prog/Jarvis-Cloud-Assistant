@@ -110,145 +110,7 @@ class LLMAdapter:
             return "global"
 
     @staticmethod
-    def _sanitize_local_reasoner_key_part(value: str) -> str:
-        v = (value or "").strip().lower()
-        if not v:
-            return ""
-        v = re.sub(r"\s+", "_", v)
-        v = re.sub(r"[^a-z0-9@._\-]", "", v)
-        return v[:120]
-
-    def _extract_user_identity_from_prefs(self, user_prefs: dict | None) -> str:
-        if not isinstance(user_prefs, dict):
-            return ""
-        for field in (
-            "user_id",
-            "auth_user_id",
-            "id",
-            "username",
-            "email",
-            "session_user",
-            "profile_id",
-        ):
-            raw = user_prefs.get(field)
-            if raw is None:
-                continue
-            s = self._sanitize_local_reasoner_key_part(str(raw))
-            if s:
-                return s
-        return ""
-
-    def _derive_local_reasoner_state_key(self, user_prefs: dict | None) -> str:
-        base = self._resolve_local_reasoner_state_key()
-        if base in {"", "global"}:
-            return "global"
-
-        if base in {"user", "per_user", "user_scoped", "userscoped"}:
-            ident = self._extract_user_identity_from_prefs(user_prefs)
-            if ident:
-                return f"user:{ident}"
-            return "global"
-
-        # Optional template support: e.g. "tenant:{user}".
-        if "{user}" in base:
-            ident = self._extract_user_identity_from_prefs(user_prefs)
-            if ident:
-                return base.replace("{user}", ident)
-            return base.replace("{user}", "global")
-
-        return base
-
-    def _ensure_local_reasoner_state_scope(self, user_prefs: dict | None) -> None:
-        try:
-            desired_key = self._derive_local_reasoner_state_key(user_prefs)
-            if desired_key == self._local_reasoner_state_key:
-                return
-            self._local_reasoner_state_key = desired_key
-            self._local_reasoner_state = self._load_local_reasoner_state()
-            self._local_reasoner_daily_maintenance()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _resolve_local_reasoner_state_path() -> Path:
-        try:
-            raw = str(getattr(rd, "LOCAL_REASONER_STATE_FILE", "data/local_reasoner_state.json") or "").strip()
-            if not raw:
-                raw = "data/local_reasoner_state.json"
-            p = Path(raw)
-            if p.is_absolute():
-                return p
-            root = Path(__file__).resolve().parents[2]
-            return root / p
-        except Exception:
-            root = Path(__file__).resolve().parents[2]
-            return root / "data" / "local_reasoner_state.json"
-
-    @staticmethod
-    def _default_local_reasoner_state() -> dict:
-        return {
-            "version": 1,
-            "updated_at": "",
-            "last_maintenance_day": "",
-            "app_aliases": {},
-            "site_aliases": {},
-            "stats": {
-                "learn_events": 0,
-                "hits": 0,
-            },
-            "cycles": [],  # Goal→Plan→Execute→Evaluate→Improve cycle feedback
-        }
-
-    def _load_local_reasoner_state(self) -> dict:
-        state = self._default_local_reasoner_state()
-        if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
-            try:
-                remote = db.local_reasoner_state_get(state_key=self._local_reasoner_state_key)
-                if isinstance(remote, dict):
-                    for k, v in state.items():
-                        if k not in remote:
-                            remote[k] = v
-                    if not isinstance(remote.get("app_aliases"), dict):
-                        remote["app_aliases"] = {}
-                    if not isinstance(remote.get("site_aliases"), dict):
-                        remote["site_aliases"] = {}
-                    if not isinstance(remote.get("stats"), dict):
-                        remote["stats"] = {"learn_events": 0, "hits": 0}
-                    return remote
-
-                # User-scoped cold start: inherit global seeded knowledge when user
-                # state doesn't exist yet, then continue learning in user scope.
-                if str(self._local_reasoner_state_key).startswith("user:"):
-                    seeded = db.local_reasoner_state_get(state_key="global")
-                    if isinstance(seeded, dict):
-                        for k, v in state.items():
-                            if k not in seeded:
-                                seeded[k] = v
-                        if not isinstance(seeded.get("app_aliases"), dict):
-                            seeded["app_aliases"] = {}
-                        if not isinstance(seeded.get("site_aliases"), dict):
-                            seeded["site_aliases"] = {}
-                        if not isinstance(seeded.get("stats"), dict):
-                            seeded["stats"] = {"learn_events": 0, "hits": 0}
-                        return seeded
-            except Exception:
-                pass
-        try:
-            p = self._local_reasoner_state_path
-            if not p.exists():
-                return state
-            raw = p.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                return state
-            for k, v in state.items():
-                if k not in data:
-                    data[k] = v
-            if not isinstance(data.get("app_aliases"), dict):
-                data["app_aliases"] = {}
-            if not isinstance(data.get("site_aliases"), dict):
-                data["site_aliases"] = {}
-            if not isinstance(data.get("stats"), dict):
+        return None
                 data["stats"] = {"learn_events": 0, "hits": 0}
             return data
         except Exception:
@@ -973,6 +835,8 @@ class LLMAdapter:
         return "Done."
 
     def _is_local_reasoner_candidate(self, text: str, mode: str, decision_hint: dict | None) -> bool:
+        # Universal LLM-only mode: disable local/deterministic reasoner.
+        return False
         if not bool(rd.LOCAL_REASONER_ENABLED):
             return False
         if (mode or "").lower() == "voice":
@@ -1018,22 +882,6 @@ class LLMAdapter:
             if isinstance(learned, dict) and isinstance(learned.get("actions"), list) and learned.get("actions"):
                 learned["source"] = "local-reasoner-learned"
                 return learned
-        except Exception:
-            pass
-
-        try:
-            # Reuse deterministic parser (already battle-tested for local PC commands).
-            pre = self._preparse_deterministic_voice_actions(text)
-            if isinstance(pre, dict) and isinstance(pre.get("actions"), list) and pre.get("actions"):
-                try:
-                    pre["actions"] = self._dedupe_actions(pre.get("actions") or [])
-                except Exception:
-                    pass
-                pre["source"] = "local-reasoner"
-                if not (pre.get("text") or "").strip():
-                    pre["text"] = self._action_text_from_first_action(pre.get("actions") or [])
-                self._learn_from_actions(text, pre.get("actions") or [])
-                return pre
         except Exception:
             pass
 
@@ -2524,15 +2372,6 @@ class LLMAdapter:
         except Exception:
             pass
 
-        # Deterministic voice mode: handle simple commands without relying on LLM.
-        try:
-            if (mode or "").lower() == "voice":
-                pre = self._preparse_deterministic_voice_actions(text)
-                if isinstance(pre, dict) and isinstance(pre.get("actions"), list) and pre["actions"]:
-                    return pre
-        except Exception:
-            pass
-
         # Voice + web-worthy requests: do web_search first (better UX, fewer hallucinations).
         # We only do this when we did NOT match a deterministic PC command above.
         try:
@@ -2667,16 +2506,6 @@ class LLMAdapter:
                         "recommended_action": recommended,
                     }
 
-                    # Fast-path: in voice mode, if the decision maker is very confident and
-                    # the action is safe/obvious, skip the LLM entirely.
-                    if (mode or "").lower() == "voice":
-                        conf = float(decision_hint.get("confidence") or 0.0)
-                        if conf >= float(rd.DECISION_FASTPATH_CONF):
-                            a = decision_hint.get("recommended_action")
-                            if isinstance(a, dict) and a.get("type") in {"open_app", "open_url", "web_search", "fetch_url"}:
-                                out = {"text": "Okay.", "actions": [a], "source": "decision-maker"}
-                                self._learn_from_actions(text, out.get("actions") or [])
-                                return out
         except Exception:
             decision_hint = None
 

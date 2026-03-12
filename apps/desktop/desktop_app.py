@@ -4,7 +4,7 @@ import socket
 import threading
 import time
 import webbrowser
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -331,6 +331,15 @@ def _open_ui(url: str, title: str, width: int, height: int) -> None:
                 webview.settings["OPEN_DEVTOOLS_IN_DEBUG"] = True
             except Exception:
                 pass
+
+        # Ensure the frontend knows the API base, even if origin detection fails.
+        try:
+            parsed = urlparse(url)
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            query.setdefault("api_url", url)
+            url = urlunparse(parsed._replace(query=urlencode(query)))
+        except Exception:
+            pass
 
         webview.create_window(title=title, url=url, width=width, height=height)
 
