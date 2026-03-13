@@ -50,11 +50,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = Get-NetTCPConnectio
 REM Start backend (background)
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:AUTH_USE_DB='true'; $env:JARVIS_CLOUD_MODE='false'; Start-Process -FilePath '%PYTHON%' -WorkingDirectory '%CD%' -ArgumentList @('-m','uvicorn','app:app','--host','127.0.0.1','--port','%API_PORT%','--log-level','info') -RedirectStandardOutput '%API_LOG%' -RedirectStandardError '%API_ERR%' | Out-Null"
 
-if not exist "jarvis-frontend\package.json" (
-	echo ERROR: jarvis-frontend\package.json not found. Frontend cannot start.
+if not exist "frontend\package.json" (
+	echo ERROR: frontend\package.json not found. Frontend cannot start.
 ) else (
 	REM Start frontend (background) detached; capture logs
-	powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'cmd.exe' -WorkingDirectory '%CD%\\jarvis-frontend' -ArgumentList @('/d','/s','/c','set REACT_APP_API_URL=http://127.0.0.1:%API_PORT%& set HOST=127.0.0.1& set PORT=3000& set BROWSER=none& set DANGEROUSLY_DISABLE_HOST_CHECK=true& set WDS_SOCKET_HOST=127.0.0.1& call npm.cmd start') -RedirectStandardOutput '%UI_LOG%' -RedirectStandardError '%UI_ERR%' | Out-Null"
+	powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'cmd.exe' -WorkingDirectory '%CD%\\frontend' -ArgumentList @('/d','/s','/c','set REACT_APP_API_URL=http://127.0.0.1:%API_PORT%& set HOST=127.0.0.1& set PORT=3000& set BROWSER=none& set DANGEROUSLY_DISABLE_HOST_CHECK=true& set WDS_SOCKET_HOST=127.0.0.1& call npm.cmd start') -RedirectStandardOutput '%UI_LOG%' -RedirectStandardError '%UI_ERR%' | Out-Null"
 )
 
 REM Quick health checks

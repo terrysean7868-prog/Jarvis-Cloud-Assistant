@@ -92,7 +92,7 @@ class Config:
     DEFAULT_ALLOWED_PATHS = [
         'modules',
         'utils',
-        'jarvis-frontend/src',
+        'frontend/src',
         'app.py',
         'jarvis_brain.py',
         'llm_adapter.py',

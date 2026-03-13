@@ -246,6 +246,7 @@ def _current_capabilities() -> dict:
         "platform": platform.system().lower(),
         "hostname": platform.node(),
         "actions": _supported_actions_catalog(),
+        "system_info": _inspect_system_state(),
     }
 
 
@@ -253,11 +254,13 @@ def _inspect_system_state() -> dict:
     cpu_percent = None
     memory_percent = None
     disk_percent = None
+    process_count = None
     if psutil is not None:
         try:
             cpu_percent = psutil.cpu_percent(interval=0.2)
             memory_percent = psutil.virtual_memory().percent
             disk_percent = psutil.disk_usage(str(PROJECT_ROOT)).percent
+            process_count = len(psutil.pids())
         except Exception:
             pass
 
@@ -268,6 +271,7 @@ def _inspect_system_state() -> dict:
         "cpu_percent": cpu_percent,
         "memory_percent": memory_percent,
         "disk_percent": disk_percent,
+        "process_count": process_count,
     }
 
 
@@ -1753,15 +1757,15 @@ async def _execute_action(action: dict) -> dict:
         if not file_path:
             dl = str(description or "").strip().lower()
             if any(k in dl for k in ("anatomy", "architecture view", "anatomy view")):
-                file_path = "jarvis-frontend/src/pages/AnatomyView.jsx"
+                file_path = "frontend/src/pages/AnatomyView.jsx"
             elif any(k in dl for k in ("autonomy dashboard", "task graph", "goal graph", "graph editor", "node editor")):
-                file_path = "jarvis-frontend/src/pages/AutonomyDashboard.jsx"
+                file_path = "frontend/src/pages/AutonomyDashboard.jsx"
             elif any(k in dl for k in ("update console", "management console", "kanban")):
-                file_path = "jarvis-frontend/src/components/UpdateManagementConsole.jsx"
+                file_path = "frontend/src/components/UpdateManagementConsole.jsx"
             elif any(k in dl for k in ("frontend api", "api client", "utils api")):
-                file_path = "jarvis-frontend/src/utils/api.js"
+                file_path = "frontend/src/utils/api.js"
             elif any(k in dl for k in ("frontend", "ui", "react", "dashboard")):
-                file_path = "jarvis-frontend/src/App.jsx"
+                file_path = "frontend/src/App.jsx"
             elif any(k in dl for k in ("pc agent", "device action", "agent runtime")):
                 file_path = "apps/pc_agent/pc_agent.py"
             elif any(k in dl for k in ("background loop", "runtime control", "pause resume", "tick once")):

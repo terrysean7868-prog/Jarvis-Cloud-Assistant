@@ -69,7 +69,7 @@ def _icon_path() -> Optional[str]:
     candidates = [
         BUNDLE_DIR / "assets" / "jarvis.ico",
         APP_DIR / "assets" / "jarvis.ico",
-        REPO_ROOT / "jarvis-frontend" / "public" / "favicon.ico",
+        REPO_ROOT / "frontend" / "public" / "favicon.ico",
     ]
     for p in candidates:
         try:

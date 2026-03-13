@@ -17,6 +17,7 @@ import {
   getAgentConfig,
   getTasks,
   getSystemInfo,
+  getDeviceStatus,
   API_URL,
   getNotificationsWsUrl,
   stopTask,
@@ -149,6 +150,7 @@ export default function App() {
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
   const [showUpdateConsole, setShowUpdateConsole] = useState(false);
+  const [autonomyTab, setAutonomyTab] = useState("Autonomy");
   const [activeDisplay, setActiveDisplay] = useState(() => {
     try {
       const saved = (localStorage.getItem("jarvis_active_display") || "").toString().trim().toLowerCase();
@@ -843,6 +845,29 @@ export default function App() {
 
     let cancelled = false;
 
+    const applySystemInfo = (info) => {
+      if (cancelled) return;
+      if (info && typeof info === "object") {
+        setSystemInfo(info);
+        try {
+          sessionStorage.setItem(`jarvis_system_info_${sessionId}`, JSON.stringify(info));
+        } catch {}
+      }
+    };
+
+    const tryDeviceStatus = async () => {
+      try {
+        const status = await getDeviceStatus(sessionId, 2500);
+        const agents = Array.isArray(status?.agents) ? status.agents : [];
+        const sys = agents[0]?.capabilities?.system_info || null;
+        if (sys && typeof sys === "object") {
+          applySystemInfo({ status: "success", ...sys });
+        }
+      } catch {
+        // ignore fallback errors
+      }
+    };
+
     // Fast-path: hydrate from cache immediately.
     try {
       const raw = sessionStorage.getItem(`jarvis_system_info_${sessionId}`);
@@ -853,15 +878,15 @@ export default function App() {
     const poll = async () => {
       try {
         const info = await getSystemInfo(sessionId, 2500);
-        if (!cancelled) {
-          setSystemInfo(info);
-          try {
-            sessionStorage.setItem(`jarvis_system_info_${sessionId}`, JSON.stringify(info));
-          } catch {}
+        if (info && info.status === "success") {
+          applySystemInfo(info);
+        } else {
+          await tryDeviceStatus();
         }
       } catch {
         // Local-only endpoint; ignore errors (cloud mode / permissions).
         // Keep the last known values to avoid UI "blanking".
+        await tryDeviceStatus();
       }
     };
 
@@ -880,6 +905,16 @@ export default function App() {
       .replace(/\s+/g, " ")
       .trim();
   }, []);
+
+  const isWakePhrase = useCallback((rawTranscript, assistantName) => {
+    const t = normalizeWake(rawTranscript);
+    if (!t) return false;
+
+    const nm = normalizeWake(assistantName || "jarvis");
+    if (!nm) return false;
+
+    return t === `hey ${nm}`;
+  }, [normalizeWake]);
 
   useEffect(() => {
     if (!isAuthenticated || !sessionId) return;
@@ -1163,6 +1198,16 @@ export default function App() {
 
     addLog("input", transcript);
     const textLower = transcript.toLowerCase();
+
+    if (isWakePhrase(transcript, assistantNameRef.current || "Jarvis")) {
+      startWakeSessionWindow();
+      setWakePulse(true);
+      setTimeout(() => setWakePulse(false), 900);
+      addLog("system", "Wake word detected. Listening.");
+      try { wakeRecognizer.current?.start(); } catch {}
+      isHandlingCommand.current = false;
+      return;
+    }
 
     // Cancel latest research task
     if (/\b(cancel|stop)\s+(research|search)\b/i.test(textLower)) {
@@ -1951,10 +1996,8 @@ export default function App() {
 
         const inWakeSession = Date.now() < (wakeSessionUntilRef.current || 0);
 
-        const nm = normalizeWake(assistantNameRef.current || "Jarvis");
-        // Strict wake phrase: "Hey {AssistantName}".
-        // This prevents accidental activation on generic terms like "assistant".
-        const wakeHit = !!(nm && transcript === `hey ${nm}`);
+        const nm = assistantNameRef.current || "Jarvis";
+        const wakeHit = isWakePhrase(rawTranscript, nm);
 
         if (wakeHit) {
           // In biometrics mode, defer wake-session start and UI pulse until
@@ -2430,6 +2473,7 @@ export default function App() {
         <AutonomyDashboard
           sessionId={sessionId}
           logs={logs}
+          onTabChange={setAutonomyTab}
         />
       )}
 
@@ -2444,61 +2488,62 @@ export default function App() {
               {emotion === "critical" && "Critical"}
             </div>
           </div>
-
-          <div
-            onPointerDown={(e) => {
-              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-              try { e.preventDefault(); } catch {}
-              try {
-                if (typeof e.pointerId === "number" && e.currentTarget?.setPointerCapture) {
-                  e.currentTarget.setPointerCapture(e.pointerId);
-                }
-              } catch {}
-              startHoldToTalk();
-            }}
-            onPointerUp={(e) => {
-              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-              try { e.preventDefault(); } catch {}
-              try {
-                if (typeof e.pointerId === "number" && e.currentTarget?.releasePointerCapture) {
-                  e.currentTarget.releasePointerCapture(e.pointerId);
-                }
-              } catch {}
-              stopHoldToTalk();
-            }}
-            onPointerCancel={(e) => {
-              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-              try {
-                if (typeof e.pointerId === "number" && e.currentTarget?.releasePointerCapture) {
-                  e.currentTarget.releasePointerCapture(e.pointerId);
-                }
-              } catch {}
-              stopHoldToTalk();
-            }}
-            onKeyDown={(e) => {
-              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-              if (e.key === " " || e.key === "Enter") {
-                e.preventDefault();
+          {!(activeDisplay === "autonomy" && String(autonomyTab || "").toLowerCase() === "anatomy") && (
+            <div
+              onPointerDown={(e) => {
+                if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+                try { e.preventDefault(); } catch {}
+                try {
+                  if (typeof e.pointerId === "number" && e.currentTarget?.setPointerCapture) {
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                  }
+                } catch {}
                 startHoldToTalk();
-              }
-            }}
-            onKeyUp={(e) => {
-              if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-              if (e.key === " " || e.key === "Enter") {
-                e.preventDefault();
+              }}
+              onPointerUp={(e) => {
+                if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+                try { e.preventDefault(); } catch {}
+                try {
+                  if (typeof e.pointerId === "number" && e.currentTarget?.releasePointerCapture) {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  }
+                } catch {}
                 stopHoldToTalk();
-              }
-            }}
-            role={isAuthenticated ? "button" : undefined}
-            tabIndex={isAuthenticated ? 0 : -1}
-            aria-label="Voice wake area"
-            style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)", cursor: isAuthenticated ? "pointer" : "default" }}
-          >
-            <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
-              {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' or 'Hey Assistant' to wake up`}
-            </div>
+              }}
+              onPointerCancel={(e) => {
+                if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+                try {
+                  if (typeof e.pointerId === "number" && e.currentTarget?.releasePointerCapture) {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  }
+                } catch {}
+                stopHoldToTalk();
+              }}
+              onKeyDown={(e) => {
+                if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+                if (e.key === " " || e.key === "Enter") {
+                  e.preventDefault();
+                  startHoldToTalk();
+                }
+              }}
+              onKeyUp={(e) => {
+                if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
+                if (e.key === " " || e.key === "Enter") {
+                  e.preventDefault();
+                  stopHoldToTalk();
+                }
+              }}
+              role={isAuthenticated ? "button" : undefined}
+              tabIndex={isAuthenticated ? 0 : -1}
+              aria-label="Voice wake area"
+              style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)", cursor: isAuthenticated ? "pointer" : "default" }}
+            >
+              <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
+                {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to wake up`}
+              </div>
 
-          </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

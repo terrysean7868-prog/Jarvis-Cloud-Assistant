@@ -1203,8 +1203,8 @@ class LLMAdapter:
                         ("executor", "src/core/executor.py"),
                         ("app.py", "apps/web/app.py"),
                         ("web app", "apps/web/app.py"),
-                        ("frontend", "jarvis-frontend/src/App.js"),
-                        ("ui", "jarvis-frontend/src/App.js"),
+                        ("frontend", "frontend/src/App.js"),
+                        ("ui", "frontend/src/App.js"),
                     ]
                     for k, p in mapping:
                         if k in tx:

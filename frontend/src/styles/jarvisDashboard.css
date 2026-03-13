@@ -6,6 +6,8 @@
 .jarvis-dashboard {
   position: fixed;
   inset: 0;
+  height: 100dvh;
+  min-height: 100vh;
   display: grid;
   grid-template-columns: 1fr 1.35fr 1fr;
   gap: 0;
@@ -23,6 +25,7 @@
   gap: 0;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   padding: 14px;
 }
 
@@ -85,6 +88,7 @@
 .jd-panelBody {
   flex: 1;
   min-height: 0;
+  height: 100%;
 }
 
 .jd-scroll {

@@ -13,11 +13,11 @@ else
 	pip install -r requirements.txt
 fi
 
-echo "🪶 Building frontend (jarvis-frontend)"
+echo "🪶 Building frontend (frontend)"
 if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
 	echo "🪶 Node: $(node --version)"
 	echo "🪶 NPM:  $(npm --version)"
-	cd jarvis-frontend
+	cd frontend
 	# Force a clean build output so we never serve stale assets.
 	rm -rf build
 	# Use npm install (not npm ci) to avoid strict lockfile sync failures on Render.
@@ -27,11 +27,11 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
 	cd ..
 else
 	echo "⚠️  Node/npm not found in this environment."
-	echo "⚠️  Frontend build will be skipped, and the UI may not be served unless jarvis-frontend/build is present in the repo."
+	echo "⚠️  Frontend build will be skipped, and the UI may not be served unless frontend/build is present in the repo."
 fi
 
-if [ ! -f jarvis-frontend/build/index.html ]; then
-	echo "❌ Frontend build missing: jarvis-frontend/build/index.html"
+if [ ! -f frontend/build/index.html ]; then
+	echo "❌ Frontend build missing: frontend/build/index.html"
 	echo "❌ This would cause a blank or missing UI in production. Failing the build."
 	exit 1
 fi

@@ -23,7 +23,7 @@ New-ItemProperty -Path $protoKey -Name 'URL Protocol' -Value '' -PropertyType St
 
 $iconKey = Join-Path $protoKey 'DefaultIcon'
 New-Item -Path $iconKey -Force | Out-Null
-New-ItemProperty -Path $iconKey -Name '(Default)' -Value "$RepoPath\jarvis-frontend\public\favicon.ico" -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $iconKey -Name '(Default)' -Value "$RepoPath\frontend\public\favicon.ico" -PropertyType String -Force | Out-Null
 
 $cmdKey = Join-Path $protoKey 'shell\open\command'
 New-Item -Path $cmdKey -Force | Out-Null

@@ -19,7 +19,7 @@ a = Analysis(
     datas=[
         ('assets\\jarvis.ico', 'assets'),
         # Include the React production build so the desktop backend can serve it locally.
-        ('jarvis-frontend\\build', 'jarvis-frontend\\build'),
+        ('frontend\\build', 'frontend\\build'),
     ] + (_WEBVIEW_DATAS or []),
     hiddenimports=['app', 'src.core.lim_adapter'] + _WEBVIEW_HIDDENIMPORTS,
     hookspath=[],

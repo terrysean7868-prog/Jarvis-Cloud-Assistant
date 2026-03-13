@@ -47,12 +47,32 @@
   min-height: 0;
   flex: 1;
   overflow: auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
   gap: 12px;
+}
+
+.anatomy-grid {
+  flex: 1;
+  min-height: 0;
+  align-content: stretch;
+  grid-auto-rows: minmax(0, 1fr);
+}
+
+.anatomy-grid .panel-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.anatomy-grid .log-box {
+  flex: 1;
+  max-height: none;
 }
 
 .panel-card {
@@ -75,17 +95,26 @@
   gap: 8px;
   align-items: center;
   margin-top: 8px;
+  flex-wrap: wrap;
+  align-items: stretch;
 }
 
 .panel-row input,
 .panel-row select,
 .panel-row textarea {
-  flex: 1;
+  flex: 1 1 240px;
+  min-width: 200px;
   border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(0, 0, 0, 0.32);
   color: rgba(235, 247, 255, 0.95);
   padding: 9px;
+}
+
+.panel-row .panel-btn {
+  flex: 0 1 140px;
+  min-height: 36px;
+  white-space: nowrap;
 }
 
 .panel-btn {

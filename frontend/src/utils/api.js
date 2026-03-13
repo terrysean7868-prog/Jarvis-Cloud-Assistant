@@ -23,7 +23,7 @@ try {
     const origin = window.location.origin;
     // If the UI is hosted on a separate Render service, default the API to the known backend service.
     // Prefer explicit REACT_APP_API_URL for custom domains / non-default setups.
-    if (/jarvis-frontend\.onrender\.com$/i.test(origin)) {
+    if (/(jarvis-frontend|frontend)\.onrender\.com$/i.test(origin)) {
       prodBase = "https://jarvis-cloud-assistant.onrender.com";
     } else {
       prodBase = origin;
@@ -227,6 +227,21 @@ export async function getSystemInfo(sessionId, timeoutMs = DEFAULT_TIMEOUT) {
   qs.set("session_id", sessionId);
 
   const res = await timeoutFetch(`${API_URL}/api/system/info?${qs.toString()}`,
+    { method: "GET" },
+    timeoutMs
+  );
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getDeviceStatus(sessionId, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  qs.set("session_id", sessionId);
+
+  const res = await timeoutFetch(`${API_URL}/api/device/status?${qs.toString()}`,
     { method: "GET" },
     timeoutMs
   );

@@ -41,7 +41,7 @@ def get_openai_client():
 ROOT_DIR = Path(__file__).parent.parent.parent
 MODULES_DIR = ROOT_DIR / "modules"
 SRC_DIR = ROOT_DIR / "src"
-FRONTEND_DIR = ROOT_DIR / "jarvis-frontend" / "src"
+FRONTEND_DIR = ROOT_DIR / "frontend" / "src"
 BACKUP_DIR = ROOT_DIR / "backups"
 UPDATE_AUDIT_LOG = ROOT_DIR / "data" / "update_audit_log.jsonl"
 

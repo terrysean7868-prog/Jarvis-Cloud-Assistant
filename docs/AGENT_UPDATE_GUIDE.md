@@ -13,7 +13,7 @@ If you are new to the repo, read these in order:
 4) `src/core/jarvis_brain.py` and `src/core/llm_adapter.py` (LLM + actions)
 5) `src/core/executor.py` and `apps/pc_agent/pc_agent.py` (legacy alias: `pc_agent.py`) (action execution)
 6) `apps/desktop/desktop_app.py` (desktop startup/runtime integration)
-7) `jarvis-frontend/src/pages/AutonomyDashboard.jsx` + `jarvis-frontend/src/utils/api.js` (autonomy UI/API integration)
+7) `frontend/src/pages/AutonomyDashboard.jsx` + `frontend/src/utils/api.js` (autonomy UI/API integration)
 
 ## 2) “Source of Truth” Rules
 
@@ -102,7 +102,7 @@ Checklist:
 ## 4) Quick Debug Map (Where to Look When Something Breaks)
 
 - UI cannot chat:
-  - `jarvis-frontend/src/utils/api.js` (API_URL, request shape)
+  - `frontend/src/utils/api.js` (API_URL, request shape)
   - `app.py` `POST /api/chat` (VOICE_ONLY_MODE / CLOUD_MODE / session checks)
 
 - Actions returned but not executed:

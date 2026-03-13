@@ -21,18 +21,18 @@ This document is the **single high-level reference** for how the system is built
   - Backup defaults: Groq OpenAI-compatible endpoint
 
 ### Frontend (Web UI)
-- **React (CRA)** in `jarvis-frontend/`
+- **React (CRA)** in `frontend/`
 - Uses browser **Web Speech**, mic recording + optional cloud STT path
-- Talks to backend through `jarvis-frontend/src/utils/api.js`
+- Talks to backend through `frontend/src/utils/api.js`
 - Receives server push events via WebSocket `/ws/notifications`
 - Autonomous control surfaces are implemented in:
-  - `jarvis-frontend/src/pages/AutonomyDashboard.jsx`
-  - `jarvis-frontend/src/pages/TaskManager.jsx`
-  - `jarvis-frontend/src/pages/AgentMonitor.jsx`
-  - `jarvis-frontend/src/pages/ResearchMonitor.jsx`
-  - `jarvis-frontend/src/pages/DeviceControl.jsx`
-  - `jarvis-frontend/src/pages/SystemHealth.jsx`
-  - `jarvis-frontend/src/pages/SelfImprovementPanel.jsx`
+  - `frontend/src/pages/AutonomyDashboard.jsx`
+  - `frontend/src/pages/TaskManager.jsx`
+  - `frontend/src/pages/AgentMonitor.jsx`
+  - `frontend/src/pages/ResearchMonitor.jsx`
+  - `frontend/src/pages/DeviceControl.jsx`
+  - `frontend/src/pages/SystemHealth.jsx`
+  - `frontend/src/pages/SelfImprovementPanel.jsx`
 - Visualization stack for autonomy UI:
   - `reactflow` for task graph rendering
   - `chart.js` + `react-chartjs-2` for runtime metrics
@@ -286,11 +286,11 @@ Auth/session:
 - `src/api/session_routes.py` (session route composition extracted from `apps/web/app.py`)
 
 Frontend:
-- `jarvis-frontend/src/utils/api.js` (all API + WS URLs)
-- `jarvis-frontend/src/App.jsx` (main UI behavior)
-- `jarvis-frontend/src/components/HUDLogs.jsx` (structured message rendering: text/plan/task_graph/code_block/research_report)
-- `jarvis-frontend/src/pages/AutonomyDashboard.jsx` (tabbed autonomy console)
-- `jarvis-frontend/src/pages/SelfImprovementPanel.jsx` (approve/reject/diff flow)
+- `frontend/src/utils/api.js` (all API + WS URLs)
+- `frontend/src/App.jsx` (main UI behavior)
+- `frontend/src/components/HUDLogs.jsx` (structured message rendering: text/plan/task_graph/code_block/research_report)
+- `frontend/src/pages/AutonomyDashboard.jsx` (tabbed autonomy console)
+- `frontend/src/pages/SelfImprovementPanel.jsx` (approve/reject/diff flow)
 
 PC agent UI / packaging:
 - `apps/pc_agent/pc_agent_app.py` (legacy alias: `pc_agent_app.py`), `assets/pc_agent_ui.html`
@@ -316,7 +316,7 @@ Desktop app:
      - LLM prompting/parsing (usually `src/core/llm_adapter.py`)
      - Server executor (`src/core/executor.py`) if server-side
   - PC agent (`apps/pc_agent/pc_agent.py`, legacy alias: `pc_agent.py`) if it’s a device action
-     - UI dispatch/permission handling if needed (`jarvis-frontend/src/utils/api.js`, PermissionModal)
+    - UI dispatch/permission handling if needed (`frontend/src/utils/api.js`, PermissionModal)
 
 4) **Prefer MongoDB, but degrade gracefully**
    - Many paths are written to keep the app usable when DB is down.

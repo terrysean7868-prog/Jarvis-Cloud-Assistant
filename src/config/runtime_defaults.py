@@ -136,7 +136,7 @@ REQUIRE_MANUAL_APPROVAL: bool = True
 
 
 # Filesystem sandbox allowlist (comma-separated paths relative to repo root)
-ALLOWED_PATHS_CSV: str = "src,modules,jarvis-frontend/src,data"
+ALLOWED_PATHS_CSV: str = "src,modules,frontend/src,data"
 
 
 # -------------------------

@@ -30,7 +30,7 @@ export default function AnatomyView({ sessionId }) {
   const devices = state?.device_connections || {};
 
   return (
-    <div className="panel-grid">
+    <div className="panel-grid anatomy-grid">
       <div className="panel-card">
         <h3 className="panel-title">System Anatomy</h3>
         <div className="log-box">

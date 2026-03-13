@@ -46,7 +46,7 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
-    frontend_dir = repo_root / "jarvis-frontend"
+    frontend_dir = repo_root / "frontend"
     spec_file = repo_root / "JarvisDesktop.spec"
 
     if not spec_file.exists():

@@ -13,7 +13,7 @@ This repo has multiple runnable parts. Use the matching dependency set so instal
 ## UI (React)
 
 - Node deps:
-  - `cd jarvis-frontend`
+  - `cd frontend`
   - `npm install`
 - Dev server:
   - `npm start`
@@ -40,7 +40,7 @@ This repo has multiple runnable parts. Use the matching dependency set so instal
   - `python scripts/build_desktop_app.py`
   - optional flags: `--install-frontend`, `--skip-frontend`, `--skip-clean`
 - What it does:
-  - rebuilds `jarvis-frontend/build`
+  - rebuilds `frontend/build`
   - runs PyInstaller on `JarvisDesktop.spec`
   - outputs latest desktop app under `dist/`
 

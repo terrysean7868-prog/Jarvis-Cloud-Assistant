@@ -59,7 +59,7 @@ class CodingAgent(BaseAgent):
         return {"status": "success", "path": str(module_path), "tool": slug}
 
     async def generate_react_component(self, component_name: str, description: str) -> dict[str, Any]:
-        ui_dir = self.repo_root / "jarvis-frontend" / "src" / "generated"
+        ui_dir = self.repo_root / "frontend" / "src" / "generated"
         ui_dir.mkdir(parents=True, exist_ok=True)
         safe_name = "".join(ch for ch in (component_name or "GeneratedPanel") if ch.isalnum()) or "GeneratedPanel"
         file_path = ui_dir / f"{safe_name}.tsx"

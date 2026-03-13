@@ -228,7 +228,7 @@ if bool(jarvis_settings.cloud_mode) and (_BROKER is None):
         pass
 
 # Serve frontend build if present (single-service deploy)
-FRONTEND_BUILD_DIR = REPO_ROOT / "jarvis-frontend" / "build"
+FRONTEND_BUILD_DIR = REPO_ROOT / "frontend" / "build"
 
 # Enable/disable background scheduler via env
 ENABLE_SCHEDULER = env.get_bool("JARVIS_ENABLE_SCHEDULER", True)
@@ -455,6 +455,17 @@ def _effective_server_url(request: Request | None) -> str:
     if CLOUD_MODE:
         return "https://jarvis-cloud-assistant.onrender.com"
     return "http://127.0.0.1:18001"
+
+
+def _is_local_request(request: Request | None) -> bool:
+    try:
+        if request is None:
+            return False
+        host = (request.headers.get("host") or "").split(",")[0].strip()
+        host = host.split(":")[0].strip().lower()
+        return host in {"localhost", "127.0.0.1", "::1"}
+    except Exception:
+        return False
 
 def _get_principal(session_id: str | None) -> dict:
     """Return principal dict: {username, role, auth_type}.
@@ -1606,9 +1617,10 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
 
     # Only expose the shared secret for local/dev setups.
     # In cloud mode, avoid leaking a global secret unless explicitly enabled.
-    if AGENT_SHARED_SECRET and (not CLOUD_MODE or EXPOSE_AGENT_SHARED_SECRET):
-        # If explicitly enabled in cloud mode, restrict to admins.
-        if (not CLOUD_MODE) or (role == "admin"):
+    allow_secret = bool(AGENT_SHARED_SECRET) and (not CLOUD_MODE or EXPOSE_AGENT_SHARED_SECRET or _is_local_request(request))
+    if allow_secret:
+        # If explicitly enabled in cloud mode, restrict to admins (unless it's a local request).
+        if (not CLOUD_MODE) or _is_local_request(request) or (role == "admin"):
             payload["agent_shared_secret"] = AGENT_SHARED_SECRET
 
     # Cache briefly to make refresh/login feel instant.
@@ -2705,6 +2717,7 @@ cors_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://jarvis-frontend.onrender.com",
+    "https://frontend.onrender.com",
     "https://jarvis-cloud-assistant.onrender.com"
 ]
 
@@ -4262,9 +4275,9 @@ def _admin_update_target_map() -> dict[str, list[str]]:
             "src/core/jarvis_brain.py",
         ],
         "frontend": [
-            "jarvis-frontend/src/App.jsx",
-            "jarvis-frontend/src/pages/AutonomyDashboard.jsx",
-            "jarvis-frontend/src/components/UpdateManagementConsole.jsx",
+            "frontend/src/App.jsx",
+            "frontend/src/pages/AutonomyDashboard.jsx",
+            "frontend/src/components/UpdateManagementConsole.jsx",
         ],
         "agents": [
             "apps/pc_agent/pc_agent.py",

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import ReactFlow, { Background, Controls } from "reactflow";
+import ReactFlow, { Background, Controls, applyEdgeChanges, applyNodeChanges } from "reactflow";
 import "reactflow/dist/style.css";
 import { Line } from "react-chartjs-2";
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend } from "chart.js";
@@ -63,7 +63,7 @@ function normalizeGraph(goal, accentColor = "#00eaff") {
   return { nodes, edges };
 }
 
-export default function AutonomyDashboard({ sessionId, logs = [] }) {
+export default function AutonomyDashboard({ sessionId, logs = [], onTabChange = null }) {
   const [tab, setTab] = useState("Autonomy");
   const [goals, setGoals] = useState([]);
   const [status, setStatus] = useState(null);
@@ -73,6 +73,8 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
   const [editTitle, setEditTitle] = useState("");
   const [editDeps, setEditDeps] = useState("");
   const [error, setError] = useState("");
+  const [graphNodes, setGraphNodes] = useState([]);
+  const [graphEdges, setGraphEdges] = useState([]);
 
   const accentColor = useMemo(() => {
     try {
@@ -119,6 +121,12 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
     return () => clearInterval(id);
   }, [refresh]);
 
+  useEffect(() => {
+    if (typeof onTabChange === "function") {
+      onTabChange(tab);
+    }
+  }, [tab, onTabChange]);
+
   const selectedGoal = useMemo(
     () => goals.find((g) => String(g?._id || "") === String(selectedGoalId || "")) || goals[0] || null,
     [goals, selectedGoalId]
@@ -145,6 +153,19 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
   }, [goals, accentColor]);
 
   const graph = useMemo(() => normalizeGraph(selectedGoal || {}, accentColor), [selectedGoal, accentColor]);
+
+  useEffect(() => {
+    setGraphNodes(graph.nodes || []);
+    setGraphEdges(graph.edges || []);
+  }, [graph]);
+
+  const onNodesChange = useCallback((changes) => {
+    setGraphNodes((nds) => applyNodeChanges(changes, nds));
+  }, []);
+
+  const onEdgesChange = useCallback((changes) => {
+    setGraphEdges((eds) => applyEdgeChanges(changes, eds));
+  }, []);
   const selectedGraphNode = useMemo(() => {
     const reports = Array.isArray(selectedGoal?.reports) ? selectedGoal.reports : [];
     const graphReport = [...reports].reverse().find((r) => r && r.graph && Array.isArray(r.graph.nodes));
@@ -269,7 +290,7 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
         <h3 className="panel-title">Task Graph</h3>
         <div className="graph-wrap">
           <ReactFlow
-            nodes={graph.nodes.map((n) => ({
+            nodes={graphNodes.map((n) => ({
               ...n,
               selected: String(n.id) === String(selectedNodeId || ""),
               style: {
@@ -279,9 +300,11 @@ export default function AutonomyDashboard({ sessionId, logs = [] }) {
                   : (n.style?.border || "1px solid rgba(255,255,255,0.2)"),
               },
             }))}
-            edges={graph.edges}
+            edges={graphEdges}
             fitView
             onNodeClick={(_, node) => setSelectedNodeId(String(node?.id || ""))}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
           >
             <Background color={accentColor} gap={18} size={1} />
             <Controls />
