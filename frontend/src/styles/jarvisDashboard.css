@@ -231,9 +231,9 @@
 .jd-copyRow {
   display: grid;
   grid-template-columns: 110px 1fr 76px;
-  gap: 10px;
+  gap: 5px;
   align-items: center;
-  padding: 10px 0;
+  padding: 4px 0;
 }
 
 .jd-copyLabel {
