@@ -186,6 +186,10 @@ def _supported_actions_catalog() -> list[str]:
         "open_path",
         "get_clipboard",
         "set_clipboard",
+        "list_running_apps",
+        "screen_info",
+        "open_windows",
+        "launch_application",
         "list_processes",
         "kill_process",
         "set_wifi",
@@ -1074,6 +1078,18 @@ async def _execute_action(action: dict) -> dict:
         if t == "switch_app":
             return mgr.switch_to_app(name)
 
+    if t == "list_running_apps":
+        if not ALLOW_APP_CONTROL:
+            return {"status": "forbidden", "action_type": t, "message": "App control disabled on agent"}
+        mgr = _get_app_manager()
+        if not mgr:
+            return {"status": "error", "action_type": t, "message": "App manager not available on this agent"}
+        try:
+            apps = mgr.list_running_apps()
+            return {"status": "success", "action_type": t, "apps": apps if isinstance(apps, list) else []}
+        except Exception as e:
+            return {"status": "error", "action_type": t, "message": str(e)}
+
     if t == "execute_command":
         if not ALLOW_EXECUTE_COMMAND:
             return {"status": "forbidden", "action_type": t, "message": "Command execution disabled on agent"}
@@ -1178,6 +1194,42 @@ async def _execute_action(action: dict) -> dict:
         flt = (action or {}).get("filter") or (action or {}).get("name") or None
         try:
             return system_ops.list_processes(filter_name=str(flt) if flt else None)
+        except Exception as e:
+            return {"status": "error", "action_type": t, "message": str(e)}
+
+    if t == "screen_info":
+        if not ALLOW_SCREEN:
+            return {"status": "forbidden", "action_type": t, "message": "Screen features disabled on agent"}
+        if not SYSTEM_OPS_AVAILABLE or not system_ops:
+            return {"status": "error", "action_type": t, "message": "system_ops not available"}
+        try:
+            return system_ops.get_screen_info()
+        except Exception as e:
+            return {"status": "error", "action_type": t, "message": str(e)}
+
+    if t == "open_windows":
+        if not ALLOW_EXECUTE_COMMAND:
+            return {"status": "forbidden", "action_type": t, "message": "System control disabled on agent (enable execute_command permission)."}
+        if not SYSTEM_OPS_AVAILABLE or not system_ops:
+            return {"status": "error", "action_type": t, "message": "system_ops not available"}
+        try:
+            return system_ops.get_open_windows()
+        except Exception as e:
+            return {"status": "error", "action_type": t, "message": str(e)}
+
+    if t == "launch_application":
+        if not ALLOW_EXECUTE_COMMAND:
+            return {"status": "forbidden", "action_type": t, "message": "System control disabled on agent (enable execute_command permission)."}
+        if not SYSTEM_OPS_AVAILABLE or not system_ops:
+            return {"status": "error", "action_type": t, "message": "system_ops not available"}
+        app_path = str((action or {}).get("app_path") or "").strip()
+        if not app_path:
+            return {"status": "error", "action_type": t, "message": "app_path required"}
+        args = (action or {}).get("args") or []
+        if not isinstance(args, list):
+            args = []
+        try:
+            return system_ops.launch_application(app_path, args)
         except Exception as e:
             return {"status": "error", "action_type": t, "message": str(e)}
 

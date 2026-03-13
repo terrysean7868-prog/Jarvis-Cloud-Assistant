@@ -65,6 +65,7 @@ Self-improvement: ${JSON.stringify(services.self_improvement || {})}`}
         <div className="log-box">
           {JSON.stringify({
             connected_count: devices.connected_count || 0,
+            delegated_summary: devices.delegated_summary || {},
             devices: devices.devices || [],
           }, null, 2)}
         </div>

@@ -32,15 +32,21 @@ export default function SystemHealth({ sessionId, logs = [] }) {
     const running = tasks.filter((t) => ["running", "in_progress", "pending"].includes(String(t?.status || ""))).length;
     const failed = tasks.filter((t) => ["failed", "error", "blocked"].includes(String(t?.status || ""))).length;
     const completed = tasks.filter((t) => ["completed", "success"].includes(String(t?.status || ""))).length;
-    const tools = Number(status?.health?.tools || 0);
+    const delegatedSummary = (status && typeof status.delegated_summary === "object") ? status.delegated_summary : {};
+    const delegatedActive =
+      Number(delegatedSummary?.delegated || 0)
+      + Number(delegatedSummary?.queued_for_agent || 0)
+      + Number(delegatedSummary?.awaiting_agent || 0)
+      + Number(delegatedSummary?.pending_permission || 0)
+      + Number(delegatedSummary?.executing || 0);
     const agents = Number(status?.health?.agents || 0);
-    const queueSize = running;
+    const queueSize = running + Number(delegatedSummary?.queued_for_agent || 0) + Number(delegatedSummary?.awaiting_agent || 0);
 
     return {
-      labels: ["Tasks Running", "Tasks Failed", "Tasks Completed", "Agents Active", "Tool Usage", "Queue Size"],
+      labels: ["Tasks Running", "Tasks Failed", "Tasks Completed", "Delegated Active", "Agents Active", "Queue Size"],
       datasets: [{
         label: "System Metrics",
-        data: [running, failed, completed, agents, tools, queueSize],
+        data: [running, failed, completed, delegatedActive, agents, queueSize],
         backgroundColor: ["#30c6ff", "#ff6f6f", "#65e3ab", "#89a0ff", "#f0bf68", "#b48dff"],
         borderColor: "#13253d",
         borderWidth: 1,

@@ -40,7 +40,28 @@ export default function DeviceControl({ sessionId }) {
 
     try {
       const res = await dispatchDeviceActions([action], sessionId, `Device control command: ${actionType}`, deviceId);
-      setResult(JSON.stringify(res, null, 2));
+      const status = String(res?.status || "unknown");
+      const taskId = res?.task?.task_id || res?.job?.job_id || null;
+      const mode = res?.mode || null;
+      const lifecycleHint = {
+        delegated: "Delegated to connected PC agent.",
+        queued_for_agent: "PC agent is offline. Task queued and will auto-resume.",
+        awaiting_agent: "No device assigned yet. Configure a target device.",
+        pending_permission: "Permission is required before execution can continue.",
+        executing: "Action is currently executing.",
+        completed: "Action completed.",
+        failed: "Action failed. Check raw payload for details.",
+      }[status] || null;
+      setResult(JSON.stringify({
+        status,
+        mode,
+        task_id: taskId,
+        message: res?.message || null,
+        lifecycle_hint: lifecycleHint,
+        reason: res?.task?.reason || null,
+        attempts: res?.task?.attempts || null,
+        raw: res,
+      }, null, 2));
       await refresh();
     } catch (e) {
       setResult(`Dispatch failed: ${e?.message || e}`);

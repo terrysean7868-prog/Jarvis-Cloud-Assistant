@@ -70,6 +70,7 @@ export default function JarvisDashboard({
   emotion = "calm",
   listening = false,
   speaking = false,
+  wakeListeningOnline = false,
   volume = 0,
   agentToken = "",
   agentSharedSecret = "",
@@ -230,6 +231,9 @@ export default function JarvisDashboard({
               showCaption={false}
               themeColor={themeColor}
             />
+            <div className="jd-empty" style={{ marginTop: 10 }}>
+              Voice pipeline: {speaking ? "speaking" : listening ? "capturing" : wakeListeningOnline ? "wake-listening" : "idle"}
+            </div>
           </div>
         </section>
       </div>

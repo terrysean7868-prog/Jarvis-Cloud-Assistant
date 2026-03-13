@@ -11,6 +11,7 @@ function statusChipClass(status) {
 
 export default function TaskManager({ sessionId }) {
   const [tasks, setTasks] = useState([]);
+  const [delegatedTasks, setDelegatedTasks] = useState([]);
   const [loading, setLoading] = useState(false);
   const [logText, setLogText] = useState("");
 
@@ -19,6 +20,7 @@ export default function TaskManager({ sessionId }) {
     try {
       const res = await getTasks(sessionId);
       setTasks(Array.isArray(res?.tasks) ? res.tasks : []);
+      setDelegatedTasks(Array.isArray(res?.delegated_tasks) ? res.delegated_tasks : []);
     } catch (e) {
       setLogText(`Task fetch failed: ${e?.message || e}`);
     } finally {
@@ -35,6 +37,11 @@ export default function TaskManager({ sessionId }) {
   const activeCount = useMemo(
     () => tasks.filter((t) => ["pending", "in_progress", "running"].includes(String(t?.status || ""))).length,
     [tasks]
+  );
+
+  const delegatedActive = useMemo(
+    () => delegatedTasks.filter((t) => ["delegated", "queued_for_agent", "awaiting_agent", "executing", "pending_permission"].includes(String(t?.status || ""))).length,
+    [delegatedTasks]
   );
 
   const retryTask = async (task) => {
@@ -55,6 +62,7 @@ export default function TaskManager({ sessionId }) {
         <div className="panel-row">
           <span className="panel-chip">Total: {tasks.length}</span>
           <span className="panel-chip">Running: {activeCount}</span>
+          <span className="panel-chip">Delegated Active: {delegatedActive}</span>
           <button className="panel-btn" onClick={refresh} disabled={loading}>{loading ? "Refreshing" : "Refresh"}</button>
         </div>
         <div className="panel-list" style={{ marginTop: 10 }}>
@@ -72,6 +80,28 @@ export default function TaskManager({ sessionId }) {
             </div>
           ))}
           {!tasks.length && <div className="panel-item"><p>No tasks found.</p></div>}
+        </div>
+      </div>
+      <div className="panel-card">
+        <h3 className="panel-title">Delegated Queue</h3>
+        <div className="panel-list" style={{ marginTop: 10 }}>
+          {delegatedTasks.map((task, idx) => (
+            <div className="panel-item" key={String(task?.task_id || idx)}>
+              <h4>{String(task?.feature || "delegated_task")}</h4>
+              <p>Status: <span className={statusChipClass(task?.status)}>{String(task?.status || "unknown")}</span></p>
+              <p>Device: {String(task?.device_id || "unassigned")}</p>
+              <p>Updated: {String(task?.updated_at_iso || task?.updated_at || "-")}</p>
+              <div className="log-box" style={{ marginTop: 8 }}>
+                {JSON.stringify({
+                  source_text: task?.source_text,
+                  reason: task?.reason,
+                  attempts: task?.attempts,
+                  last_job_id: task?.last_job_id,
+                }, null, 2)}
+              </div>
+            </div>
+          ))}
+          {!delegatedTasks.length && <div className="panel-item"><p>No delegated tasks.</p></div>}
         </div>
       </div>
       <div className="panel-card">

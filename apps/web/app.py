@@ -240,7 +240,7 @@ ENABLE_SCHEDULER = env.get_bool("JARVIS_ENABLE_SCHEDULER", True)
 # - Require an authenticated session for chat + internet endpoints (to prevent public abuse)
 # - Disable local/PC control and local filesystem endpoints (these are unsafe + meaningless in cloud)
 CLOUD_MODE = bool(jarvis_settings.cloud_mode)
-VOICE_ONLY_MODE = env.get_bool("JARVIS_VOICE_ONLY", True)
+VOICE_ONLY_MODE = env.get_bool("JARVIS_VOICE_ONLY", False)
 PC_AGENT_ENABLED = env.get_bool("JARVIS_ENABLE_PC_AGENT", True)
 AGENT_SHARED_SECRET = env.get_str("JARVIS_AGENT_SHARED_SECRET", "")
 EXPOSE_AGENT_SHARED_SECRET = env.get_bool("JARVIS_EXPOSE_AGENT_SHARED_SECRET", False)
@@ -273,9 +273,16 @@ _AGENT_CONFIG_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 _JOB_OWNER_CACHE_TTL_S = 10 * 60
 _JOB_OWNER_CACHE: dict[str, tuple[float, str, str | None, str | None]] = {}
 
+_JOB_RESULT_CACHE_TTL_S = 5 * 60
+_JOB_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_JOB_RESULT_WAITERS: dict[str, asyncio.Event] = {}
+
+_DELEGATED_TASK_INDEX_READY = False
+
 _DEVICE_REGISTRY_INDEX_READY = False
 _DEVICE_PERMISSIONS_INDEX_READY = False
 _AGENT_CONFIG_INDEX_READY = False
+_REQUIREMENTS_AUDIT_INDEX_READY = False
 
 
 def _remember_job_owner(job: dict) -> None:
@@ -321,6 +328,433 @@ def _pop_job_owner(job_id: str | None) -> tuple[str | None, str | None, str | No
         return username or None, device_id or None, source_text or None
     except Exception:
         return None, None, None
+
+
+def _delegated_tasks_collection():
+    """Collection storing cloud delegated tasks for queue/resume lifecycle."""
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return None
+    col = database.db["delegated_tasks"]
+    global _DELEGATED_TASK_INDEX_READY
+    if not _DELEGATED_TASK_INDEX_READY:
+        try:
+            col.create_index([("status", 1), ("device_id", 1), ("updated_at", -1)])
+        except Exception:
+            pass
+        try:
+            col.create_index([("username", 1), ("feature", 1), ("status", 1), ("updated_at", -1)])
+        except Exception:
+            pass
+        try:
+            col.create_index("task_id", unique=True)
+        except Exception:
+            pass
+        try:
+            col.create_index("last_job_id")
+        except Exception:
+            pass
+        _DELEGATED_TASK_INDEX_READY = True
+    return col
+
+
+def _normalize_flow_status(value: str | None, *, default: str = "awaiting_agent") -> str:
+    s = str(value or "").strip().lower()
+    allowed = {
+        "available",
+        "executing",
+        "delegated",
+        "queued_for_agent",
+        "awaiting_agent",
+        "pending_permission",
+        "restricted",
+        "failed",
+        "completed",
+    }
+    return s if s in allowed else default
+
+
+def _remember_job_result(payload: dict[str, Any]) -> None:
+    try:
+        job_id = str((payload or {}).get("job_id") or "").strip()
+        if not job_id:
+            return
+        now = time.time()
+        _JOB_RESULT_CACHE[job_id] = (now, payload)
+
+        waiter = _JOB_RESULT_WAITERS.get(job_id)
+        if waiter:
+            waiter.set()
+
+        if len(_JOB_RESULT_CACHE) > 1000:
+            cutoff = now - _JOB_RESULT_CACHE_TTL_S
+            for k, v in list(_JOB_RESULT_CACHE.items()):
+                if (not v) or (v[0] < cutoff):
+                    _JOB_RESULT_CACHE.pop(k, None)
+    except Exception:
+        return
+
+
+async def _await_job_result(job_id: str, timeout_s: float = 2.5) -> dict[str, Any] | None:
+    jid = str(job_id or "").strip()
+    if not jid:
+        return None
+
+    try:
+        cached = _JOB_RESULT_CACHE.get(jid)
+        if cached and (time.time() - float(cached[0])) <= _JOB_RESULT_CACHE_TTL_S:
+            return cached[1]
+    except Exception:
+        pass
+
+    waiter = _JOB_RESULT_WAITERS.get(jid)
+    if waiter is None:
+        waiter = asyncio.Event()
+        _JOB_RESULT_WAITERS[jid] = waiter
+
+    try:
+        await asyncio.wait_for(waiter.wait(), timeout=max(0.1, float(timeout_s or 0.1)))
+    except Exception:
+        pass
+    finally:
+        _JOB_RESULT_WAITERS.pop(jid, None)
+
+    try:
+        cached = _JOB_RESULT_CACHE.get(jid)
+        if cached:
+            return cached[1]
+    except Exception:
+        pass
+    return None
+
+
+def _queue_delegated_task(
+    *,
+    username: str,
+    role: str,
+    device_id: str | None,
+    feature: str,
+    source_text: str,
+    actions: list[dict[str, Any]],
+    status_value: str,
+    reason: str,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    normalized_status = _normalize_flow_status(status_value)
+    task = {
+        "task_id": f"dlg_{uuid.uuid4().hex[:16]}",
+        "username": (username or "").strip().lower() or None,
+        "role": (role or "user").strip().lower(),
+        "device_id": _normalize_device_id(device_id) or None,
+        "feature": str(feature or "device_action").strip() or "device_action",
+        "source_text": str(source_text or "").strip(),
+        "actions": [a for a in (actions or []) if isinstance(a, dict)],
+        "status": normalized_status,
+        "reason": str(reason or "").strip() or None,
+        "attempts": 0,
+        "last_job_id": None,
+        "created_at": now,
+        "updated_at": now,
+        "created_at_iso": now.isoformat(),
+        "updated_at_iso": now.isoformat(),
+    }
+
+    try:
+        col = _delegated_tasks_collection()
+        if col is not None:
+            # De-duplicate very recent equivalent pending items from repeated polling.
+            existing = col.find_one(
+                {
+                    "username": task["username"],
+                    "feature": task["feature"],
+                    "device_id": task["device_id"],
+                    "status": {"$in": ["awaiting_agent", "queued_for_agent", "delegated", "executing"]},
+                },
+                {"_id": 0},
+                sort=[("updated_at", -1)],
+            )
+            if isinstance(existing, dict):
+                return _to_json_safe(existing)
+            col.insert_one(task)
+            task.pop("_id", None)
+    except Exception:
+        pass
+
+    return _to_json_safe(task)
+
+
+def _mark_delegated_task(*, task_id: str | None = None, job_id: str | None = None, status_value: str, extra: dict[str, Any] | None = None) -> None:
+    try:
+        col = _delegated_tasks_collection()
+        if col is None:
+            return
+        q = None
+        if task_id:
+            q = {"task_id": str(task_id).strip()}
+        elif job_id:
+            q = {"last_job_id": str(job_id).strip()}
+        if not q:
+            return
+
+        now = datetime.now(timezone.utc)
+        update = {
+            "status": _normalize_flow_status(status_value),
+            "updated_at": now,
+            "updated_at_iso": now.isoformat(),
+        }
+        if isinstance(extra, dict):
+            update.update(extra)
+        col.update_one(q, {"$set": update}, upsert=False)
+    except Exception:
+        return
+
+
+def _delegated_status_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "available": 0,
+        "executing": 0,
+        "delegated": 0,
+        "queued_for_agent": 0,
+        "awaiting_agent": 0,
+        "pending_permission": 0,
+        "requires_configuration": 0,
+        "restricted": 0,
+        "failed": 0,
+        "completed": 0,
+    }
+    for row in rows or []:
+        s = _normalize_flow_status((row or {}).get("status"), default="awaiting_agent")
+        if s in counts:
+            counts[s] += 1
+    return counts
+
+
+def _list_delegated_tasks_for_principal(
+    principal: dict[str, Any],
+    *,
+    limit: int = 100,
+    statuses: str | None = None,
+) -> list[dict[str, Any]]:
+    col = _delegated_tasks_collection()
+    if col is None:
+        return []
+
+    username = str((principal or {}).get("username") or "").strip().lower()
+    role = str((principal or {}).get("role") or "user").strip().lower()
+    is_admin = role == "admin"
+
+    q: dict[str, Any] = {}
+    if statuses:
+        vals = [str(s).strip().lower() for s in str(statuses).split(",") if str(s).strip()]
+        vals = [_normalize_flow_status(v, default=v) for v in vals]
+        if vals:
+            q["status"] = {"$in": vals}
+    if (not is_admin) and username:
+        q["username"] = username
+
+    lim = max(1, min(int(limit or 100), 400))
+    rows = list(col.find(q, {"_id": 0}).sort("updated_at", -1).limit(lim))
+    return [_to_json_safe(r) for r in rows]
+
+
+async def _resume_queued_delegations_for_device(device_id: str) -> None:
+    did = _normalize_device_id(device_id)
+    if not did:
+        return
+
+    col = _delegated_tasks_collection()
+    if col is None:
+        return
+
+    owner = _get_device_owner(did)
+    query = {
+        "status": {"$in": ["awaiting_agent", "queued_for_agent"]},
+        "$or": [
+            {"device_id": did},
+            {"device_id": None, "username": owner},
+        ],
+    }
+
+    rows = []
+    try:
+        rows = list(col.find(query, {"_id": 0}).sort("updated_at", 1).limit(30))
+    except Exception:
+        rows = []
+
+    for row in rows:
+        try:
+            actions = row.get("actions") or []
+            if not isinstance(actions, list) or not actions:
+                _mark_delegated_task(task_id=row.get("task_id"), status_value="failed", extra={"error": "missing_actions"})
+                continue
+
+            username = str(row.get("username") or "user").strip().lower() or "user"
+            source_text = str(row.get("source_text") or row.get("feature") or "delegated_task").strip()
+            job = await _dispatch_actions_to_device(did, username=username, actions=actions, source_text=source_text)
+            _mark_delegated_task(
+                task_id=row.get("task_id"),
+                status_value="delegated",
+                extra={
+                    "device_id": did,
+                    "last_job_id": job.get("job_id"),
+                    "attempts": int(row.get("attempts") or 0) + 1,
+                    "dispatched_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as e:
+            _mark_delegated_task(task_id=row.get("task_id"), status_value="queued_for_agent", extra={"last_error": str(e)[:300]})
+
+
+async def _resume_pending_permission_delegations_for_device(device_id: str) -> None:
+    did = _normalize_device_id(device_id)
+    if not did:
+        return
+
+    col = _delegated_tasks_collection()
+    if col is None:
+        return
+
+    owner = _get_device_owner(did)
+    query = {
+        "status": "pending_permission",
+        "$or": [
+            {"device_id": did},
+            {"device_id": None, "username": owner},
+        ],
+    }
+
+    rows = []
+    try:
+        rows = list(col.find(query, {"_id": 0}).sort("updated_at", 1).limit(30))
+    except Exception:
+        rows = []
+
+    for row in rows:
+        try:
+            actions = row.get("actions") or []
+            if not isinstance(actions, list) or not actions:
+                _mark_delegated_task(task_id=row.get("task_id"), status_value="failed", extra={"error": "missing_actions"})
+                continue
+
+            username = str(row.get("username") or "user").strip().lower() or "user"
+            source_text = str(row.get("source_text") or row.get("feature") or "delegated_task").strip()
+            job = await _dispatch_actions_to_device(did, username=username, actions=actions, source_text=source_text)
+            _mark_delegated_task(
+                task_id=row.get("task_id"),
+                status_value="delegated",
+                extra={
+                    "device_id": did,
+                    "last_job_id": job.get("job_id"),
+                    "attempts": int(row.get("attempts") or 0) + 1,
+                    "dispatched_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as e:
+            _mark_delegated_task(task_id=row.get("task_id"), status_value="pending_permission", extra={"last_error": str(e)[:300]})
+
+
+async def _delegate_or_queue_cloud_action(
+    *,
+    session_id: str | None,
+    feature: str,
+    actions: list[dict[str, Any]],
+    source_text: str,
+    require_admin: bool = False,
+    await_timeout_s: float = 2.5,
+) -> dict[str, Any]:
+    _require_pc_agent_enabled()
+    principal = _require_admin_session(session_id) if require_admin else _require_authenticated_session(session_id)
+    username = str((principal or {}).get("username") or "").strip().lower()
+    role = str((principal or {}).get("role") or "user").strip().lower()
+
+    did = _get_owner_device_id(username)
+    if (not did) and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
+        did = DEFAULT_DEVICE_ID
+    if (not did) and role == "admin":
+        did = DEFAULT_DEVICE_ID
+
+    if not did:
+        task = _queue_delegated_task(
+            username=username,
+            role=role,
+            device_id=None,
+            feature=feature,
+            source_text=source_text,
+            actions=actions,
+            status_value="awaiting_agent",
+            reason="missing_device_assignment",
+        )
+        return {
+            "status": "awaiting_agent",
+            "mode": "cloud",
+            "feature": feature,
+            "task": task,
+            "message": "No device is assigned yet. Task is waiting for agent assignment.",
+        }
+
+    if not await device_hub.is_connected(did):
+        task = _queue_delegated_task(
+            username=username,
+            role=role,
+            device_id=did,
+            feature=feature,
+            source_text=source_text,
+            actions=actions,
+            status_value="queued_for_agent",
+            reason="agent_offline",
+        )
+        return {
+            "status": "queued_for_agent",
+            "mode": "cloud",
+            "feature": feature,
+            "device_id": did,
+            "task": task,
+            "message": "PC agent is offline. Task queued and will auto-resume on reconnect.",
+        }
+
+    job = await _dispatch_actions_to_device(did, username=username or "user", actions=actions, source_text=source_text)
+    job_id = str((job or {}).get("job_id") or "").strip()
+
+    payload = await _await_job_result(job_id, timeout_s=await_timeout_s)
+    if not payload:
+        return {
+            "status": "delegated",
+            "mode": "cloud",
+            "feature": feature,
+            "device_id": did,
+            "job": job,
+            "message": "Delegated to PC agent and awaiting completion.",
+        }
+
+    results = (payload or {}).get("results") or []
+    first = results[0] if isinstance(results, list) and results else {}
+    raw_first_status = str((first or {}).get("status") or "").strip().lower()
+    if raw_first_status in {"success", "ok"}:
+        first_status = "completed"
+    elif raw_first_status in {"error", "forbidden"}:
+        first_status = "failed"
+    else:
+        first_status = _normalize_flow_status(raw_first_status, default="completed")
+
+    return {
+        "status": first_status,
+        "mode": "cloud",
+        "feature": feature,
+        "device_id": did,
+        "job": job,
+        "agent_result": payload,
+    }
+
+
+def _delegated_first_result(delegated: dict[str, Any]) -> dict[str, Any] | None:
+    payload = (delegated.get("agent_result") or {}).get("results") or []
+    first = payload[0] if isinstance(payload, list) and payload else None
+    if isinstance(first, dict):
+        return _to_json_safe(dict(first))
+    return None
 
 
 def _truncate_notification_payload(obj: Any, *, max_str: int = 2000, max_list: int = 30, max_depth: int = 4, _depth: int = 0):
@@ -600,11 +1034,67 @@ READ_ONLY_ACTION_TYPES = {
     "read", "list",
 }
 
-def _cloud_feature_disabled(feature: str):
+def _cloud_feature_disabled(feature: str, *, required_by: str = "admin", delegated: bool = True):
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail=f"{feature} is disabled in cloud deployments.",
+        detail={
+            "message": f"{feature} is restricted in cloud deployments.",
+            "mode": "cloud",
+            "status": "restricted",
+            "details_level": "sanitized",
+            "restriction": {
+                "feature": feature,
+                "required_by": required_by,
+                "delegated": bool(delegated),
+                "delegated_to": "pc_agent" if delegated else None,
+                "guidance": [
+                    "Use a connected PC agent for local/device execution.",
+                    "If this is an admin-only operation, request admin approval.",
+                ],
+            },
+        },
     )
+
+
+def _build_cloud_safe_system_info() -> dict:
+    """Return a cloud-safe, schema-stable system info payload.
+
+    This intentionally mirrors key fields used by the local dashboard while
+    replacing local-only internals with sanitized placeholders.
+    """
+    db_connected = (getattr(database, "client", None) is not None) and (getattr(database, "db", None) is not None)
+    return {
+        "status": "success",
+        "mode": "cloud",
+        "details_level": "sanitized",
+        "version": "1.0",
+        "voice_enabled": bool(VOICE_ONLY_MODE),
+        "pc_agent_enabled": bool(PC_AGENT_ENABLED),
+        "database_connected": bool(db_connected),
+        "redis_connected": bool(_BROKER is not None),
+        "llm_configured": bool(getattr(rd, "PRIMARY_ENDPOINT", "") or getattr(rd, "PRIMARY_API_KEY", "") or getattr(rd, "BACKUP_API_KEY", "")),
+        "uptime_seconds": int(time.time() - START_TS),
+        "task_queue_enabled": bool(ENABLE_SCHEDULER and SCHEDULER_AVAILABLE),
+        "connected_agents": None,
+        "local_system_details": "restricted",
+        # Preserve dashboard-compatible keys.
+        "cpu_percent": None,
+        "memory_percent": None,
+        "disk_percent": None,
+        "boot_time": None,
+        "cpu_count": None,
+        "process_count": None,
+        "restriction": {
+            "feature": "System operations",
+            "required_by": "admin",
+            "delegated": True,
+            "delegated_to": "pc_agent",
+            "guidance": [
+                "Connect a PC agent to access local runtime metrics.",
+                "Cloud mode returns sanitized system information by design.",
+            ],
+        },
+    }
 
 
 def _user_explicitly_requested_screen_capture(text: str) -> bool:
@@ -843,6 +1333,71 @@ def _agent_config_collection():
             pass
         _AGENT_CONFIG_INDEX_READY = True
     return col
+
+
+def _requirements_audit_collection():
+    """Collection for permission/access requirement audit events."""
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return None
+    col = database.db["requirements_audit"]
+    global _REQUIREMENTS_AUDIT_INDEX_READY
+    if not _REQUIREMENTS_AUDIT_INDEX_READY:
+        try:
+            col.create_index("ts")
+        except Exception:
+            pass
+        try:
+            col.create_index([("user_id", 1), ("device_id", 1), ("ts", -1)])
+        except Exception:
+            pass
+        try:
+            col.create_index([("status", 1), ("requirement_type", 1), ("ts", -1)])
+        except Exception:
+            pass
+        _REQUIREMENTS_AUDIT_INDEX_READY = True
+    return col
+
+
+def _log_requirement_event(
+    *,
+    user_id: str | None,
+    device_id: str | None,
+    requested_action: str,
+    requirement_type: str,
+    target: str,
+    permission_or_scope: str | None = None,
+    status: str = "pending",
+    actor_role: str | None = None,
+    source: str | None = None,
+    details: dict | None = None,
+):
+    """Best-effort requirement audit event logger."""
+    try:
+        col = _requirements_audit_collection()
+        if col is None:
+            return
+        now = datetime.now(timezone.utc)
+        payload = {
+            "ts": now.isoformat(),
+            "user_id": (user_id or "").strip().lower() or None,
+            "device_id": _normalize_device_id(device_id) or None,
+            "requested_action": (requested_action or "").strip() or "unknown",
+            "requirement_type": (requirement_type or "").strip() or "unknown",
+            "target": (target or "").strip() or "unknown",
+            "permission_or_scope": (permission_or_scope or "").strip() or None,
+            "status": (status or "pending").strip().lower(),
+            "actor_role": (actor_role or "").strip().lower() or None,
+            "source": (source or "").strip() or None,
+            "details": details if isinstance(details, dict) else {},
+            "created_at": now,
+        }
+        col.insert_one(payload)
+    except Exception:
+        return
 
 
 def _skills_collection():
@@ -1101,6 +1656,27 @@ def _is_jsonable(value: Any) -> bool:
     if isinstance(value, dict):
         return all(isinstance(k, str) and _is_jsonable(v) for k, v in value.items())
     return False
+
+
+def _to_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            out[str(k)] = _to_json_safe(v)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(v) for v in value]
+    iso = getattr(value, "isoformat", None)
+    if callable(iso):
+        try:
+            return iso()
+        except Exception:
+            pass
+    return str(value)
 
 
 def _user_prefs_collection():
@@ -1436,6 +2012,18 @@ async def agent_ws(ws: WebSocket):
 
         await ws.send_json({"type": "ack", "device_id": device_id, "status": "connected"})
 
+        # Auto-resume queued delegated tasks as soon as the agent reconnects.
+        try:
+            await _resume_queued_delegations_for_device(device_id)
+        except Exception:
+            pass
+
+        # Resume permission-blocked tasks when agent reconnects (saved permissions may auto-apply).
+        try:
+            await _resume_pending_permission_delegations_for_device(device_id)
+        except Exception:
+            pass
+
         # If we have previously approved permissions for this device, apply them automatically.
         try:
             saved = _get_saved_device_permissions(device_id)
@@ -1468,6 +2056,10 @@ async def agent_ws(ws: WebSocket):
                 caps = payload.get("capabilities") or {}
                 if isinstance(caps, dict):
                     await device_hub.update_capabilities(device_id, caps)
+                    try:
+                        await _resume_pending_permission_delegations_for_device(device_id)
+                    except Exception:
+                        pass
                 await ws.send_json({"type": "ok"})
                 continue
 
@@ -1476,6 +2068,30 @@ async def agent_ws(ws: WebSocket):
                 await device_hub.touch(device_id)
                 logger = __import__('logging').getLogger(__name__)
                 logger.info("[AGENT RESULT] %s", payload)
+
+                try:
+                    _remember_job_result(payload if isinstance(payload, dict) else {})
+                    jid = str((payload or {}).get("job_id") or "").strip()
+                    if jid:
+                        results = (payload or {}).get("results") or []
+                        first = results[0] if isinstance(results, list) and results else {}
+                        raw_status = str((first or {}).get("status") or "completed").strip().lower()
+                        if raw_status in {"success", "ok"}:
+                            flow_status = "completed"
+                        elif raw_status in {"error", "forbidden"}:
+                            flow_status = "failed"
+                        else:
+                            flow_status = _normalize_flow_status(raw_status, default="completed")
+                        _mark_delegated_task(
+                            job_id=jid,
+                            status_value=flow_status,
+                            extra={
+                                "completed_at": datetime.now(timezone.utc).isoformat(),
+                                "result_preview": _truncate_notification_payload(results),
+                            },
+                        )
+                except Exception:
+                    pass
 
                 # Publish to the user who initiated this job (best-effort).
                 try:
@@ -1944,6 +2560,10 @@ async def device_dispatch(req: DeviceDispatchRequest):
     p = _require_authenticated_session(req.session_id)
     username = (p.get("username") or "").strip().lower()
     role = (p.get("role") or "user").strip().lower()
+    requested_action = ", ".join([
+        str((a or {}).get("type") or "").strip()
+        for a in (req.actions or []) if isinstance(a, dict)
+    ]) or "device_action"
 
     did = None
     if role == "admin":
@@ -1956,26 +2576,103 @@ async def device_dispatch(req: DeviceDispatchRequest):
             did = _get_owner_device_id(username) or DEFAULT_DEVICE_ID
     else:
         if req.device_id and _normalize_device_id(req.device_id) != _normalize_device_id(_get_owner_device_id(username) or ""):
-            raise HTTPException(status_code=403, detail="Users cannot dispatch to another device")
+            _log_requirement_event(
+                user_id=username,
+                device_id=req.device_id,
+                requested_action=requested_action,
+                requirement_type="admin_policy",
+                target="Device Registry Policy",
+                status="denied",
+                actor_role=role,
+                source="device_dispatch",
+                details={"message": "Users cannot dispatch to another device"},
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "Users cannot dispatch to another device",
+                    "requirement": {
+                        "requirement_type": "admin_policy",
+                        "target": "Device Registry Policy",
+                        "target_application": "Jarvis Management Console",
+                        "permission_or_scope": "device_dispatch_cross_owner",
+                        "required_by": "admin",
+                        "why": "Cross-device dispatch is controlled by administrator policy and ownership mapping.",
+                        "guidance": [
+                            "Ask an administrator to assign this device to your account or perform the action for you.",
+                            "Admin path: Management Console -> Device Registry -> Assign owner.",
+                            "After policy is updated, Jarvis can resume the action.",
+                        ],
+                        "resume_automatically": True,
+                    },
+                },
+            )
         did = _get_owner_device_id(username)
         if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
             did = DEFAULT_DEVICE_ID
         if not did:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "message": "No device assigned to this user",
-                    "action": "configure_pc",
-                    "hint": "Configure a device via /api/user/device/configure (auto-pick) or /api/user/device/set (explicit device_id).",
-                },
+            _log_requirement_event(
+                user_id=username,
+                device_id=None,
+                requested_action=requested_action,
+                requirement_type="missing_user_information",
+                target="Device Selection",
+                permission_or_scope="device_id",
+                status="pending",
+                actor_role=role,
+                source="device_dispatch",
+                details={"message": "No device assigned to this user"},
             )
+            queued = _queue_delegated_task(
+                username=username,
+                role=role,
+                device_id=None,
+                feature="device_dispatch",
+                source_text=req.source_text or requested_action,
+                actions=[a for a in (req.actions or []) if isinstance(a, dict)],
+                status_value="awaiting_agent",
+                reason="missing_device_assignment",
+            )
+            return {
+                "status": "awaiting_agent",
+                "mode": "cloud",
+                "task": queued,
+                "message": "No device assigned yet. Action queued and will resume after device configuration.",
+                "action": "configure_pc",
+                "hint": "Configure a device via /api/user/device/configure (auto-pick) or /api/user/device/set (explicit device_id).",
+            }
 
     if not await device_hub.is_connected(did):
-        raise HTTPException(status_code=409, detail={
-            "message": "Device agent is not connected",
+        _log_requirement_event(
+            user_id=username,
+            device_id=did,
+            requested_action=requested_action,
+            requirement_type="third_party_app_permission",
+            target="PC Agent",
+            permission_or_scope="agent_connection",
+            status="pending",
+            actor_role=role,
+            source="device_dispatch",
+            details={"message": "Device agent is not connected"},
+        )
+        queued = _queue_delegated_task(
+            username=username,
+            role=role,
+            device_id=did,
+            feature="device_dispatch",
+            source_text=req.source_text or requested_action,
+            actions=[a for a in (req.actions or []) if isinstance(a, dict)],
+            status_value="queued_for_agent",
+            reason="agent_offline",
+        )
+        return {
+            "status": "queued_for_agent",
+            "mode": "cloud",
             "device_id": did,
+            "task": queued,
+            "message": "Device agent is offline. Action queued and will auto-resume on reconnect.",
             "hint": "Start pc_agent.py on the target PC and ensure JARVIS_SERVER_URL and JARVIS_AGENT_SHARED_SECRET match the server.",
-        })
+        }
 
     actions = req.actions or []
     if not isinstance(actions, list):
@@ -2003,15 +2700,37 @@ async def device_dispatch(req: DeviceDispatchRequest):
     agent = await device_hub.get_agent(did)
     caps = (agent or {}).get("capabilities") or None
     if not caps:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Agent is connected but did not report capabilities",
-                "action": "update_pc_agent",
-                "hint": "Update pc_agent.py and restart the agent so it reports capabilities on connect.",
-                "device_id": did,
-            },
+        _log_requirement_event(
+            user_id=username,
+            device_id=did,
+            requested_action=requested_action,
+            requirement_type="third_party_app_permission",
+            target="PC Agent Capabilities",
+            permission_or_scope="capabilities_payload",
+            status="pending",
+            actor_role=role,
+            source="device_dispatch",
+            details={"message": "Agent is connected but did not report capabilities"},
         )
+        queued = _queue_delegated_task(
+            username=username,
+            role=role,
+            device_id=did,
+            feature="device_dispatch",
+            source_text=req.source_text or requested_action,
+            actions=[a for a in (req.actions or []) if isinstance(a, dict)],
+            status_value="pending_permission",
+            reason="missing_agent_capabilities",
+        )
+        return {
+            "status": "pending_permission",
+            "mode": "cloud",
+            "device_id": did,
+            "task": queued,
+            "message": "Agent is connected but missing capability metadata.",
+            "action": "update_pc_agent",
+            "hint": "Update pc_agent.py and restart the agent so it reports capabilities on connect.",
+        }
 
     saved_perms = _get_saved_device_permissions(did) or {}
 
@@ -2101,16 +2820,42 @@ async def device_dispatch(req: DeviceDispatchRequest):
                     continue
                 except Exception:
                     pass
-            raise HTTPException(status_code=403, detail={
+            _log_requirement_event(
+                user_id=username,
+                device_id=did,
+                requested_action=at or requested_action,
+                requirement_type="assistant_permission",
+                target="PC Agent Runtime Permission",
+                permission_or_scope=key,
+                status="pending",
+                actor_role=role,
+                source="device_dispatch",
+                details={"env_var": env_name, "action_type": at},
+            )
+            queued = _queue_delegated_task(
+                username=username,
+                role=role,
+                device_id=did,
+                feature="device_dispatch",
+                source_text=req.source_text or requested_action,
+                actions=[a for a in (req.actions or []) if isinstance(a, dict)],
+                status_value="pending_permission",
+                reason=f"missing_{key}",
+            )
+            return {
+                "status": "pending_permission",
+                "mode": "cloud",
+                "device_id": did,
+                "task": queued,
                 "message": f"No permission: '{at}' is disabled on your PC agent.",
                 "action_type": at,
                 "required_capability": key,
                 "env_var": env_name,
                 "suggestion": f"Enable {env_name}=true on the PC agent.",
-            })
+            }
 
     job = await _dispatch_actions_to_device(did, username=username or "user", actions=actions, source_text=req.source_text or "")
-    return {"status": "queued", "job": job, "request_id": f"disp_{uuid.uuid4().hex[:12]}"}
+    return {"status": "delegated", "job": job, "device_id": did, "request_id": f"disp_{uuid.uuid4().hex[:12]}"}
 
 
 # =========================================================
@@ -2280,6 +3025,51 @@ class DevicePermissionsGrantRequest(BaseModel):
     permissions: Dict[str, bool]
 
 
+class RequirementAuditLogRequest(BaseModel):
+    session_id: str
+    requested_action: str
+    requirement_type: str
+    target: str
+    permission_or_scope: str | None = None
+    status: str = "pending"
+    device_id: str | None = None
+    source: str | None = "frontend"
+    details: Dict[str, Any] | None = None
+
+
+@app.post("/api/requirements/audit/log")
+async def requirements_audit_log(req: RequirementAuditLogRequest):
+    principal = _require_authenticated_session(req.session_id)
+    username = (principal.get("username") or "").strip().lower() or None
+    role = (principal.get("role") or "user").strip().lower()
+
+    _log_requirement_event(
+        user_id=username,
+        device_id=req.device_id,
+        requested_action=req.requested_action,
+        requirement_type=req.requirement_type,
+        target=req.target,
+        permission_or_scope=req.permission_or_scope,
+        status=req.status,
+        actor_role=role,
+        source=req.source,
+        details=req.details,
+    )
+    return {"status": "success"}
+
+
+@app.get("/api/admin/requirements/audit")
+async def admin_requirements_audit(session_id: str, limit: int = 100):
+    _require_admin_session(session_id)
+    col = _requirements_audit_collection()
+    if col is None:
+        return {"status": "error", "message": "Database unavailable", "events": []}
+
+    lim = max(1, min(int(limit), 500))
+    rows = list(col.find({}, {"_id": 0}).sort("created_at", -1).limit(lim))
+    return {"status": "success", "events": rows, "count": len(rows)}
+
+
 @app.get("/api/device/permissions")
 async def device_permissions_get(session_id: str, device_id: str | None = None, owner_username: str | None = None):
     """Get saved device permissions for a device.
@@ -2389,6 +3179,18 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
     # If the agent is offline, we cannot apply runtime permissions now, but the saved permissions
     # will be auto-applied when the agent connects.
     if not await device_hub.is_connected(did):
+        _log_requirement_event(
+            user_id=username,
+            device_id=did,
+            requested_action="agent_set_permissions",
+            requirement_type="third_party_app_permission",
+            target="PC Agent",
+            permission_or_scope="agent_connection",
+            status="pending",
+            actor_role=role,
+            source="device_permissions_grant",
+            details={"permissions": normalized},
+        )
         return {"status": "saved", "offline": True, "device_id": did, "permissions": normalized}
 
     job = await _dispatch_actions_to_device(
@@ -2397,6 +3199,26 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
         actions=[{"type": "agent_set_permissions", "permissions": normalized}],
         source_text="permission_grant",
     )
+    for key, enabled in normalized.items():
+        _log_requirement_event(
+            user_id=username,
+            device_id=did,
+            requested_action="agent_set_permissions",
+            requirement_type="assistant_permission",
+            target="PC Agent Runtime Permission",
+            permission_or_scope=key,
+            status="granted" if bool(enabled) else "denied",
+            actor_role=role,
+            source="device_permissions_grant",
+            details={"enabled": bool(enabled)},
+        )
+
+    # Granting permissions should immediately retry permission-blocked tasks.
+    try:
+        await _resume_pending_permission_delegations_for_device(did)
+    except Exception:
+        pass
+
     return {"status": "queued", "job": job, "device_id": did, "permissions": normalized}
 
 
@@ -3189,6 +4011,11 @@ class GoalGraphUpdateRequest(BaseModel):
     rerun_failed: bool = False
 
 
+class GoalCancelRequest(BaseModel):
+    session_id: str | None = None
+    reason: str | None = None
+
+
 class AutonomyControlRequest(BaseModel):
     session_id: str | None = None
     action: str
@@ -3221,18 +4048,81 @@ async def create_autonomy_goal(req: GoalCreateRequest):
 
 
 @app.get("/api/autonomy/goals")
-async def list_autonomy_goals(statuses: str = "pending,running,failed,completed", limit: int = 25):
+async def list_autonomy_goals(statuses: str = "pending,running,failed,completed", limit: int = 25, session_id: str | None = None):
     try:
+        principal = None
+        if CLOUD_MODE:
+            principal = _require_authenticated_session(session_id)
+
         status_list = [s.strip() for s in statuses.split(",") if s.strip()]
         goals = autonomy_runtime.goals.list_goals(statuses=status_list, limit=max(1, min(limit, 100)))
+
+        if CLOUD_MODE and principal and str((principal or {}).get("role") or "").strip().lower() != "admin":
+            username = str((principal or {}).get("username") or "").strip().lower()
+            goals = [g for g in goals if str((g or {}).get("owner") or "").strip().lower() == username]
+
         return {"status": "ok", "goals": goals}
     except Exception as e:
         return {"status": "error", "message": str(e), "goals": []}
 
 
+@app.post("/api/autonomy/goals/{goal_id}/cancel")
+async def cancel_autonomy_goal(goal_id: str, req: GoalCancelRequest):
+    principal = _get_principal(req.session_id) if req.session_id else {"username": "system", "role": "anonymous"}
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(req.session_id)
+
+    goal = autonomy_runtime.goals.get_goal(goal_id)
+    if not goal:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found")
+
+    role = str((principal or {}).get("role") or "user").strip().lower()
+    username = str((principal or {}).get("username") or "system").strip()
+    owner = str((goal or {}).get("owner") or "").strip().lower()
+    if role != "admin" and owner and owner != username.lower():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Goal ownership required")
+
+    previous_status = str((goal or {}).get("status") or "").strip().lower()
+    if previous_status in {"completed", "failed", "cancelled"}:
+        return {
+            "status": "ok",
+            "goal_id": goal_id,
+            "goal_status": previous_status or "unknown",
+            "message": "Goal already in a terminal state",
+        }
+
+    autonomy_runtime.goals.update_goal_status(goal_id, "cancelled", last_error="cancelled_by_user")
+    autonomy_runtime.goals.append_report(
+        goal_id,
+        {
+            "type": "cancelled",
+            "requested_by": username or "system",
+            "reason": str(req.reason or "user_requested")[:200],
+            "previous_status": previous_status or "unknown",
+        },
+    )
+    return {
+        "status": "ok",
+        "goal_id": goal_id,
+        "goal_status": "cancelled",
+        "previous_status": previous_status or "unknown",
+    }
+
+
 @app.get("/api/autonomy/status")
-async def autonomy_status():
+async def autonomy_status(session_id: str | None = None):
     try:
+        if CLOUD_MODE:
+            _require_authenticated_session(session_id)
+
+        delegated_rows = []
+        if session_id:
+            try:
+                principal = _require_authenticated_session(session_id)
+                delegated_rows = _list_delegated_tasks_for_principal(principal, limit=120)
+            except Exception:
+                delegated_rows = []
+
         return {
             "status": "ok",
             "runtime": {
@@ -3242,6 +4132,7 @@ async def autonomy_status():
             },
             "health": autonomy_runtime._health_check(),
             "tools": autonomy_runtime.tools.list_tools(),
+            "delegated_summary": _delegated_status_counts(delegated_rows),
         }
     except Exception as e:
         return {
@@ -3254,6 +4145,7 @@ async def autonomy_status():
             "health": {"status": "error", "message": str(e)},
             "tools": [],
             "message": str(e),
+            "delegated_summary": _delegated_status_counts([]),
         }
 
 
@@ -3389,8 +4281,11 @@ async def autonomy_control(req: AutonomyControlRequest):
 
 @app.get("/api/anatomy/state")
 async def anatomy_state(session_id: str | None = None):
+    principal = None
     if CLOUD_MODE:
-        _require_authenticated_session(session_id)
+        principal = _require_authenticated_session(session_id)
+    elif session_id:
+        principal = _get_principal(session_id)
 
     goals = autonomy_runtime.goals.list_goals(statuses=["pending", "running", "awaiting_confirmation", "failed", "completed", "blocked"], limit=120)
     goal_counts = {
@@ -3421,6 +4316,12 @@ async def anatomy_state(session_id: str | None = None):
             task_counts[s] += 1
 
     connected = await device_hub.list_agents()
+    delegated_rows = []
+    try:
+        if principal and (principal.get("username") or principal.get("role")):
+            delegated_rows = _list_delegated_tasks_for_principal(principal, limit=150)
+    except Exception:
+        delegated_rows = []
     knowledge = {
         "learning_examples": 0,
         "web_training_items": 0,
@@ -3459,6 +4360,8 @@ async def anatomy_state(session_id: str | None = None):
         "device_connections": {
             "connected_count": len(connected),
             "devices": list(connected.values()),
+            "delegated_summary": _delegated_status_counts(delegated_rows),
+            "delegated_tasks": delegated_rows[:20],
         },
     }
 
@@ -3500,11 +4403,10 @@ async def voice_auth_endpoint(auth_req: VoiceAuthRequest):
             uname = (auth_req.username or "").strip().lower()
             requested_role = (auth_req.role or "user").strip().lower()
 
-            # Cloud mode: always force role=user.
-            # Local mode: only allow role=admin when registering the configured admin username.
-            if CLOUD_MODE:
-                role = "user"
-            elif requested_role == "admin" and uname == ADMIN_USERNAME:
+            # Only allow role=admin when registering the configured admin username.
+            # In cloud mode this preserves least privilege for normal users while still
+            # allowing admin-only product surfaces (update console/runtime control).
+            if requested_role == "admin" and uname == ADMIN_USERNAME:
                 role = "admin"
             else:
                 role = "user"
@@ -4296,7 +5198,34 @@ async def handle_self_update(request: SelfUpdateRequest):
     """Handle self-update commands from voice input."""
     try:
         if CLOUD_MODE:
-            return {"status": "error", "message": "Self-update is disabled in cloud mode"}
+            delegated = await _delegate_or_queue_cloud_action(
+                session_id=request.session_id,
+                feature="Self-update",
+                actions=[
+                    {
+                        "type": "self_update",
+                        "description": request.description or request.command,
+                        "file_path": request.file_path or "",
+                        "auto_install_deps": bool(request.auto_install_deps),
+                        "dry_run": bool(request.dry_run),
+                    }
+                ],
+                source_text=request.command or request.description or "self_update",
+                require_admin=True,
+                await_timeout_s=12.0,
+            )
+            if delegated.get("status") == "completed":
+                first = _delegated_first_result(delegated) or {}
+                if isinstance(first, dict):
+                    first.setdefault("mode", "cloud")
+                    first["execution"] = delegated
+                    return first
+            return {
+                "status": delegated.get("status") or "delegated",
+                "mode": "cloud",
+                "message": "Self-update delegated to PC agent.",
+                "execution": delegated,
+            }
 
         # Validate session and admin privileges before allowing self-update
         if not request.session_id:
@@ -4603,13 +5532,18 @@ async def get_all_tasks(session_id: str | None = None):
     tasks = task_manager.get_all_tasks()
 
     if not CLOUD_MODE:
-        return {"tasks": tasks}
+        return {"tasks": tasks, "delegated_tasks": []}
 
     principal = _require_authenticated_session(session_id)
     username = (principal.get("username") or "").strip().lower()
     is_admin = (principal.get("role") == "admin")
+    delegated_rows = _list_delegated_tasks_for_principal(principal, limit=120)
     if is_admin:
-        return {"tasks": tasks}
+        return {
+            "tasks": tasks,
+            "delegated_tasks": delegated_rows,
+            "delegated_summary": _delegated_status_counts(delegated_rows),
+        }
 
     filtered = []
     for t in tasks:
@@ -4620,7 +5554,23 @@ async def get_all_tasks(session_id: str | None = None):
                 filtered.append(t)
         except Exception:
             continue
-    return {"tasks": filtered}
+    return {
+        "tasks": filtered,
+        "delegated_tasks": delegated_rows,
+        "delegated_summary": _delegated_status_counts(delegated_rows),
+    }
+
+
+@app.get("/api/delegated/tasks")
+async def list_delegated_tasks(session_id: str, limit: int = 120, statuses: str | None = None):
+    principal = _require_authenticated_session(session_id)
+    rows = _list_delegated_tasks_for_principal(principal, limit=limit, statuses=statuses)
+    return {
+        "status": "success",
+        "tasks": rows,
+        "count": len(rows),
+        "summary": _delegated_status_counts(rows),
+    }
 
 
 @app.get("/api/agents")
@@ -4722,20 +5672,6 @@ async def list_self_improvement_proposals(session_id: str | None = None):
     except Exception:
         proposals = []
 
-    # Provide deterministic fallback for fresh deployments where no proposals exist yet.
-    if not proposals:
-        proposals = [
-            {
-                "proposal_id": "sample-proposal-1",
-                "title": "Refactor autonomy task scoring heuristics",
-                "risk_score": 0.32,
-                "generated_tools": [],
-                "diff": "--- a/src/planning/task_planner.py\n+++ b/src/planning/task_planner.py\n@@\n- heuristic = 1\n+ heuristic = 2",
-                "status": "pending",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ]
-
     return {"status": "ok", "proposals": proposals, "count": len(proposals)}
 
 
@@ -4755,6 +5691,8 @@ async def decide_self_improvement_proposal(req: SelfImprovementDecisionRequest):
     if decision not in {"approve", "reject"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="decision must be approve or reject")
 
+    next_status = "approved" if decision == "approve" else "rejected"
+
     updated = False
     try:
         database._ensure_connected()
@@ -4763,7 +5701,7 @@ async def decide_self_improvement_proposal(req: SelfImprovementDecisionRequest):
                 {"proposal_id": req.proposal_id},
                 {
                     "$set": {
-                        "status": decision,
+                        "status": next_status,
                         "reviewed_at": datetime.now(timezone.utc),
                         "reviewed_by": str((principal or {}).get("username") or "admin"),
                     }
@@ -4778,6 +5716,7 @@ async def decide_self_improvement_proposal(req: SelfImprovementDecisionRequest):
         "status": "ok",
         "message": f"Proposal {decision}",
         "proposal_id": req.proposal_id,
+        "proposal_status": next_status,
         "updated": updated,
     }
 
@@ -4827,7 +5766,20 @@ class FileCopyRequest(BaseModel):
 async def read_file_endpoint(req: FileRequest):
     """Read file content"""
     if CLOUD_MODE:
-        _cloud_feature_disabled("File operations")
+        delegated = await _delegate_or_queue_cloud_action(
+            session_id=req.session_id,
+            feature="File operations",
+            actions=[{"type": "read", "path": req.path}],
+            source_text=f"file_read:{req.path}",
+            require_admin=True,
+            await_timeout_s=8.0,
+        )
+        if delegated.get("status") == "completed":
+            first = _delegated_first_result(delegated) or {}
+            if isinstance(first, dict):
+                first["execution"] = delegated
+                return first
+        return {"status": delegated.get("status") or "delegated", "mode": "cloud", "execution": delegated}
     _require_admin_session(req.session_id)
     try:
         result = file_ops.read_file(req.path)
@@ -4839,7 +5791,20 @@ async def read_file_endpoint(req: FileRequest):
 async def write_file_endpoint(req: FileWriteRequest):
     """Write content to file"""
     if CLOUD_MODE:
-        _cloud_feature_disabled("File operations")
+        delegated = await _delegate_or_queue_cloud_action(
+            session_id=req.session_id,
+            feature="File operations",
+            actions=[{"type": "write", "path": req.path, "content": req.content}],
+            source_text=f"file_write:{req.path}",
+            require_admin=True,
+            await_timeout_s=10.0,
+        )
+        if delegated.get("status") == "completed":
+            first = _delegated_first_result(delegated) or {}
+            if isinstance(first, dict):
+                first["execution"] = delegated
+                return first
+        return {"status": delegated.get("status") or "delegated", "mode": "cloud", "execution": delegated}
     _require_admin_session(req.session_id)
     try:
         result = file_ops.write_file(req.path, req.content)
@@ -4851,7 +5816,20 @@ async def write_file_endpoint(req: FileWriteRequest):
 async def list_files_endpoint(req: FileRequest):
     """List files in directory"""
     if CLOUD_MODE:
-        _cloud_feature_disabled("File operations")
+        delegated = await _delegate_or_queue_cloud_action(
+            session_id=req.session_id,
+            feature="File operations",
+            actions=[{"type": "list", "path": req.path}],
+            source_text=f"file_list:{req.path}",
+            require_admin=True,
+            await_timeout_s=8.0,
+        )
+        if delegated.get("status") == "completed":
+            first = _delegated_first_result(delegated) or {}
+            if isinstance(first, dict):
+                first["execution"] = delegated
+                return first
+        return {"status": delegated.get("status") or "delegated", "mode": "cloud", "execution": delegated}
     _require_admin_session(req.session_id)
     try:
         result = file_ops.list_files(req.path)
@@ -4863,7 +5841,20 @@ async def list_files_endpoint(req: FileRequest):
 async def delete_file_endpoint(req: FileRequest):
     """Delete a file"""
     if CLOUD_MODE:
-        _cloud_feature_disabled("File operations")
+        delegated = await _delegate_or_queue_cloud_action(
+            session_id=req.session_id,
+            feature="File operations",
+            actions=[{"type": "delete", "path": req.path}],
+            source_text=f"file_delete:{req.path}",
+            require_admin=True,
+            await_timeout_s=8.0,
+        )
+        if delegated.get("status") == "completed":
+            first = _delegated_first_result(delegated) or {}
+            if isinstance(first, dict):
+                first["execution"] = delegated
+                return first
+        return {"status": delegated.get("status") or "delegated", "mode": "cloud", "execution": delegated}
     _require_admin_session(req.session_id)
     try:
         result = file_ops.delete_file(req.path)
@@ -4875,7 +5866,20 @@ async def delete_file_endpoint(req: FileRequest):
 async def create_directory_endpoint(req: FileRequest):
     """Create a directory"""
     if CLOUD_MODE:
-        _cloud_feature_disabled("File operations")
+        delegated = await _delegate_or_queue_cloud_action(
+            session_id=req.session_id,
+            feature="File operations",
+            actions=[{"type": "mkdir", "path": req.path}],
+            source_text=f"file_mkdir:{req.path}",
+            require_admin=True,
+            await_timeout_s=8.0,
+        )
+        if delegated.get("status") == "completed":
+            first = _delegated_first_result(delegated) or {}
+            if isinstance(first, dict):
+                first["execution"] = delegated
+                return first
+        return {"status": delegated.get("status") or "delegated", "mode": "cloud", "execution": delegated}
     _require_admin_session(req.session_id)
     try:
         result = file_ops.create_directory(req.path)
@@ -4887,7 +5891,20 @@ async def create_directory_endpoint(req: FileRequest):
 async def copy_file_endpoint(req: FileCopyRequest):
     """Copy a file"""
     if CLOUD_MODE:
-        _cloud_feature_disabled("File operations")
+        delegated = await _delegate_or_queue_cloud_action(
+            session_id=req.session_id,
+            feature="File operations",
+            actions=[{"type": "copy", "source": req.source, "destination": req.destination}],
+            source_text=f"file_copy:{req.source}",
+            require_admin=True,
+            await_timeout_s=10.0,
+        )
+        if delegated.get("status") == "completed":
+            first = _delegated_first_result(delegated) or {}
+            if isinstance(first, dict):
+                first["execution"] = delegated
+                return first
+        return {"status": delegated.get("status") or "delegated", "mode": "cloud", "execution": delegated}
     _require_admin_session(req.session_id)
     try:
         result = file_ops.copy_file(req.source, req.destination)
@@ -4899,7 +5916,21 @@ async def copy_file_endpoint(req: FileCopyRequest):
 async def cleanup_project_endpoint(req: dict | None = None):
     """Clean up project cache files"""
     if CLOUD_MODE:
-        _cloud_feature_disabled("File operations")
+        sid = (req or {}).get("session_id") if isinstance(req, dict) else None
+        delegated = await _delegate_or_queue_cloud_action(
+            session_id=sid,
+            feature="File operations",
+            actions=[{"type": "cleanup"}],
+            source_text="file_cleanup",
+            require_admin=True,
+            await_timeout_s=12.0,
+        )
+        if delegated.get("status") == "completed":
+            first = _delegated_first_result(delegated) or {}
+            if isinstance(first, dict):
+                first["execution"] = delegated
+                return first
+        return {"status": delegated.get("status") or "delegated", "mode": "cloud", "execution": delegated}
     _require_admin_session((req or {}).get("session_id"))
     try:
         result = file_ops.cleanup_project()
@@ -4926,6 +5957,8 @@ app.include_router(build_internet_router(_require_voice_session))
 app.include_router(build_system_control_router(
     cloud_mode=bool(CLOUD_MODE),
     cloud_feature_disabled=_cloud_feature_disabled,
+    cloud_safe_system_info=_build_cloud_safe_system_info,
+    cloud_delegate_or_queue=_delegate_or_queue_cloud_action,
     require_admin_session=_require_admin_session,
     require_authenticated_session=_require_authenticated_session,
     screen_access=screen_access,

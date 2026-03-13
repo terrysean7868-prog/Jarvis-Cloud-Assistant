@@ -77,12 +77,13 @@ export async function sendMessage(text, mode = "chat", sessionId = null, timeout
     console.error("sendMessage error:", err);
     const isTimeout = err && err.name === "AbortError";
     const message = isTimeout
-      ? "Request timed out. Please try again."
-      : (err?.message || "Request failed. Please try again.");
+      ? "Assistant request timed out while waiting for the backend response. Retrying may resume pending delegated work."
+      : (err?.message || "Assistant request failed due to a transport or backend error.");
 
     // Return a consistent structure so callers can always render something.
     return {
-      status: "error",
+      status: "failed",
+      mode: "client_fallback",
       message,
       text: message,
       actions: [],
@@ -478,6 +479,22 @@ export async function updateAutonomyGoalGraph(goalId, payload = {}, timeoutMs = 
   return await res.json();
 }
 
+export async function cancelAutonomyGoal(goalId, sessionId = null, reason = "user_requested", timeoutMs = DEFAULT_TIMEOUT) {
+  const gid = String(goalId || "").trim();
+  if (!gid) throw new Error("goalId is required");
+
+  const res = await timeoutFetch(`${API_URL}/api/autonomy/goals/${encodeURIComponent(gid)}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId || null, reason: String(reason || "user_requested") }),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
 export async function controlAutonomyRuntime(action, sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
   const res = await timeoutFetch(`${API_URL}/api/autonomy/control`, {
     method: "POST",
@@ -528,6 +545,23 @@ export async function getDeviceList(sessionId = null, timeoutMs = DEFAULT_TIMEOU
   const url = `${API_URL}/api/device/list${qs.toString() ? `?${qs.toString()}` : ""}`;
 
   const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getDelegatedTasks(sessionId, { limit = 120, statuses = null, timeoutMs = DEFAULT_TIMEOUT } = {}) {
+  const qs = new URLSearchParams();
+  qs.set("session_id", String(sessionId || ""));
+  qs.set("limit", String(limit || 120));
+  if (statuses) qs.set("statuses", String(statuses));
+
+  const res = await timeoutFetch(`${API_URL}/api/delegated/tasks?${qs.toString()}`, {
     method: "GET",
     headers: { "Content-Type": "application/json" },
   }, timeoutMs);
@@ -671,6 +705,57 @@ export async function rollbackAdminUpdate({ sessionId, filePath, backupPath = nu
   if (backupPath) body.backup_path = backupPath;
 
   const res = await timeoutFetch(`${API_URL}/api/admin/updates/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getAdminRequirementsAudit(sessionId, limit = 120, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  qs.set("session_id", String(sessionId || ""));
+  qs.set("limit", String(limit || 120));
+
+  const res = await timeoutFetch(`${API_URL}/api/admin/requirements/audit?${qs.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function logRequirementEvent({
+  sessionId,
+  requestedAction,
+  requirementType,
+  target,
+  permissionOrScope = null,
+  status = "pending",
+  deviceId = null,
+  source = "frontend",
+  details = null,
+}, timeoutMs = DEFAULT_TIMEOUT) {
+  const body = {
+    session_id: sessionId,
+    requested_action: String(requestedAction || "").trim(),
+    requirement_type: String(requirementType || "unknown").trim(),
+    target: String(target || "unknown").trim(),
+    status: String(status || "pending").trim().toLowerCase(),
+    source: String(source || "frontend").trim(),
+  };
+  if (permissionOrScope) body.permission_or_scope = String(permissionOrScope);
+  if (deviceId) body.device_id = String(deviceId);
+  if (details && typeof details === "object") body.details = details;
+
+  const res = await timeoutFetch(`${API_URL}/api/requirements/audit/log`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

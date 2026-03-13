@@ -4,6 +4,7 @@ import "reactflow/dist/style.css";
 import { Line } from "react-chartjs-2";
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend } from "chart.js";
 import {
+  cancelAutonomyGoal,
   controlAutonomyRuntime,
   createAutonomyGoal,
   getAutonomyGoals,
@@ -87,7 +88,7 @@ export default function AutonomyDashboard({ sessionId, logs = [], onTabChange = 
   const refresh = useCallback(async () => {
     try {
       const [gRes, sRes] = await Promise.allSettled([
-        getAutonomyGoals({ sessionId, statuses: "pending,running,awaiting_confirmation,failed,completed", limit: 80 }),
+        getAutonomyGoals({ sessionId, statuses: "pending,running,awaiting_confirmation,failed,completed,cancelled", limit: 80 }),
         getAutonomyStatus(sessionId),
       ]);
 
@@ -194,8 +195,19 @@ export default function AutonomyDashboard({ sessionId, logs = [], onTabChange = 
     }
   };
 
-  const cancelGoal = () => {
-    setError("Cancel endpoint is not available yet in this build; use task cancellation controls.");
+  const cancelGoal = async () => {
+    const gid = String(selectedGoalId || selectedGoal?._id || "").trim();
+    if (!gid) {
+      setError("Select a goal to cancel.");
+      return;
+    }
+    try {
+      await cancelAutonomyGoal(gid, sessionId, "user_requested");
+      await refresh();
+      setError("");
+    } catch (e) {
+      setError(e?.message || String(e));
+    }
   };
 
   const runtimeControl = async (action) => {

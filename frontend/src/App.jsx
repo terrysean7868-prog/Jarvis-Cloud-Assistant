@@ -22,6 +22,7 @@ import {
   getNotificationsWsUrl,
   stopTask,
   getAdminUpdateHistory,
+  logRequirementEvent,
 } from "./utils/api";
 import "./styles/jarvis.css";
 import AuthModal from "./components/AuthModal";
@@ -112,6 +113,7 @@ export default function App() {
   // Light state only — avoid large objects in state
   const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [wakeListeningOnline, setWakeListeningOnline] = useState(false);
   const [wakePulse, setWakePulse] = useState(false);
   const [logs, setLogs] = useState(() => {
     try {
@@ -149,6 +151,7 @@ export default function App() {
   const [, setPermissions] = useState(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [permissionPrompt, setPermissionPrompt] = useState(null);
+  const [pendingResume, setPendingResume] = useState(null);
   const [showUpdateConsole, setShowUpdateConsole] = useState(false);
   const [autonomyTab, setAutonomyTab] = useState("Autonomy");
   const [activeDisplay, setActiveDisplay] = useState(() => {
@@ -171,6 +174,7 @@ export default function App() {
   const lastWakeNoSpeechLogRef = useRef(0);
   const wakeDisabledUntilRef = useRef(0);
   const wakePermissionHintedRef = useRef(false);
+  const lastWakeDetectedAtRef = useRef(0);
   const [voiceUnlocked, setVoiceUnlocked] = useState(() => !isMobile);
   const [vizAudioUnlocked, setVizAudioUnlocked] = useState(false);
 
@@ -243,6 +247,70 @@ export default function App() {
       ...prev.slice(0, 24),
     ]);
   }, []);
+
+  const auditRequirementEvent = useCallback(async (event) => {
+    try {
+      if (!sessionId) return;
+      await logRequirementEvent({ sessionId, ...(event || {}) }, 4000);
+    } catch {
+      // best effort only
+    }
+  }, [sessionId]);
+
+  const buildRequirementDetails = useCallback((req) => {
+    const requirement = req && typeof req === "object" ? req : {};
+    const lines = [];
+    lines.push(`Requirement Type: ${String(requirement.requirement_type || "missing_requirement").replace(/_/g, " ")}`);
+    lines.push(`Target: ${String(requirement.target_application || requirement.target || "system")}`);
+    lines.push(`Why: ${String(requirement.why || "This is required to continue the requested action.")}`);
+    const requiredBy = String(requirement.required_by || "user").trim().toLowerCase();
+    lines.push(`Who should act: ${requiredBy === "admin" ? "Administrator" : "Current user"}`);
+    const guidance = Array.isArray(requirement.guidance) ? requirement.guidance : [];
+    if (guidance.length) {
+      lines.push("How to resolve:");
+      guidance.forEach((step, idx) => lines.push(`${idx + 1}. ${String(step)}`));
+    }
+    lines.push("Resume Behavior: Once resolved, I will resume the original task automatically.");
+    return lines.join("\n");
+  }, []);
+
+  const promptForRequirement = useCallback((opts) => {
+    const requirement = opts?.requirement || {};
+    const requirementType = String(requirement.requirement_type || opts?.requirementType || "missing_requirement");
+    const target = String(requirement.target || opts?.target || "System");
+    const permissionOrScope = String(requirement.permission_or_scope || opts?.permissionOrScope || "").trim() || null;
+    const title = opts?.title || `Requirement required: ${requirementType.replace(/_/g, " ")}`;
+    const message = opts?.message || String(opts?.rawMessage || "Additional permission or information is required to continue.");
+    const details = buildRequirementDetails({ ...requirement, requirement_type: requirementType, target, permission_or_scope: permissionOrScope });
+    const prompt = {
+      title,
+      message,
+      details,
+      requirementType,
+      target,
+      permissionOrScope,
+      requiredBy: String(requirement.required_by || "user").trim().toLowerCase(),
+      pendingActions: Array.isArray(opts?.pendingActions) ? opts.pendingActions : [],
+      sourceText: String(opts?.sourceText || ""),
+      neededPermissions: opts?.neededPermissions || null,
+      actionMode: String(opts?.actionMode || "ack"),
+      allowLabel: opts?.allowLabel || (opts?.actionMode === "grant_permission" ? "Grant and Continue" : "I Fixed It"),
+      denyLabel: opts?.denyLabel || "Not Now",
+    };
+    setPermissionPrompt(prompt);
+
+    auditRequirementEvent({
+      requestedAction: String(opts?.requestedAction || "unknown"),
+      requirementType,
+      target,
+      permissionOrScope,
+      status: "pending",
+      details: {
+        message,
+        action_mode: prompt.actionMode,
+      },
+    });
+  }, [auditRequirementEvent, buildRequirementDetails]);
 
   const buildDeviceCompletionSpeech = useCallback((results, sourceText) => {
     const rows = Array.isArray(results) ? results : [];
@@ -549,6 +617,62 @@ export default function App() {
             const details = sourceText ? `Source: ${sourceText}` : "";
             addLog("system", [header, summary, details].filter(Boolean).join("\n"));
 
+            // If actions failed because of permissions/access, prompt user with concrete guidance.
+            try {
+              const failed = results.filter((r) => {
+                const st = String(r?.status || "").toLowerCase();
+                return st === "forbidden" || st === "error";
+              });
+              if (failed.length) {
+                const first = failed[0] || {};
+                const actionType = String(first?.action_type || first?.action || "device_action").toLowerCase();
+                const msg = String(first?.message || first?.error || "Permission or access requirement not satisfied.");
+                const lower = msg.toLowerCase();
+
+                if (/screen|record|capture|accessibility|automation/.test(lower) || /capture_screen|screen_navigation/.test(actionType)) {
+                  promptForRequirement({
+                    requestedAction: sourceText || actionType,
+                    requirementType: /accessibility|automation/.test(lower)
+                      ? "third_party_app_permission"
+                      : "operating_system_permission",
+                    target: /accessibility|automation/.test(lower)
+                      ? "Desktop Automation / Accessibility Access"
+                      : "OS Screen Recording Permission",
+                    message: msg,
+                    requirement: {
+                      requirement_type: /accessibility|automation/.test(lower)
+                        ? "third_party_app_permission"
+                        : "operating_system_permission",
+                      target: /accessibility|automation/.test(lower)
+                        ? "Desktop Automation / Accessibility Access"
+                        : "OS Screen Recording Permission",
+                      target_application: /accessibility|automation/.test(lower)
+                        ? "Jarvis PC Agent / target application"
+                        : "Operating System Privacy Settings",
+                      required_by: "user",
+                      why: "This action needs OS/app-level permission that is currently blocked.",
+                      guidance: /accessibility|automation/.test(lower)
+                        ? [
+                            "Open OS accessibility/automation permissions.",
+                            "Allow Jarvis PC Agent (and target app if required).",
+                            "Restart the app/agent and return here.",
+                          ]
+                        : [
+                            "Open OS Privacy/Security settings.",
+                            "Allow screen recording/screen capture for Jarvis desktop app or PC Agent.",
+                            "Restart app/agent if required.",
+                          ],
+                      resume_automatically: true,
+                    },
+                    actionMode: "retry_source_text",
+                    allowLabel: "I Enabled It",
+                    pendingActions: [],
+                    sourceText: sourceText || actionType,
+                  });
+                }
+              }
+            } catch {}
+
             // Voice UX: confirm completion when all actions succeeded.
             try {
               const allGood = ok > 0 && err === 0 && forbidden === 0;
@@ -607,6 +731,7 @@ export default function App() {
     buildResearchCompletionSpeech,
     buildWorkflowCompletionSpeech,
     speakNotificationCompletion,
+    promptForRequirement,
   ]);
 
   useEffect(() => {
@@ -884,8 +1009,8 @@ export default function App() {
           await tryDeviceStatus();
         }
       } catch {
-        // Local-only endpoint; ignore errors (cloud mode / permissions).
-        // Keep the last known values to avoid UI "blanking".
+        // Preserve last known values and try device fallback.
+        // Cloud mode may return delegated/queued lifecycle states while waiting for PC-agent results.
         await tryDeviceStatus();
       }
     };
@@ -1571,7 +1696,38 @@ export default function App() {
 
     // send to backend
     try {
+      setEmotion("analyzing");
       const res = await sendMessage(transcript, "voice", sessionId);
+
+      const resultText = String(res?.text || res?.message || "");
+      if (String(res?.status || "").toLowerCase() === "error") {
+        const lowerErr = resultText.toLowerCase();
+        if (/(api[_\s-]?key|oauth|token|scope|webhook|integration|not configured|missing configuration)/i.test(lowerErr)) {
+          promptForRequirement({
+            requestedAction: transcript,
+            requirementType: "service_account_permission",
+            target: "Service Integration Configuration",
+            title: "Requirement required: Service integration access",
+            message: resultText || "A required service credential or integration scope is missing.",
+            requirement: {
+              requirement_type: "service_account_permission",
+              target: "Service Integration Configuration",
+              target_application: "Jarvis Integrations / Environment Configuration",
+              required_by: "admin",
+              why: "This task requires credentials, OAuth consent, or integration scopes that are not currently configured.",
+              guidance: [
+                "Open Management Console -> Integrations or Server Configuration.",
+                "Connect the required account or set the required API key/token.",
+                "Grant required scopes for the target service.",
+                "Retry and Jarvis will continue automatically.",
+              ],
+              resume_automatically: true,
+            },
+            actionMode: "retry_source_text",
+            sourceText: transcript,
+          });
+        }
+      }
       addStructuredLog("response", res.text || "No text returned.", "text", null);
 
       try {
@@ -1636,9 +1792,40 @@ export default function App() {
 
       // run any actions returned
       if (Array.isArray(res.actions) && res.actions.length) {
+        const openUrlInUi = (targetUrl) => {
+          const w = window.open(targetUrl, "_blank", "noopener,noreferrer");
+          if (!w) {
+            addLog("system", `Popup blocked. Open this link: ${targetUrl}`);
+            promptForRequirement({
+              requestedAction: "open_url",
+              requirementType: "browser_site_permission",
+              target: "Browser Popup Permission",
+              title: "Permission required: Browser popup access",
+              message: "Your browser blocked opening a new tab for this action.",
+              requirement: {
+                requirement_type: "browser_site_permission",
+                target: "Browser Popup Permission",
+                target_application: "Current browser site settings",
+                required_by: "user",
+                why: "Jarvis needs popup permission for this site to open requested links.",
+                guidance: [
+                  "Open browser site settings for this page.",
+                  "Allow popups and redirects for this site.",
+                  "Try the action again.",
+                ],
+                resume_automatically: false,
+              },
+            });
+            try {
+              if (navigator.clipboard?.writeText) navigator.clipboard.writeText(targetUrl);
+            } catch {}
+          }
+        };
+
         const DEVICE_ACTION_TYPES = new Set([
           "device_action",
           "open_app", "close_app", "switch_app",
+          "open_url",
           "execute_command",
           "set_brightness", "adjust_brightness",
           "set_power_plan", "set_energy_saver",
@@ -1664,9 +1851,47 @@ export default function App() {
           } else {
             try {
               const dispatchRes = await dispatchDeviceActions(deviceActions, sessionId, transcript);
-              addLog("system", `PC actions queued (${deviceActions.length}).`);
-              if (dispatchRes?.status === "queued") {
-                // ok
+              const flowStatus = String(dispatchRes?.status || "").toLowerCase();
+              if (flowStatus === "delegated") {
+                addLog("system", `PC actions delegated (${deviceActions.length}).`);
+              } else if (flowStatus === "queued_for_agent") {
+                addLog("system", "PC agent offline. Task queued and will auto-resume on reconnect.");
+                setPendingResume({
+                  type: "device_connection",
+                  createdAt: Date.now(),
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                });
+              } else if (flowStatus === "awaiting_agent") {
+                addLog("system", "No device assigned yet. Action is waiting for device setup.");
+                promptForRequirement({
+                  requestedAction: "device_action",
+                  requirementType: "missing_user_information",
+                  target: "Device Selection",
+                  message: dispatchRes?.message || "Assign a device to continue.",
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                  actionMode: "configure_device",
+                  allowLabel: "Configure and Continue",
+                });
+              } else if (flowStatus === "pending_permission") {
+                addLog("system", dispatchRes?.message || "Permission is required before this action can execute.");
+                const cap = String(dispatchRes?.required_capability || "").trim();
+                const needed = cap ? { [cap]: true } : null;
+                promptForRequirement({
+                  requestedAction: String(dispatchRes?.action_type || "device_action"),
+                  requirementType: "assistant_permission",
+                  target: "PC Agent Runtime Permission",
+                  message: dispatchRes?.message || "Permission is required before this action can execute.",
+                  neededPermissions: needed,
+                  permissionOrScope: cap || null,
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                  actionMode: cap ? "grant_permission" : "ack",
+                  allowLabel: cap ? "Grant and Continue" : "I Fixed It",
+                });
+              } else {
+                addLog("system", `PC action status: ${flowStatus || "unknown"}`);
               }
             } catch (e) {
               const raw = e?.message || String(e);
@@ -1688,28 +1913,135 @@ export default function App() {
               const detail = structuredDetail ?? parsed?.detail;
               const permDetail = (detail && typeof detail === "object") ? detail : null;
               const permMsg = (typeof detail === "string") ? detail : (permDetail?.message || null);
+              const reqInfo = (permDetail && typeof permDetail.requirement === "object") ? permDetail.requirement : null;
 
               if (permDetail?.required_capability) {
                 const needed = { [permDetail.required_capability]: true };
-                setPermissionPrompt({
-                  title: "Permission required",
+                promptForRequirement({
+                  requestedAction: permDetail?.action_type || "device_action",
+                  requirementType: "assistant_permission",
+                  target: "PC Agent Runtime Permission",
                   message: permDetail.message || "This action needs permission on your PC agent.",
-                  details: permDetail.env_var ? `Allow it now? (This updates the running PC agent.)\nRequired: ${permDetail.env_var}` : "Allow it now? (This updates the running PC agent.)",
-                  neededPermissions: needed,
+                  requirement: reqInfo || {
+                    requirement_type: "assistant_permission",
+                    target: "PC Agent Runtime Permission",
+                    target_application: "Jarvis Management Console / PC Agent",
+                    permission_or_scope: permDetail.required_capability,
+                    required_by: "user",
+                    why: "The requested device action is blocked by current PC agent permission policy.",
+                    guidance: [
+                      "Open Management Console -> Device Permissions.",
+                      `Enable '${permDetail.required_capability}'.`,
+                      "Save and apply.",
+                    ],
+                    resume_automatically: true,
+                  },
+                  permissionOrScope: permDetail.required_capability,
                   pendingActions: deviceActions,
                   sourceText: transcript,
+                  neededPermissions: needed,
+                  actionMode: "grant_permission",
+                  allowLabel: "Grant and Continue",
                 });
                 try {
                   speak("Permission required. Please approve the popup.");
                 } catch {}
               } else if (permDetail?.message === "Device agent is not connected" || /device agent is not connected/i.test(String(permMsg || raw))) {
                 addLog("system", "PC agent is not connected. Start JarvisPCAgent.exe (or python pc_agent.py) and login again (then click Yes).");
+                setPendingResume({
+                  type: "device_connection",
+                  createdAt: Date.now(),
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                });
+                promptForRequirement({
+                  requestedAction: "device_action",
+                  requirementType: "third_party_app_permission",
+                  target: "PC Agent",
+                  message: permMsg || "The PC agent is currently offline.",
+                  requirement: reqInfo || {
+                    requirement_type: "third_party_app_permission",
+                    target: "PC Agent",
+                    target_application: "JarvisPCAgent",
+                    required_by: "user",
+                    why: "The PC agent must be connected before device actions can run.",
+                    guidance: [
+                      "Start JarvisPCAgent on your PC.",
+                      "Confirm it is connected to your server.",
+                      "Keep it running; Jarvis will auto-resume this task.",
+                    ],
+                    resume_automatically: true,
+                  },
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                  actionMode: "wait_for_connection",
+                  allowLabel: "I Started The Agent",
+                });
                 try { speak("PC agent is not connected. Start it and login again."); } catch {}
+
+                // Fallback: if the only action is open_url, attempt UI open.
+                if (deviceActions.every(a => (a || {}).type === "open_url")) {
+                  deviceActions.forEach((a) => {
+                    const targetUrl = a?.value || a?.url;
+                    if (targetUrl) openUrlInUi(targetUrl);
+                  });
+                }
               } else if (/no device assigned to this user/i.test(String(permMsg || raw))) {
                 addLog("system", "PC is not configured. Login again and click Yes when asked about PC agent.");
+                promptForRequirement({
+                  requestedAction: "device_action",
+                  requirementType: "missing_user_information",
+                  target: "Device Selection",
+                  message: permMsg || "A target device has not been assigned yet.",
+                  requirement: reqInfo || {
+                    requirement_type: "missing_user_information",
+                    target: "Device Selection",
+                    target_application: "Jarvis Management Console",
+                    required_by: "user",
+                    why: "Jarvis needs a selected device before it can run PC actions.",
+                    guidance: [
+                      "Open Management Console -> Device Setup.",
+                      "Click Configure My PC.",
+                      "Approve the selected device.",
+                    ],
+                    resume_automatically: true,
+                  },
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                  actionMode: "configure_device",
+                  allowLabel: "Configure and Continue",
+                });
+
+                if (deviceActions.every(a => (a || {}).type === "open_url")) {
+                  deviceActions.forEach((a) => {
+                    const targetUrl = a?.value || a?.url;
+                    if (targetUrl) openUrlInUi(targetUrl);
+                  });
+                }
               } else {
                 addLog("system", `PC action dispatch failed: ${permMsg || raw}`);
                 addLog("system", "Make sure pc_agent.py is running on your PC and connected.");
+                promptForRequirement({
+                  requestedAction: "device_action",
+                  requirementType: "missing_requirement",
+                  target: "PC Agent / Integration",
+                  message: permMsg || raw,
+                  requirement: {
+                    requirement_type: "missing_requirement",
+                    target: "PC Agent / Integration",
+                    target_application: "Jarvis + external integrations",
+                    required_by: "user",
+                    why: "One or more requirements for this action are still missing.",
+                    guidance: [
+                      "Check Device Status and Permissions in the Management Console.",
+                      "Verify the external app/service is logged in and authorized.",
+                      "Retry the task after fixing the requirement.",
+                    ],
+                    resume_automatically: true,
+                  },
+                  pendingActions: deviceActions,
+                  sourceText: transcript,
+                });
               }
             }
           }
@@ -1721,13 +2053,7 @@ export default function App() {
           if (a.type === "open_url" && (a.value || a.url)) {
             const targetUrl = a.value || a.url;
             // Always prefer a new tab. Never navigate away from the assistant UI.
-            const w = window.open(targetUrl, "_blank", "noopener,noreferrer");
-            if (!w) {
-              addLog("system", `Popup blocked. Open this link: ${targetUrl}`);
-              try {
-                if (navigator.clipboard?.writeText) navigator.clipboard.writeText(targetUrl);
-              } catch {}
-            }
+            openUrlInUi(targetUrl);
           }
         }
       }
@@ -1740,7 +2066,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, isWakePhrase]);
+  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, isWakePhrase, promptForRequirement]);
 
   const startHoldToTalk = useCallback(async () => {
     if (!isAuthenticated) {
@@ -1981,6 +2307,7 @@ export default function App() {
 
     recognizer.onstart = () => {
       active = true;
+      try { setWakeListeningOnline(true); } catch {}
       lastEventAt = Date.now();
     };
 
@@ -2000,6 +2327,12 @@ export default function App() {
         const wakeHit = isWakePhrase(rawTranscript, nm);
 
         if (wakeHit) {
+          const now = Date.now();
+          if (now - Number(lastWakeDetectedAtRef.current || 0) < 1200) {
+            return;
+          }
+          lastWakeDetectedAtRef.current = now;
+
           // In biometrics mode, defer wake-session start and UI pulse until
           // we successfully capture a verified command.
           if (!voiceBiometricsActive) {
@@ -2043,17 +2376,60 @@ export default function App() {
       // Avoid an infinite restart loop that spams logs in packaged desktop builds.
       const fatal = new Set(["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"]);
       if (fatal.has(errName)) {
+        try { setWakeListeningOnline(false); } catch {}
         if (!wakePermissionHintedRef.current) {
           wakePermissionHintedRef.current = true;
           if (errName === "language-not-supported") {
             addLog("system", `Wake listener disabled: language not supported (${voiceLang || "en-US"}).`);
           } else if (errName === "audio-capture") {
             addLog("system", "Wake listener disabled: microphone not available.");
+            promptForRequirement({
+              requestedAction: "voice_input",
+              requirementType: "operating_system_permission",
+              target: "Microphone Access",
+              title: "Permission required: Microphone access",
+              message: "Your system currently does not expose a microphone input to the app.",
+              requirement: {
+                requirement_type: "operating_system_permission",
+                target: "Microphone Access",
+                target_application: "Operating System Privacy Settings",
+                required_by: "user",
+                why: "Voice commands require OS-level microphone access.",
+                guidance: [
+                  "Open OS Privacy/Security settings.",
+                  "Enable microphone access for this app/browser.",
+                  "Restart the app if required.",
+                ],
+                resume_automatically: true,
+              },
+              actionMode: "retry_voice",
+            });
           } else {
             addLog(
               "system",
               "Wake listener disabled: microphone permission denied. Enable microphone access for this app/browser, then reload Jarvis."
             );
+            promptForRequirement({
+              requestedAction: "voice_input",
+              requirementType: "browser_site_permission",
+              target: "Browser Microphone Permission",
+              title: "Permission required: Browser microphone access",
+              message: "Microphone permission is blocked for this site.",
+              requirement: {
+                requirement_type: "browser_site_permission",
+                target: "Browser Microphone Permission",
+                target_application: "Current browser site settings",
+                required_by: "user",
+                why: "Voice listening cannot start unless the browser allows microphone access for this site.",
+                guidance: [
+                  "Click the lock icon in the address bar.",
+                  "Set Microphone for this site to Allow.",
+                  "Refresh the page if needed.",
+                ],
+                resume_automatically: true,
+              },
+              actionMode: "retry_voice",
+            });
           }
         }
         wakeDisabledUntilRef.current = Date.now() + 10 * 60 * 1000;
@@ -2073,12 +2449,14 @@ export default function App() {
         }
       }
       active = false;
+      try { setWakeListeningOnline(false); } catch {}
       // restart with backoff
       if (isAuthenticated) scheduleStart(errName === "aborted" ? 700 : 1500);
     };
 
     recognizer.onend = () => {
       active = false;
+      try { setWakeListeningOnline(false); } catch {}
       lastEventAt = Date.now();
       if (!isHandlingCommand.current && isAuthenticated) scheduleStart(700);
     };
@@ -2128,6 +2506,7 @@ export default function App() {
         if (watchdogTimer) clearInterval(watchdogTimer);
       } catch {}
       try {
+        setWakeListeningOnline(false);
         recognizer.onresult = null;
         recognizer.onerror = null;
         recognizer.onstart = null;
@@ -2139,7 +2518,52 @@ export default function App() {
         if (wakeSessionTimerRef.current) clearTimeout(wakeSessionTimerRef.current);
       } catch {}
     };
-  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive, isWakePhrase]);
+  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive, isWakePhrase, promptForRequirement]);
+
+  useEffect(() => {
+    if (!pendingResume || !isAuthenticated || !sessionId) return;
+    if (String(pendingResume?.type || "") !== "device_connection") return;
+
+    let cancelled = false;
+    const startedAt = Number(pendingResume?.createdAt || Date.now());
+
+    const tryResume = async () => {
+      if (cancelled) return;
+      if ((Date.now() - startedAt) > (10 * 60 * 1000)) {
+        addLog("system", "Pending task resume timed out. You can retry the original command.");
+        setPendingResume(null);
+        return;
+      }
+      try {
+        const status = await getDeviceStatus(sessionId, 2500);
+        const agents = Array.isArray(status?.agents) ? status.agents : [];
+        if (!agents.length) return;
+
+        await dispatchDeviceActions(pendingResume.pendingActions || [], sessionId, pendingResume.sourceText || "auto_resume_after_requirement");
+        addLog("system", "Requirement satisfied. Resumed and queued your original action.");
+        try { speak("Requirement resolved. Continuing your task now."); } catch {}
+        auditRequirementEvent({
+          requestedAction: "device_action",
+          requirementType: "third_party_app_permission",
+          target: "PC Agent",
+          permissionOrScope: "agent_connection",
+          status: "granted",
+          details: { resumed: true },
+        });
+        setPendingResume(null);
+        setPermissionPrompt(null);
+      } catch {
+        // Keep polling silently.
+      }
+    };
+
+    tryResume();
+    const id = setInterval(tryResume, 5000);
+    return () => {
+      cancelled = true;
+      try { clearInterval(id); } catch {}
+    };
+  }, [pendingResume, isAuthenticated, sessionId, addLog, auditRequirementEvent]);
 
   // Authentication helpers (unchanged, stable)
   const handleAuthSuccess = useCallback((newSessionId, newUsername, newRole, newPermissions) => {
@@ -2314,6 +2738,18 @@ export default function App() {
             allowLabel={permissionPrompt.allowLabel || "Allow"}
             denyLabel={permissionPrompt.denyLabel || "Deny"}
             onDeny={() => {
+              const req = permissionPrompt;
+              if (req) {
+                auditRequirementEvent({
+                  requestedAction: String(req?.sourceText || "device_action"),
+                  requirementType: String(req?.requirementType || "missing_requirement"),
+                  target: String(req?.target || "system"),
+                  permissionOrScope: req?.permissionOrScope || null,
+                  status: "denied",
+                  details: { action_mode: req?.actionMode || "ack" },
+                });
+                addLog("system", "Requirement not granted yet. I can still help with alternatives that do not need this permission.");
+              }
               setPermissionPrompt(null);
             }}
             onAllow={async () => {
@@ -2321,14 +2757,58 @@ export default function App() {
               try {
                 // For all other permission prompts, close the modal immediately before proceeding.
                 setPermissionPrompt(null);
-                const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
-                if (grantRes?.offline) {
-                  addLog("system", "Permission saved. Start JarvisPCAgent.exe (or python pc_agent.py) and login again (then click Yes).");
-                  return;
+                if (req?.actionMode === "grant_permission" && req?.neededPermissions) {
+                  const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
+                  if (grantRes?.offline) {
+                    addLog("system", "Permission saved. Start JarvisPCAgent.exe (or python pc_agent.py) and keep it connected. I will resume when available.");
+                    setPendingResume({
+                      type: "device_connection",
+                      createdAt: Date.now(),
+                      pendingActions: req.pendingActions || [],
+                      sourceText: req.sourceText || "",
+                    });
+                    return;
+                  }
+                  await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
+                  addLog("system", "Permission granted. Resumed your original task.");
+                } else if (req?.actionMode === "configure_device") {
+                  await configureMyPc(sessionId);
+                  await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
+                  addLog("system", "Device configured. Resumed your original task.");
+                } else if (req?.actionMode === "wait_for_connection") {
+                  setPendingResume({
+                    type: "device_connection",
+                    createdAt: Date.now(),
+                    pendingActions: req.pendingActions || [],
+                    sourceText: req.sourceText || "",
+                  });
+                  addLog("system", "I will keep monitoring and resume automatically once the requirement is satisfied.");
+                } else if (req?.actionMode === "retry_voice") {
+                  wakeDisabledUntilRef.current = 0;
+                  wakePermissionHintedRef.current = false;
+                  try { wakeRecognizer.current?.start(); } catch {}
+                  addLog("system", "Voice permission updated. Wake listening resumed.");
+                } else if (req?.actionMode === "retry_source_text") {
+                  const src = String(req?.sourceText || "").trim();
+                  if (src) {
+                    await sendMessage(src, "voice", sessionId);
+                    addLog("system", "Requirement resolved. Retried your original request.");
+                  } else {
+                    addLog("system", "Requirement acknowledged. Ready to continue once you provide the original request.");
+                  }
+                } else if (Array.isArray(req?.pendingActions) && req.pendingActions.length) {
+                  await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
+                  addLog("system", "Requirement acknowledged. Attempting to resume your original task.");
                 }
 
-                await dispatchDeviceActions(req.pendingActions, sessionId, req.sourceText);
-                addLog("system", "Permission granted. PC action queued.");
+                auditRequirementEvent({
+                  requestedAction: String(req?.sourceText || "device_action"),
+                  requirementType: String(req?.requirementType || "missing_requirement"),
+                  target: String(req?.target || "system"),
+                  permissionOrScope: req?.permissionOrScope || null,
+                  status: "granted",
+                  details: { action_mode: req?.actionMode || "ack" },
+                });
               } catch (err) {
                 addLog("system", `Permission grant failed: ${err?.message || err}`);
               }
@@ -2455,6 +2935,7 @@ export default function App() {
           emotion={emotion}
           listening={listening}
           speaking={speaking}
+          wakeListeningOnline={wakeListeningOnline}
           volume={volume}
           agentToken={agentToken}
           agentSharedSecret={agentSharedSecret}
@@ -2483,7 +2964,7 @@ export default function App() {
           <div style={{ pointerEvents: "none", background: "rgba(10,10,12,0.28)", color: "var(--jarvis-accent)", padding: "8px 14px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 10, minWidth: 220, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
             <div style={{ width: 10, height: 10, borderRadius: 999, background: emotion === "critical" ? "#ff4d4f" : emotion === "analyzing" ? "#ffd24d" : "#00ffc8", boxShadow: emotion === "critical" ? "0 0 10px rgba(255,77,79,0.45)" : emotion === "analyzing" ? "0 0 10px rgba(255,210,77,0.35)" : "0 0 10px rgba(0,255,200,0.45)" }} />
             <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 13, letterSpacing: 0.3 }}>
-              {emotion === "calm" && ((listening || speaking) ? "Listening (session)" : "Idle")}
+              {emotion === "calm" && (speaking ? "Speaking" : (listening ? "Capturing" : (wakeListeningOnline ? "Wake listening" : "Idle")))}
               {emotion === "analyzing" && "Analyzing"}
               {emotion === "critical" && "Critical"}
             </div>

@@ -1,17 +1,22 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { getAgents } from "../utils/api";
+import { getAgents, getDelegatedTasks } from "../utils/api";
 import "./autonomyPanel.css";
 
 export default function AgentMonitor({ sessionId }) {
   const [agents, setAgents] = useState([]);
   const [deviceAgents, setDeviceAgents] = useState([]);
+  const [delegatedSummary, setDelegatedSummary] = useState({});
   const [err, setErr] = useState("");
 
   const refresh = useCallback(async () => {
     try {
-      const res = await getAgents(sessionId);
-      setAgents(Array.isArray(res?.agents) ? res.agents : []);
-      setDeviceAgents(Array.isArray(res?.connected_device_agents) ? res.connected_device_agents : []);
+      const [agentRes, delegatedRes] = await Promise.all([
+        getAgents(sessionId),
+        getDelegatedTasks(sessionId, { limit: 120 }),
+      ]);
+      setAgents(Array.isArray(agentRes?.agents) ? agentRes.agents : []);
+      setDeviceAgents(Array.isArray(agentRes?.connected_device_agents) ? agentRes.connected_device_agents : []);
+      setDelegatedSummary((delegatedRes && typeof delegatedRes.summary === "object") ? delegatedRes.summary : {});
       setErr("");
     } catch (e) {
       setErr(e?.message || String(e));
@@ -46,6 +51,13 @@ export default function AgentMonitor({ sessionId }) {
       </div>
       <div className="panel-card">
         <h3 className="panel-title">Connected Device Agents</h3>
+        <div className="panel-row">
+          <span className="panel-chip">Delegated: {Number(delegatedSummary?.delegated || 0)}</span>
+          <span className="panel-chip">Queued: {Number(delegatedSummary?.queued_for_agent || 0)}</span>
+          <span className="panel-chip">Awaiting Agent: {Number(delegatedSummary?.awaiting_agent || 0)}</span>
+          <span className="panel-chip">Completed: {Number(delegatedSummary?.completed || 0)}</span>
+          <span className="panel-chip">Failed: {Number(delegatedSummary?.failed || 0)}</span>
+        </div>
         <div className="panel-list">
           {deviceAgents.map((d, idx) => (
             <div className="panel-item" key={String(d?.device_id || idx)}>

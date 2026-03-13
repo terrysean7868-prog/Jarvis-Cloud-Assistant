@@ -64,14 +64,26 @@ class ChatOrchestrator:
         ) or re.search(r"\bresearch\s+(?:status|progress|update)\b", tl):
             return False
 
-        return bool(
+        explicit_research = bool(
             re.search(
-                r"\b(research|do\s+research|make\s+research|deep\s+research|in-?depth|detailed\s+research|"
-                r"with\s+sources|with\s+citations|with\s+links|sources?|citations?|cite|links?|"
-                r"analyze|analysis|summarize|summary|compare)\b",
+                r"\b(research|do\s+research|make\s+research|perform\s+research|deep\s+research|"
+                r"in-?depth|detailed\s+research)\b",
                 tl,
             )
         )
+        if explicit_research:
+            return True
+
+        wants_sources = bool(
+            re.search(
+                r"\b(with\s+sources|with\s+citations|with\s+links|sources?|citations?|cite|links?|"
+                r"latest|today|current|as\s+of|look\s+up|online|internet)\b",
+                tl,
+            )
+        )
+        analysis_like = bool(re.search(r"\b(analyze|analysis|summarize|summary|compare)\b", tl))
+
+        return bool(wants_sources and analysis_like)
 
     @staticmethod
     def _extract_research_topic_label(text: str) -> str:

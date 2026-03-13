@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   getAdminUpdateConfig,
   getAdminUpdateHistory,
+  getAdminRequirementsAudit,
   getAdminProgressiveUpdateReport,
   runAdminAutoUpdate,
   runAdminUpdate,
@@ -25,6 +26,7 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
   const [autoScopes, setAutoScopes] = useState(["backend", "frontend", "agents", "tools"]);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  const [requirementEvents, setRequirementEvents] = useState([]);
 
   const disabled = !sessionId || busy;
 
@@ -42,8 +44,9 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
     for (const row of historyPreview) {
       const s = String(row?.status || "").toLowerCase();
       if (["success", "completed", "done", "rolled_back"].includes(s)) lanes.completed.push(row);
-      else if (["running", "in_progress", "started"].includes(s)) lanes.in_progress.push(row);
-      else if (["error", "failed"].includes(s)) lanes.failed.push(row);
+      else if (["running", "in_progress", "started", "executing", "delegated"].includes(s)) lanes.in_progress.push(row);
+      else if (["queued_for_agent", "awaiting_agent", "pending_permission", "requires_configuration", "available"].includes(s)) lanes.queued.push(row);
+      else if (["error", "failed", "restricted"].includes(s)) lanes.failed.push(row);
       else lanes.queued.push(row);
     }
     return lanes;
@@ -91,6 +94,20 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
       }
     } catch {
       setUpdateConfig(null);
+    }
+  }, [sessionId]);
+
+  const refreshRequirementAudit = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const res = await getAdminRequirementsAudit(sessionId, 120, 12000);
+      if (res?.status === "success") {
+        setRequirementEvents(Array.isArray(res?.events) ? res.events : []);
+      } else {
+        setRequirementEvents([]);
+      }
+    } catch {
+      setRequirementEvents([]);
     }
   }, [sessionId]);
 
@@ -243,8 +260,9 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
       await refreshConfig();
       await refreshProgressiveReport();
       await refreshHistory();
+      await refreshRequirementAudit();
     })();
-  }, [isOpen, sessionId, refreshConfig, refreshProgressiveReport, refreshHistory]);
+  }, [isOpen, sessionId, refreshConfig, refreshProgressiveReport, refreshHistory, refreshRequirementAudit]);
 
   if (!isOpen) return null;
 
@@ -307,6 +325,7 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
           <button disabled={disabled} onClick={deleteByTitle} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ff8f8f", background: "rgba(255,143,143,0.12)", color: "#ffd2d2", cursor: disabled ? "not-allowed" : "pointer" }}>Delete Task by Title</button>
           <button disabled={disabled} onClick={refreshHistory} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #2f3a40", background: "#1b1f24", color: "#e8f7ff", cursor: disabled ? "not-allowed" : "pointer" }}>Refresh History</button>
           <button disabled={disabled} onClick={refreshProgressiveReport} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #6fdca5", background: "rgba(111,220,165,0.12)", color: "#cdf7e1", cursor: disabled ? "not-allowed" : "pointer" }}>Refresh Progressive Report</button>
+          <button disabled={disabled} onClick={refreshRequirementAudit} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #7da6ff", background: "rgba(125,166,255,0.12)", color: "#d7e4ff", cursor: disabled ? "not-allowed" : "pointer" }}>Refresh Requirement Audit</button>
         </div>
 
         <div style={{ fontSize: 12, color: status.includes("failed") || status.includes("error") ? "#ff9f9f" : "#9ecfe0", minHeight: 16 }}>{status}</div>
@@ -364,6 +383,21 @@ export default function UpdateManagementConsole({ sessionId, isOpen, onClose, on
               <div><strong>{row.action || "update"}</strong> • {row.status || "unknown"} • {(row.actor || "unknown")}</div>
               <div style={{ color: "#9ab8c4" }}>{row.target_file || "-"}</div>
               <div style={{ color: "#7ea0ad" }}>{row.ts || ""}</div>
+            </div>
+          ))
+        )}
+      </div>
+
+      <div style={{ marginTop: 10, maxHeight: 220, overflowY: "auto", borderTop: "1px solid #2a3138", paddingTop: 8 }}>
+        <div style={{ color: "#9ecfe0", fontSize: 12, marginBottom: 6 }}><strong>Requirement / Permission Audit</strong></div>
+        {!Array.isArray(requirementEvents) || !requirementEvents.length ? (
+          <div style={{ color: "#8da3ad", fontSize: 12 }}>No requirement audit events yet.</div>
+        ) : (
+          requirementEvents.slice(0, 60).map((ev, idx) => (
+            <div key={`${ev.ts || ""}-${idx}`} style={{ marginBottom: 7, fontSize: 12, color: "#d6ebf3", borderBottom: "1px dashed #23303a", paddingBottom: 6 }}>
+              <div><strong>{String(ev?.requirement_type || "requirement")}</strong> • {String(ev?.status || "pending")} • {String(ev?.user_id || "unknown")}</div>
+              <div style={{ color: "#9ab8c4" }}>{String(ev?.target || "-")} {ev?.permission_or_scope ? `(${String(ev.permission_or_scope)})` : ""}</div>
+              <div style={{ color: "#7ea0ad" }}>{String(ev?.requested_action || "-")} • {String(ev?.device_id || "-")} • {String(ev?.ts || "")}</div>
             </div>
           ))
         )}

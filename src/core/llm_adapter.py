@@ -769,6 +769,28 @@ class LLMAdapter:
                 raise Exception(f"OpenAI API error: {await r.text()}")
             return await r.json()
 
+    @staticmethod
+    def _is_transient_provider_error(err: Exception) -> bool:
+        msg = str(err or "").strip().lower()
+        if not msg:
+            return False
+        transient_markers = (
+            "timeout",
+            "timed out",
+            "connection",
+            "temporarily",
+            "temporary",
+            "too many requests",
+            "rate limit",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "server error",
+        )
+        return any(m in msg for m in transient_markers)
+
     def _choose_model_for_request(self, text: str, mode: str) -> str:
         """Route to a stronger model for complex tasks when configured."""
         try:
@@ -2730,11 +2752,13 @@ Style tone: {tone}.
         if cycle_ctx:
             effective_context = (cycle_ctx + "\n\n" + effective_context).strip()
 
-        user_prompt = f"""
+        def _build_user_prompt(context_window: int) -> str:
+            clipped_ctx = effective_context[-context_window:] if effective_context else "(none)"
+            return f"""
 User said: "{text}"
 
 Context:
-    {effective_context[-2400:] if effective_context else '(none)'}
+    {clipped_ctx}
 
 Return ONLY valid JSON matching:
 {{
@@ -2746,43 +2770,63 @@ Return ONLY valid JSON matching:
         try:
             start = datetime.now(timezone.utc)
             chosen_model = self._choose_model_for_request(text=text, mode=mode)
+            prompt_windows = [2400, 1400, 800]
 
+            response = None
             provider_source = "openai"
-            try:
-                if self.provider == "ollama":
-                    provider_source = "ollama"
-                    response = await self._call_ollama_chat(
-                        [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        temperature=temperature,
-                        model=chosen_model,
-                        endpoint=self.primary_endpoint,
-                    )
-                else:
-                    response = await self._call_openai(
-                        [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        model=chosen_model,
-                        endpoint=self.primary_endpoint,
-                        api_key=self.primary_key,
-                    )
-            except Exception as e_primary:
-                print(f"[LLM WARN] Primary provider failed: {e_primary}")
+            routed_model = chosen_model
+            last_err = None
+
+            # Primary provider retries with progressively smaller context windows.
+            for attempt, ctx_window in enumerate(prompt_windows):
+                try:
+                    user_prompt = _build_user_prompt(ctx_window)
+                    if self.provider == "ollama":
+                        provider_source = "ollama"
+                        routed_model = chosen_model
+                        response = await self._call_ollama_chat(
+                            [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            temperature=temperature,
+                            model=chosen_model,
+                            endpoint=self.primary_endpoint,
+                        )
+                    else:
+                        provider_source = "openai"
+                        routed_model = chosen_model
+                        response = await self._call_openai(
+                            [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
+                            temperature=temperature,
+                            model=chosen_model,
+                            endpoint=self.primary_endpoint,
+                            api_key=self.primary_key,
+                        )
+                    break
+                except Exception as e_primary:
+                    last_err = e_primary
+                    print(f"[LLM WARN] Primary provider failed (attempt {attempt + 1}): {e_primary}")
+                    if attempt >= 1 and not self._is_transient_provider_error(e_primary):
+                        break
+
+            # Fallback provider (Groq/OpenAI-compatible) with compact context.
+            if response is None:
                 if not self.backup_key:
-                    raise
+                    raise last_err or Exception("Primary provider failed")
                 provider_source = "groq"
+                routed_model = self.backup_model
+                fallback_prompt = _build_user_prompt(prompt_windows[-1])
                 response = await self._call_openai(
                     [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
+                        {"role": "user", "content": fallback_prompt},
                     ],
-                    max_tokens=max_tokens,
+                    max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
                     temperature=temperature,
                     model=self.backup_model,
                     endpoint=self.backup_endpoint,
@@ -2919,6 +2963,11 @@ Return ONLY valid JSON matching:
             latency = (datetime.now(timezone.utc) - start).total_seconds()
             parsed["latency"] = f"{latency:.2f}s"
             parsed["source"] = provider_source
+            parsed["routing"] = {
+                "provider": provider_source,
+                "model": routed_model,
+                "fallback_used": provider_source in {"groq"},
+            }
 
             self._learn_from_actions(text, parsed.get("actions") or [])
 
@@ -2968,6 +3017,22 @@ Return ONLY valid JSON matching:
                         "actions": [{"type": "web_search", "query": q, "num_results": 5}],
                         "source": "fallback-web",
                     }
+            except Exception:
+                pass
+
+            # Reuse deterministic intent parsing when provider calls fail.
+            # This keeps basic greetings, simple intents, and low-risk commands responsive
+            # even when no external LLM is currently reachable.
+            try:
+                deterministic = self._preparse_deterministic_voice_actions(text)
+                if isinstance(deterministic, dict):
+                    out = {
+                        "text": str(deterministic.get("text") or "Done."),
+                        "actions": deterministic.get("actions") if isinstance(deterministic.get("actions"), list) else [],
+                        "source": str(deterministic.get("source") or "fallback-local-deterministic"),
+                    }
+                    self._learn_from_actions(text, out.get("actions") or [])
+                    return out
             except Exception:
                 pass
 
@@ -3028,6 +3093,58 @@ Return ONLY valid JSON matching:
                     parsed["source"] = "fallback-local"
                     self._learn_from_actions(text, parsed.get("actions") or [])
                     return parsed
+            except Exception:
+                pass
+
+            # Human-readable fallback for basic chat cases when provider is unavailable.
+            try:
+                tl = (text or "").strip().lower()
+                if re.match(r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+jarvis)?([\s!?.]*)$", tl):
+                    return {
+                        "text": "Hey! I am online. I can help with chat, research prompts, and connected PC actions.",
+                        "actions": [],
+                        "source": "fallback-local-chat",
+                    }
+
+                m = re.match(r"^(what\s+is\s+)?(-?\d+)\s*([+\-*/])\s*(-?\d+)\??$", tl)
+                if m:
+                    a = int(m.group(2))
+                    op = m.group(3)
+                    b = int(m.group(4))
+                    if op == "+":
+                        ans = a + b
+                    elif op == "-":
+                        ans = a - b
+                    elif op == "*":
+                        ans = a * b
+                    else:
+                        ans = "undefined" if b == 0 else (a / b)
+                    return {
+                        "text": f"{a} {op} {b} = {ans}",
+                        "actions": [],
+                        "source": "fallback-local-chat",
+                    }
+
+                if "what can you do" in tl or "capabilit" in tl:
+                    return {
+                        "text": "I can chat, answer questions, run research prompts, and trigger connected PC actions like opening apps, URLs, screenshots, and automation tasks when permissions are granted.",
+                        "actions": [],
+                        "source": "fallback-local-chat",
+                    }
+
+                if tl.startswith("summarize") or tl.startswith("summarise"):
+                    return {
+                        "text": "Summary: Provider-backed generation is currently unavailable. I can still execute deterministic device commands and basic local fallback responses.",
+                        "actions": [],
+                        "source": "fallback-local-chat",
+                    }
+
+                if tl.startswith("compare ") or " compare " in tl:
+                    return {
+                        "text": "Quick comparison: option A usually offers stronger performance control and lower-level tuning, while option B typically offers faster development and simpler operations. If you share your exact use case, I can tailor the recommendation.",
+                        "actions": [],
+                        "source": "fallback-local-chat",
+                    }
             except Exception:
                 pass
 
