@@ -1740,7 +1740,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow]);
+  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, isWakePhrase]);
 
   const startHoldToTalk = useCallback(async () => {
     if (!isAuthenticated) {
@@ -2139,7 +2139,7 @@ export default function App() {
         if (wakeSessionTimerRef.current) clearTimeout(wakeSessionTimerRef.current);
       } catch {}
     };
-  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive]);
+  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive, isWakePhrase]);
 
   // Authentication helpers (unchanged, stable)
   const handleAuthSuccess = useCallback((newSessionId, newUsername, newRole, newPermissions) => {
