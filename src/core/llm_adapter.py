@@ -110,11 +110,57 @@ class LLMAdapter:
             return "global"
 
     @staticmethod
-        return None
-                data["stats"] = {"learn_events": 0, "hits": 0}
-            return data
+    def _resolve_local_reasoner_state_path() -> Path:
+        try:
+            root = Path(__file__).resolve().parents[2]
         except Exception:
-            return state
+            root = Path.cwd()
+        return root / "data" / "local_reasoner_state.json"
+
+    @staticmethod
+    def _default_local_reasoner_state() -> dict:
+        return {
+            "version": 1,
+            "updated_at": "",
+            "last_maintenance_day": "",
+            "app_aliases": {},
+            "site_aliases": {},
+            "stats": {
+                "learn_events": 0,
+                "hits": 0,
+            },
+            "cycles": [],
+        }
+
+    def _load_local_reasoner_state(self) -> dict:
+        state = self._default_local_reasoner_state()
+
+        if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
+            try:
+                data = db.local_reasoner_state_get(self._local_reasoner_state_key)
+                if isinstance(data, dict):
+                    if "stats" not in data:
+                        data["stats"] = {"learn_events": 0, "hits": 0}
+                    if "cycles" not in data:
+                        data["cycles"] = []
+                    return data
+            except Exception:
+                pass
+
+        try:
+            p = self._local_reasoner_state_path
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    if "stats" not in data:
+                        data["stats"] = {"learn_events": 0, "hits": 0}
+                    if "cycles" not in data:
+                        data["cycles"] = []
+                    return data
+        except Exception:
+            pass
+
+        return state
 
     def _save_local_reasoner_state(self) -> None:
         self._local_reasoner_state["updated_at"] = datetime.now(timezone.utc).isoformat()
