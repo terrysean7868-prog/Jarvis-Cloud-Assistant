@@ -968,7 +968,11 @@ export default function App() {
         const staleOwnedDevice =
           !!preferredDeviceId
           && cfgStatus === 403
-          && (detailText.includes("assigned to another user") || detailText.includes("no permission"));
+          && (
+            detailText.includes("this device_id is assigned to another user")
+            || detailText.includes("device_id is assigned to another user")
+            || detailText.includes("already assigned to another user")
+          );
 
         if (!staleOwnedDevice) {
           throw cfgErr;
@@ -1019,6 +1023,7 @@ export default function App() {
       }
     } catch (e) {
       const status = Number(e?.status || 0);
+      const detailText = String(e?.detail?.message || e?.detail || e?.message || "").toLowerCase();
       if (status === 401) {
         addLog("system", "Session expired while connecting PC agent. Please login again.");
         localStorage.removeItem("jarvis_session");
@@ -1032,7 +1037,23 @@ export default function App() {
         setPermissions(null);
         setShowAuthModal(true);
       } else if (status === 403) {
-        addLog("system", "Permission denied while connecting PC agent.");
+        if (detailText.includes("all connected pcs are already assigned to other users")) {
+          addLog("system", "Cannot connect this account: all currently connected PCs are assigned to other users. Re-login with the PC owner account or ask an admin to reassign the device.");
+        } else if (
+          detailText.includes("this device_id is assigned to another user")
+          || detailText.includes("device_id is assigned to another user")
+          || detailText.includes("already assigned to another user")
+        ) {
+          addLog("system", "This saved PC route belongs to another user. Clear/reconfigure device ownership (or use the correct owner account) and try Connect PC Agent again.");
+        } else {
+          addLog("system", `Permission denied while connecting PC agent. ${String(e?.detail?.message || e?.detail || "")}`.trim());
+        }
+      } else if (status === 409) {
+        if (detailText.includes("no pc agent is connected")) {
+          addLog("system", "No PC agent is currently connected. Start JarvisPCAgent.exe (or python pc_agent.py) on your PC first, then click Connect PC Agent.");
+        } else {
+          addLog("system", `PC route conflict: ${String(e?.detail?.message || e?.detail || "Please pick the correct device and retry.")}`);
+        }
       } else {
         addLog("system", "Could not establish connection. Try again.");
       }

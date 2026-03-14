@@ -283,6 +283,7 @@ _JOB_RESULT_WAITERS: dict[str, asyncio.Event] = {}
 _DELEGATED_TASK_INDEX_READY = False
 
 _DEVICE_REGISTRY_INDEX_READY = False
+_USER_DEVICE_LINK_INDEX_READY = False
 _DEVICE_PERMISSIONS_INDEX_READY = False
 _AGENT_CONFIG_INDEX_READY = False
 _REQUIREMENTS_AUDIT_INDEX_READY = False
@@ -1250,12 +1251,10 @@ def _require_device_owner(username: str | None):
 
 
 def _device_registry_collection():
-    """Collection mapping device_id <-> owner_username.
+    """Collection storing device metadata keyed by device_id.
 
-    Security model:
-    - A device_id can be owned by at most one user.
-    - A user can own at most one device_id.
-    - Non-admin users can only assign an unowned device_id to themselves.
+    Ownership mapping is handled by user_device_links to allow many users to
+    share one device_id when needed.
     """
     try:
         database._ensure_connected()
@@ -1270,11 +1269,35 @@ def _device_registry_collection():
             col.create_index("device_id", unique=True)
         except Exception:
             pass
+        _DEVICE_REGISTRY_INDEX_READY = True
+    return col
+
+
+def _user_device_links_collection():
+    """Collection mapping owner_username -> device_id.
+
+    Model:
+    - One user can be mapped to at most one device_id (unique owner_username).
+    - One device_id can be mapped to many users (non-unique device_id).
+    """
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return None
+    col = database.db["user_device_links"]
+    global _USER_DEVICE_LINK_INDEX_READY
+    if not _USER_DEVICE_LINK_INDEX_READY:
         try:
-            col.create_index("owner_username", unique=True, sparse=True)
+            col.create_index("owner_username", unique=True)
         except Exception:
             pass
-        _DEVICE_REGISTRY_INDEX_READY = True
+        try:
+            col.create_index("device_id")
+        except Exception:
+            pass
+        _USER_DEVICE_LINK_INDEX_READY = True
     return col
 
 
@@ -1480,7 +1503,7 @@ def _normalize_device_id(device_id: str | None) -> str:
 
 
 def _get_owner_device_id(owner_username: str | None) -> str | None:
-    """Return the device_id owned by the given user (or None)."""
+    """Return the device_id assigned to the given user (or None)."""
     owner = (owner_username or "").strip().lower()
     if not owner:
         return None
@@ -1490,11 +1513,16 @@ def _get_owner_device_id(owner_username: str | None) -> str | None:
     if cached and (now - cached[0]) < _DEVICE_LOOKUP_CACHE_TTL_S:
         return cached[1]
 
-    col = _device_registry_collection()
+    col = _user_device_links_collection()
     if col is None:
-        _OWNER_TO_DEVICE_CACHE[owner] = (now, None)
-        return None
-    doc = col.find_one({"owner_username": owner}, {"_id": 0, "device_id": 1})
+        # Legacy fallback for deployments that only have device_registry ownership data.
+        legacy = _device_registry_collection()
+        if legacy is None:
+            _OWNER_TO_DEVICE_CACHE[owner] = (now, None)
+            return None
+        doc = legacy.find_one({"owner_username": owner}, {"_id": 0, "device_id": 1})
+    else:
+        doc = col.find_one({"owner_username": owner}, {"_id": 0, "device_id": 1})
     did = (doc or {}).get("device_id")
     did = _normalize_device_id(did) or None
     _OWNER_TO_DEVICE_CACHE[owner] = (now, did)
@@ -1504,7 +1532,10 @@ def _get_owner_device_id(owner_username: str | None) -> str | None:
 
 
 def _get_device_owner(device_id: str | None) -> str | None:
-    """Return the owner_username for a device_id (or None)."""
+    """Return one owner_username for a device_id (or None).
+
+    In shared-device mode, this returns the most recently updated owner.
+    """
     did = _normalize_device_id(device_id)
     if not did:
         return None
@@ -1514,11 +1545,19 @@ def _get_device_owner(device_id: str | None) -> str | None:
     if cached and (now - cached[0]) < _DEVICE_LOOKUP_CACHE_TTL_S:
         return cached[1]
 
-    col = _device_registry_collection()
+    col = _user_device_links_collection()
     if col is None:
-        _DEVICE_TO_OWNER_CACHE[did] = (now, None)
-        return None
-    doc = col.find_one({"device_id": did}, {"_id": 0, "owner_username": 1})
+        legacy = _device_registry_collection()
+        if legacy is None:
+            _DEVICE_TO_OWNER_CACHE[did] = (now, None)
+            return None
+        doc = legacy.find_one({"device_id": did}, {"_id": 0, "owner_username": 1})
+    else:
+        doc = col.find_one(
+            {"device_id": did},
+            {"_id": 0, "owner_username": 1},
+            sort=[("updated_at", -1), ("created_at", -1)],
+        )
     owner = (doc or {}).get("owner_username")
     owner = (owner or "").strip().lower() or None
     _DEVICE_TO_OWNER_CACHE[did] = (now, owner)
@@ -1528,11 +1567,12 @@ def _get_device_owner(device_id: str | None) -> str | None:
 
 
 def _set_device_owner(device_id: str, owner_username: str | None, updated_by: str | None = None):
-    """Assign/unassign ownership for a device_id.
+    """Assign/unassign user mapping for a device_id.
 
-    If owner_username is None/empty, the device is unassigned.
+    If owner_username is provided, map that user -> device.
+    If owner_username is None, clear all user links pointing to device_id.
     """
-    col = _device_registry_collection()
+    col = _user_device_links_collection()
     if col is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -1543,7 +1583,7 @@ def _set_device_owner(device_id: str, owner_username: str | None, updated_by: st
     now = datetime.utcnow()
     if owner:
         col.update_one(
-            {"device_id": did},
+            {"owner_username": owner},
             {
                 "$set": {
                     "device_id": did,
@@ -1555,21 +1595,22 @@ def _set_device_owner(device_id: str, owner_username: str | None, updated_by: st
             },
             upsert=True,
         )
+        _OWNER_TO_DEVICE_CACHE[owner] = (time.time(), did)
+        _DEVICE_TO_OWNER_CACHE[did] = (time.time(), owner)
     else:
-        # Unassign ownership, keep the record for audit.
-        col.update_one(
-            {"device_id": did},
-            {
-                "$set": {
-                    "device_id": did,
-                    "owner_username": None,
-                    "updated_at": now,
-                    "updated_by": updater,
-                },
-                "$setOnInsert": {"created_at": now},
-            },
-            upsert=True,
-        )
+        col.delete_many({"device_id": did})
+        _DEVICE_TO_OWNER_CACHE.pop(did, None)
+
+
+def _clear_owner_device(owner_username: str | None):
+    owner = (owner_username or "").strip().lower()
+    if not owner:
+        return
+    col = _user_device_links_collection()
+    if col is None:
+        return
+    col.delete_one({"owner_username": owner})
+    _OWNER_TO_DEVICE_CACHE.pop(owner, None)
 
 
 def _can_control_device(principal: dict) -> bool:
@@ -2409,20 +2450,16 @@ async def user_get_device(req: UserDeviceGetRequest):
 async def user_set_device(req: UserDeviceSetRequest):
     """Bind the authenticated user to a device_id.
 
-    Users cannot claim a device owned by another user.
+    Shared-device mode: multiple users may point to the same device_id.
     """
     p = _require_authenticated_session(req.session_id)
     user_id = (p.get("username") or "").strip().lower()
     did = _validate_device_id_or_400(req.device_id)
 
-    current_owner = _get_device_owner(did)
-    if current_owner and current_owner != user_id:
-        raise HTTPException(status_code=403, detail="This device_id is already assigned to another user")
-
-    # Unassign any previous device from this user, then assign the new one.
+    # Update this user's mapping; device_id may be shared across users.
     prev = _get_owner_device_id(user_id)
     if prev and prev != did:
-        _set_device_owner(prev, None, updated_by=user_id)
+        _clear_owner_device(user_id)
 
     _set_device_owner(did, user_id, updated_by=user_id)
     return {"status": "success", "user_id": user_id, "device_id": did}
@@ -2445,12 +2482,9 @@ async def user_configure_device(req: UserDeviceConfigureRequest):
 
     if req.device_id:
         did = _validate_device_id_or_400(req.device_id)
-        current_owner = _get_device_owner(did)
-        if current_owner and current_owner != user_id:
-            raise HTTPException(status_code=403, detail="No permission: this device_id is assigned to another user")
         prev = _get_owner_device_id(user_id)
         if prev and prev != did:
-            _set_device_owner(prev, None, updated_by=user_id)
+            _clear_owner_device(user_id)
         _set_device_owner(did, user_id, updated_by=user_id)
         agent = await device_hub.get_agent(did)
         return {
@@ -2478,12 +2512,8 @@ async def user_configure_device(req: UserDeviceConfigureRequest):
     if not agents_by_id:
         raise HTTPException(status_code=409, detail="No PC agent is connected. Start pc_agent.py on your PC and try again.")
 
-    # Prefer unowned devices; allow already-owned-by-user (none in this branch).
-    candidates = []
-    for did in agents_by_id.keys():
-        owner = _get_device_owner(did)
-        if not owner:
-            candidates.append(did)
+    # Shared-device mode: any connected device can be mapped to this user.
+    candidates = [str(d or "").strip().lower() for d in agents_by_id.keys() if str(d or "").strip()]
 
     if len(candidates) == 1:
         did = candidates[0]
@@ -2499,7 +2529,7 @@ async def user_configure_device(req: UserDeviceConfigureRequest):
         }
 
     if not candidates:
-        raise HTTPException(status_code=403, detail="No permission: all connected PCs are already assigned to other users")
+        raise HTTPException(status_code=409, detail="No PC agent is connected. Start pc_agent.py on your PC and try again.")
 
     raise HTTPException(
         status_code=409,
@@ -2518,15 +2548,11 @@ async def admin_assign_device(req: AdminDeviceAssignRequest):
     did = _validate_device_id_or_400(req.device_id)
     owner = (req.owner_username or "").strip().lower() or None
 
-    # If assigning to a user, ensure uniqueness on both sides.
+    # Shared-device mode: many users can map to the same device_id.
     if owner:
-        existing_owner = _get_device_owner(did)
-        if existing_owner and existing_owner != owner:
-            # force reassignment by first unassigning
-            _set_device_owner(did, None, updated_by=admin_user)
         prev = _get_owner_device_id(owner)
         if prev and prev != did:
-            _set_device_owner(prev, None, updated_by=admin_user)
+            _clear_owner_device(owner)
         _set_device_owner(did, owner, updated_by=admin_user)
         return {"status": "success", "device_id": did, "owner_username": owner}
 
