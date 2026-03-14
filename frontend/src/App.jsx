@@ -705,6 +705,16 @@ export default function App() {
           // 1008 = policy violation (we use this for missing/invalid session_id)
           if (evt && evt.code === 1008) {
             addLog("system", "Realtime notifications disconnected (auth required). Please login again.");
+            localStorage.removeItem("jarvis_session");
+            localStorage.removeItem("jarvis_username");
+            localStorage.removeItem("jarvis_role");
+            localStorage.removeItem("jarvis_permissions");
+            setIsAuthenticated(false);
+            setSessionId(null);
+            setUsername(null);
+            setRole(null);
+            setPermissions(null);
+            setShowAuthModal(true);
             return;
           }
 
@@ -949,7 +959,27 @@ export default function App() {
         preferredDeviceId = localStorage.getItem("jarvis_device_id") || null;
       } catch {}
 
-      const resp = await configureMyPc(sid, preferredDeviceId);
+      let resp = null;
+      try {
+        resp = await configureMyPc(sid, preferredDeviceId);
+      } catch (cfgErr) {
+        const cfgStatus = Number(cfgErr?.status || 0);
+        const detailText = String(cfgErr?.detail?.message || cfgErr?.detail || cfgErr?.message || "").toLowerCase();
+        const staleOwnedDevice =
+          !!preferredDeviceId
+          && cfgStatus === 403
+          && (detailText.includes("assigned to another user") || detailText.includes("no permission"));
+
+        if (!staleOwnedDevice) {
+          throw cfgErr;
+        }
+
+        addLog("system", "Saved PC route is no longer yours. Rebinding to your available PC…");
+        try {
+          localStorage.removeItem("jarvis_device_id");
+        } catch {}
+        resp = await configureMyPc(sid, null);
+      }
       const did = (resp?.device_id || "").toString().trim();
       try {
         if (did) localStorage.setItem("jarvis_device_id", did);
@@ -989,8 +1019,20 @@ export default function App() {
       }
     } catch (e) {
       const status = Number(e?.status || 0);
-      if (status === 401 || status === 403) {
-        addLog("system", "Permission denied while connecting PC agent. Please login again.");
+      if (status === 401) {
+        addLog("system", "Session expired while connecting PC agent. Please login again.");
+        localStorage.removeItem("jarvis_session");
+        localStorage.removeItem("jarvis_username");
+        localStorage.removeItem("jarvis_role");
+        localStorage.removeItem("jarvis_permissions");
+        setIsAuthenticated(false);
+        setSessionId(null);
+        setUsername(null);
+        setRole(null);
+        setPermissions(null);
+        setShowAuthModal(true);
+      } else if (status === 403) {
+        addLog("system", "Permission denied while connecting PC agent.");
       } else {
         addLog("system", "Could not establish connection. Try again.");
       }

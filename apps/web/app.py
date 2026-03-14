@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import logging
 from pathlib import Path
 import time
 import re
@@ -69,6 +70,8 @@ from src.api.internet_routes import build_internet_router
 from src.api.session_routes import build_session_router
 from src.api.system_control_routes import build_system_control_router
 from src.api.telegram_routes import build_telegram_router
+
+logger = logging.getLogger(__name__)
 
 # Optional shared broker for multi-instance deployments (Redis pub/sub).
 try:
@@ -4886,10 +4889,22 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         principal = _require_authenticated_session(msg.session_id)
     username = None
     role = principal.get("role", "anonymous")
-    if msg.session_id:
+    if CLOUD_MODE:
+        username = principal.get("username")
+    elif msg.session_id:
         username = _require_voice_session(msg.session_id)
     if username:
         msg.user = username
+
+    logger.info(
+        "[chat.entry] request_id=%s mode=%s cloud=%s user=%s role=%s text_len=%s",
+        request_id,
+        str(msg.mode or "chat"),
+        str(bool(CLOUD_MODE)),
+        str(username or msg.user or principal.get("username") or "anonymous"),
+        str(role),
+        len((msg.text or "").strip()),
+    )
 
     # Admin-only module update cycle flow (start/continue/delete by title).
     # Uses explicit phrases so unrelated conversations continue normally.
@@ -5001,6 +5016,13 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         background_tasks=background_tasks,
         user_id=((username or msg.user) if (username or msg.user) else None),
     )
+    logger.info(
+        "[chat.mode] request_id=%s mode=%s source=%s action_count=%s",
+        request_id,
+        str(msg.mode or "chat"),
+        str((response or {}).get("source") or "unknown"),
+        len(actions) if isinstance(actions, list) else 0,
+    )
 
     # Persist voice command telemetry (MongoDB)
     try:
@@ -5063,6 +5085,12 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
 
         response["actions"] = remaining_actions
         response["request_id"] = request_id
+        logger.info(
+            "[chat.response] request_id=%s mode=cloud source=%s actions=%s",
+            request_id,
+            str((response or {}).get("source") or "unknown"),
+            len(remaining_actions),
+        )
         return response
 
     # Local mode
@@ -5070,6 +5098,12 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         response["request_id"] = request_id
     except Exception:
         pass
+    logger.info(
+        "[chat.response] request_id=%s mode=local source=%s actions=%s",
+        request_id,
+        str((response or {}).get("source") or "unknown"),
+        len((response or {}).get("actions") or []),
+    )
     return response
 
 # Alias for backward compatibility

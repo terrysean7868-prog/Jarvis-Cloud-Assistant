@@ -1,15 +1,20 @@
 # src/core/llm_adapter.py
 import os
 import json
+import asyncio
 import aiohttp
 import re
 import random
+import time
+import logging
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pathlib import Path
 from src.utils.db import db
 from src.config import runtime_defaults as rd
 from src.config.secrets import llm_secrets
+
+logger = logging.getLogger(__name__)
 
 # Import decision-making system
 try:
@@ -43,7 +48,12 @@ class LLMAdapter:
         self.backup_endpoint = (rd.BACKUP_ENDPOINT or "").strip()
         self.persona = rd.PERSONA
         self.session = None
-        self.timeout = aiohttp.ClientTimeout(total=30)
+        self.provider_timeout_s = max(5, int(os.getenv("JARVIS_LLM_PROVIDER_TIMEOUT_S", "12") or "12"))
+        self.provider_budget_s = max(
+            self.provider_timeout_s,
+            int(os.getenv("JARVIS_LLM_PROVIDER_BUDGET_S", "16") or "16"),
+        )
+        self.timeout = aiohttp.ClientTimeout(total=self.provider_timeout_s)
         self.max_retries = 2
         # Default response budget. We dynamically increase for complex queries.
         self.default_max_tokens = int(rd.LLM_MAX_TOKENS_DEFAULT)
@@ -833,6 +843,39 @@ class LLMAdapter:
         if re.search(r"\b(explain|define|meaning|documentation|docs|guide|tutorial)\b", tl):
             return True
         return False
+
+    @staticmethod
+    def _quick_local_chat_reply(user_text: str) -> dict | None:
+        """Fast-path replies for common basic prompts.
+
+        This avoids provider round-trips for trivial/local-safe chat prompts.
+        """
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            return None
+
+        if re.match(r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+jarvis)?([\s!?.]*)$", tl):
+            return {
+                "text": "Hey! I am online. I can help with chat, research prompts, and connected PC actions.",
+                "actions": [],
+                "source": "deterministic-local-chat",
+            }
+
+        if "what can you do" in tl or "capabilit" in tl:
+            return {
+                "text": "I can chat, answer questions, run research prompts, and trigger connected PC actions like opening apps, URLs, screenshots, and automation tasks when permissions are granted.",
+                "actions": [],
+                "source": "deterministic-local-chat",
+            }
+
+        if re.search(r"\b(self\s*[-_]?update)\b", tl) and re.search(r"\b(explain|what\s+is|how|command|usage|mean|means)\b", tl):
+            return {
+                "text": "The self-update command is an admin-only maintenance flow that applies controlled code changes with audit history and optional rollback. Use it only for trusted update requests, and always review the generated diff before deployment.",
+                "actions": [],
+                "source": "deterministic-local-chat",
+            }
+
+        return None
 
     def _estimate_complexity(self, text: str, mode: str) -> int:
         """Rough heuristic to scale response budget for harder tasks.
@@ -2428,6 +2471,25 @@ class LLMAdapter:
             return parsed
 
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
+        quick = self._quick_local_chat_reply(text)
+        if isinstance(quick, dict):
+            quick["routing"] = {
+                "provider": "deterministic",
+                "model": "local-fast-path",
+                "fallback_used": True,
+            }
+            try:
+                quick["emotion"] = quick.get("emotion") or self._infer_emotion(quick.get("text") or text)
+            except Exception:
+                pass
+            logger.info(
+                "[llm.fast_path] mode=%s source=%s text_preview=%s",
+                str(mode or "chat"),
+                str(quick.get("source") or "deterministic-local-chat"),
+                (text or "")[:80].replace("\n", " "),
+            )
+            return quick
+
         """
         Generate a rich, humanlike structured response.
         
@@ -2771,6 +2833,15 @@ Return ONLY valid JSON matching:
             start = datetime.now(timezone.utc)
             chosen_model = self._choose_model_for_request(text=text, mode=mode)
             prompt_windows = [2400, 1400, 800]
+            budget_started = time.monotonic()
+
+            logger.info(
+                "[llm.request] mode=%s provider=%s model=%s budget_s=%s",
+                str(mode or "chat"),
+                str(self.provider or ""),
+                str(chosen_model or ""),
+                str(self.provider_budget_s),
+            )
 
             response = None
             provider_source = "openai"
@@ -2779,37 +2850,67 @@ Return ONLY valid JSON matching:
 
             # Primary provider retries with progressively smaller context windows.
             for attempt, ctx_window in enumerate(prompt_windows):
+                elapsed = time.monotonic() - budget_started
+                remaining = max(0.0, float(self.provider_budget_s) - elapsed)
+                if remaining <= 0.0:
+                    last_err = TimeoutError("provider budget exhausted before primary response")
+                    logger.warning("[llm.provider.timeout] stage=primary reason=budget_exhausted")
+                    break
                 try:
                     user_prompt = _build_user_prompt(ctx_window)
                     if self.provider == "ollama":
                         provider_source = "ollama"
                         routed_model = chosen_model
-                        response = await self._call_ollama_chat(
-                            [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            temperature=temperature,
-                            model=chosen_model,
-                            endpoint=self.primary_endpoint,
+                        logger.info(
+                            "[llm.provider.start] provider=ollama attempt=%s ctx_window=%s remaining_s=%.2f",
+                            attempt + 1,
+                            ctx_window,
+                            remaining,
+                        )
+                        response = await asyncio.wait_for(
+                            self._call_ollama_chat(
+                                [
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": user_prompt},
+                                ],
+                                temperature=temperature,
+                                model=chosen_model,
+                                endpoint=self.primary_endpoint,
+                            ),
+                            timeout=max(1.0, min(float(self.provider_timeout_s), remaining)),
                         )
                     else:
                         provider_source = "openai"
                         routed_model = chosen_model
-                        response = await self._call_openai(
-                            [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
-                            temperature=temperature,
-                            model=chosen_model,
-                            endpoint=self.primary_endpoint,
-                            api_key=self.primary_key,
+                        logger.info(
+                            "[llm.provider.start] provider=openai attempt=%s ctx_window=%s remaining_s=%.2f",
+                            attempt + 1,
+                            ctx_window,
+                            remaining,
+                        )
+                        response = await asyncio.wait_for(
+                            self._call_openai(
+                                [
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": user_prompt},
+                                ],
+                                max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
+                                temperature=temperature,
+                                model=chosen_model,
+                                endpoint=self.primary_endpoint,
+                                api_key=self.primary_key,
+                            ),
+                            timeout=max(1.0, min(float(self.provider_timeout_s), remaining)),
                         )
                     break
                 except Exception as e_primary:
                     last_err = e_primary
+                    logger.warning(
+                        "[llm.provider.fail] provider=%s attempt=%s error=%s",
+                        "ollama" if self.provider == "ollama" else "openai",
+                        attempt + 1,
+                        str(e_primary),
+                    )
                     print(f"[LLM WARN] Primary provider failed (attempt {attempt + 1}): {e_primary}")
                     if attempt >= 1 and not self._is_transient_provider_error(e_primary):
                         break
@@ -2818,19 +2919,27 @@ Return ONLY valid JSON matching:
             if response is None:
                 if not self.backup_key:
                     raise last_err or Exception("Primary provider failed")
+                elapsed = time.monotonic() - budget_started
+                remaining = max(0.0, float(self.provider_budget_s) - elapsed)
+                if remaining <= 0.0:
+                    raise TimeoutError("provider budget exhausted before fallback response")
                 provider_source = "groq"
                 routed_model = self.backup_model
                 fallback_prompt = _build_user_prompt(prompt_windows[-1])
-                response = await self._call_openai(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": fallback_prompt},
-                    ],
-                    max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
-                    temperature=temperature,
-                    model=self.backup_model,
-                    endpoint=self.backup_endpoint,
-                    api_key=self.backup_key,
+                logger.info("[llm.provider.start] provider=groq attempt=1 remaining_s=%.2f", remaining)
+                response = await asyncio.wait_for(
+                    self._call_openai(
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": fallback_prompt},
+                        ],
+                        max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
+                        temperature=temperature,
+                        model=self.backup_model,
+                        endpoint=self.backup_endpoint,
+                        api_key=self.backup_key,
+                    ),
+                    timeout=max(1.0, min(float(self.provider_timeout_s), remaining)),
                 )
             if self.provider == "ollama" and isinstance(response, dict):
                 msg = response.get("message") or {}
@@ -2968,6 +3077,12 @@ Return ONLY valid JSON matching:
                 "model": routed_model,
                 "fallback_used": provider_source in {"groq"},
             }
+            logger.info(
+                "[llm.response] source=%s latency=%s fallback_used=%s",
+                provider_source,
+                parsed.get("latency"),
+                str(provider_source in {"groq"}),
+            )
 
             self._learn_from_actions(text, parsed.get("actions") or [])
 

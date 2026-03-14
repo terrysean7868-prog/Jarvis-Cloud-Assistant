@@ -61,7 +61,7 @@
 
 .jd-right .jd-panel:last-child {
   flex: 1;
-  min-height: 150px;
+  min-height: 160px;
 }
 
 /* Centered horizontal dividers inside left/right columns */
