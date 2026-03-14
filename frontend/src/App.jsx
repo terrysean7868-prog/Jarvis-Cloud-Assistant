@@ -943,22 +943,57 @@ export default function App() {
     }
 
     try {
-      addLog("system", "Checking PC agent…");
-      const online = await isPcAgentOnline(sid);
-      if (!online) {
-        addLog("system", "PC agent is offline. Start JarvisPCAgent.exe (or python pc_agent.py), then try again.");
-        return;
-      }
-
-      addLog("system", "PC agent online. Establishing connection…");
-      const resp = await configureMyPc(sid);
+      addLog("system", "Configuring PC agent route…");
+      let preferredDeviceId = null;
       try {
-        const did = (resp?.device_id || "").toString().trim();
+        preferredDeviceId = localStorage.getItem("jarvis_device_id") || null;
+      } catch {}
+
+      const resp = await configureMyPc(sid, preferredDeviceId);
+      const did = (resp?.device_id || "").toString().trim();
+      try {
         if (did) localStorage.setItem("jarvis_device_id", did);
       } catch {}
-      addLog("system", "PC agent connected.");
-    } catch {
-      addLog("system", "Could not establish connection. Try again.");
+
+      // Refresh agent config immediately so user sees latest token/urls.
+      try {
+        const cfg = await getAgentConfig(sid, did || null, 12000);
+        const nextToken = (cfg?.agent_token || "").toString();
+        const nextSecret = (cfg?.agent_shared_secret || "").toString();
+        const nextServerUrl = (cfg?.server_url || "").toString();
+        const nextWsUrl = (cfg?.ws_url || "").toString();
+        setAgentToken(nextToken);
+        setAgentSharedSecret(nextSecret);
+        setAgentServerUrl(nextServerUrl);
+        setAgentWsUrl(nextWsUrl);
+        setAgentCfgLoaded(true);
+        setAgentCfgError(null);
+      } catch {
+        // Non-fatal for connection flow; keep existing values.
+      }
+
+      addLog("system", "Route configured. Checking agent presence…");
+      let online = false;
+      for (let i = 0; i < 8; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        online = await isPcAgentOnline(sid);
+        if (online) break;
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((resolve) => setTimeout(resolve, 900));
+      }
+
+      if (online) {
+        addLog("system", "PC agent connected.");
+      } else {
+        addLog("system", "PC route is configured, but agent is still offline. Start JarvisPCAgent.exe (or python pc_agent.py). It will auto-connect.");
+      }
+    } catch (e) {
+      const status = Number(e?.status || 0);
+      if (status === 401 || status === 403) {
+        addLog("system", "Permission denied while connecting PC agent. Please login again.");
+      } else {
+        addLog("system", "Could not establish connection. Try again.");
+      }
     }
   }, [sessionId, addLog, isPcAgentOnline]);
 

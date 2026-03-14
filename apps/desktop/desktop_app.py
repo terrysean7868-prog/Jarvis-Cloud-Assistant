@@ -48,6 +48,15 @@ def _port_open(host: str, port: int) -> bool:
         return False
 
 
+def _find_free_port(host: str, start_port: int, max_tries: int = 30) -> int | None:
+    p0 = int(start_port)
+    for i in range(max(1, int(max_tries))):
+        p = p0 + i
+        if not _port_open(host, p):
+            return p
+    return None
+
+
 def _notify(title: str, message: str) -> None:
     msg = str(message or "").strip() or "Jarvis desktop event"
     try:
@@ -412,6 +421,15 @@ def main() -> int:
     port = int(args.port or DEFAULT_PORT)
 
     url, host, port = _normalize_local_url_and_bind((args.url or "").strip(), host, port)
+
+    # If preferred port is occupied by another process, try the next free local port
+    # to keep desktop startup reliable instead of failing immediately.
+    if not args.no_backend and _port_open(host, port):
+        if not _wait_for_backend(url, timeout_s=1.5):
+            alt = _find_free_port(host, port + 1, max_tries=40)
+            if alt is not None:
+                port = int(alt)
+                url = f"http://{host}:{port}"
     if not _is_local_url(url):
         print("Desktop app is local-only. Use http://127.0.0.1:<port> or http://localhost:<port>.")
         return 2
@@ -430,7 +448,7 @@ def main() -> int:
         backend_ready = False
         if not args.no_backend:
             backend.start()
-            backend_ready = _wait_for_backend(url, timeout_s=25.0)
+            backend_ready = _wait_for_backend(url, timeout_s=45.0)
         else:
             backend_ready = _wait_for_backend(url, timeout_s=4.0)
 
