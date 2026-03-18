@@ -2800,7 +2800,7 @@ export default function App() {
         if (wakeSessionTimerRef.current) clearTimeout(wakeSessionTimerRef.current);
       } catch {}
     };
-  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive, isWakePhrase, getWakeCommandRemainder, promptForRequirement]);
+  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive, isWakePhrase, getWakeCommandRemainder, promptForRequirement]);
 
   useEffect(() => {
     if (!pendingResume || !isAuthenticated || !sessionId) return;
