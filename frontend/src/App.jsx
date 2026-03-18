@@ -735,6 +735,9 @@ export default function App() {
           if (type === "device_job_result") {
             const deviceId = (msg?.device_id || "").toString();
             const jobId = (msg?.job_id || "").toString();
+            if (sourceText === "system_info") {
+              return;
+            }
             const sourceText = (msg?.source_text || "").toString();
             const results = Array.isArray(msg?.results) ? msg.results : [];
 
@@ -1221,9 +1224,12 @@ export default function App() {
         const sys = agents[0]?.capabilities?.system_info || null;
         if (sys && typeof sys === "object") {
           applySystemInfo({ status: "success", ...sys });
+          return true;
         }
+        return false;
       } catch {
         // ignore fallback errors
+        return false;
       }
     };
 
@@ -1236,11 +1242,14 @@ export default function App() {
 
     const poll = async () => {
       try {
+        // Prefer agent capability snapshot first (avoids delegated system_info jobs in cloud).
+        const fromDevice = await tryDeviceStatus();
+        if (fromDevice) return;
+
+        // Fallback path for local mode when no agent snapshot is available.
         const info = await getSystemInfo(sessionId, 2500);
         if (info && info.status === "success") {
           applySystemInfo(info);
-        } else {
-          await tryDeviceStatus();
         }
       } catch {
         // Preserve last known values and try device fallback.
@@ -2703,12 +2712,12 @@ export default function App() {
         return;
       }
 
-      // Reduce disruptive log spam; "no-speech" is common and not actionable.
-      if (errName !== "no-speech") {
+      // Reduce disruptive log spam; "no-speech"/"aborted" are common and not actionable.
+      if (errName !== "no-speech" && errName !== "aborted") {
         addLog("system", `Wake listener error: ${errName}`);
       } else {
         const now = Date.now();
-        // "no-speech" is extremely common; keep it very quiet.
+        // Common idle/transition events; keep them very quiet.
         if (now - lastWakeNoSpeechLogRef.current > 10 * 60 * 1000) {
           lastWakeNoSpeechLogRef.current = now;
           addLog("system", "Wake listener: idle (no speech)");
