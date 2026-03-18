@@ -735,10 +735,10 @@ export default function App() {
           if (type === "device_job_result") {
             const deviceId = (msg?.device_id || "").toString();
             const jobId = (msg?.job_id || "").toString();
+            const sourceText = (msg?.source_text || "").toString();
             if (sourceText === "system_info") {
               return;
             }
-            const sourceText = (msg?.source_text || "").toString();
             const results = Array.isArray(msg?.results) ? msg.results : [];
 
             let ok = 0;
