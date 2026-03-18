@@ -1274,15 +1274,22 @@ export default function App() {
       .trim();
   }, []);
 
-  const isWakePhrase = useCallback((rawTranscript, assistantName) => {
+  const getWakeCommandRemainder = useCallback((rawTranscript, assistantName) => {
     const t = normalizeWake(rawTranscript);
-    if (!t) return false;
+    if (!t) return null;
 
     const nm = normalizeWake(assistantName || "jarvis");
-    if (!nm) return false;
+    if (!nm) return null;
 
-    return t === `hey ${nm}`;
+    const onlyWakePrefix = `hey ${nm}`;
+    if (t === onlyWakePrefix) return "";
+    if (t.startsWith(`${onlyWakePrefix} `)) return t.slice(onlyWakePrefix.length).trim();
+    return null;
   }, [normalizeWake]);
+
+  const isWakePhrase = useCallback((rawTranscript, assistantName) => {
+    return getWakeCommandRemainder(rawTranscript, assistantName) !== null;
+  }, [getWakeCommandRemainder]);
 
   useEffect(() => {
     if (!isAuthenticated || !sessionId) return;
@@ -1564,6 +1571,20 @@ export default function App() {
       startWakeSessionWindow();
     }
 
+    const wakeRemainder = getWakeCommandRemainder(transcript, assistantNameRef.current || "Jarvis");
+    if (wakeRemainder !== null) {
+      startWakeSessionWindow();
+      setWakePulse(true);
+      setTimeout(() => setWakePulse(false), 900);
+      if (!wakeRemainder) {
+        addLog("system", "Wake word detected. Listening.");
+        try { wakeRecognizer.current?.start(); } catch {}
+        isHandlingCommand.current = false;
+        return;
+      }
+      transcript = wakeRemainder;
+    }
+
     addLog("input", transcript);
     const textLower = transcript.toLowerCase();
 
@@ -1582,16 +1603,6 @@ export default function App() {
         isHandlingCommand.current = false;
         return;
       }
-    }
-
-    if (isWakePhrase(transcript, assistantNameRef.current || "Jarvis")) {
-      startWakeSessionWindow();
-      setWakePulse(true);
-      setTimeout(() => setWakePulse(false), 900);
-      addLog("system", "Wake word detected. Listening.");
-      try { wakeRecognizer.current?.start(); } catch {}
-      isHandlingCommand.current = false;
-      return;
     }
 
     // Cancel latest research task
@@ -2326,7 +2337,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, isWakePhrase, promptForRequirement, resolvePermissionPromptDecision]);
+  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, getWakeCommandRemainder, promptForRequirement, resolvePermissionPromptDecision]);
 
   const startHoldToTalk = useCallback(async () => {
     if (!isAuthenticated) {
@@ -2595,11 +2606,7 @@ export default function App() {
 
           // If the user said wake-word + command in one utterance,
           // execute immediately instead of waiting for another capture step.
-          let trailingCommand = transcript;
-          const wakeName = normalizeWake(nm || "jarvis");
-          if (wakeName && trailingCommand.startsWith(wakeName)) {
-            trailingCommand = trailingCommand.slice(wakeName.length).trim();
-          }
+          const trailingCommand = getWakeCommandRemainder(rawTranscript, nm);
 
           // In biometrics mode, defer wake-session start and UI pulse until
           // we successfully capture a verified command.
@@ -2793,7 +2800,7 @@ export default function App() {
         if (wakeSessionTimerRef.current) clearTimeout(wakeSessionTimerRef.current);
       } catch {}
     };
-  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, normalizeWake, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive, isWakePhrase, promptForRequirement]);
+  }, [addLog, handleVoiceCommand, isAuthenticated, isMobile, voiceLang, voiceUnlocked, startWakeSessionWindow, voiceBiometricsActive, isWakePhrase, getWakeCommandRemainder, promptForRequirement]);
 
   useEffect(() => {
     if (!pendingResume || !isAuthenticated || !sessionId) return;
@@ -3229,7 +3236,7 @@ export default function App() {
               style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)", cursor: isAuthenticated ? "pointer" : "default" }}
             >
               <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
-                {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}' to wake up`}
+                {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}'`}
               </div>
 
             </div>
