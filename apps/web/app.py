@@ -716,7 +716,7 @@ async def _delegate_or_queue_cloud_action(
             "feature": feature,
             "device_id": did,
             "task": task,
-            "message": "PC agent is offline. Task queued and will auto-resume on reconnect.",
+            "message": "PC agent is offline. Task queued for manual resume after reconnect.",
         }
 
     job = await _dispatch_actions_to_device(did, username=username or "user", actions=actions, source_text=source_text)
@@ -2056,30 +2056,7 @@ async def agent_ws(ws: WebSocket):
 
         await ws.send_json({"type": "ack", "device_id": device_id, "status": "connected"})
 
-        # Auto-resume queued delegated tasks as soon as the agent reconnects.
-        try:
-            await _resume_queued_delegations_for_device(device_id)
-        except Exception:
-            pass
-
-        # Resume permission-blocked tasks when agent reconnects (saved permissions may auto-apply).
-        try:
-            await _resume_pending_permission_delegations_for_device(device_id)
-        except Exception:
-            pass
-
-        # If we have previously approved permissions for this device, apply them automatically.
-        try:
-            saved = _get_saved_device_permissions(device_id)
-            if saved and isinstance(saved, dict):
-                await _dispatch_actions_to_device(
-                    device_id=device_id,
-                    username="system",
-                    actions=[{"type": "agent_set_permissions", "permissions": saved}],
-                    source_text="auto_apply_permissions",
-                )
-        except Exception:
-            pass
+        # Manual mode: do not auto-resume queued/pending delegated tasks on reconnect.
 
         # Main loop
         while True:
@@ -2100,10 +2077,6 @@ async def agent_ws(ws: WebSocket):
                 caps = payload.get("capabilities") or {}
                 if isinstance(caps, dict):
                     await device_hub.update_capabilities(device_id, caps)
-                    try:
-                        await _resume_pending_permission_delegations_for_device(device_id)
-                    except Exception:
-                        pass
                 await ws.send_json({"type": "ok"})
                 continue
 
@@ -2699,7 +2672,7 @@ async def device_dispatch(req: DeviceDispatchRequest):
             "mode": "cloud",
             "device_id": did,
             "task": queued,
-            "message": "Device agent is offline. Action queued and will auto-resume on reconnect.",
+            "message": "Device agent is offline. Action queued for manual resume after reconnect.",
             "hint": "Start pc_agent.py on the target PC and ensure JARVIS_SERVER_URL and JARVIS_AGENT_SHARED_SECRET match the server.",
         }
 
@@ -3242,11 +3215,7 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
             details={"enabled": bool(enabled)},
         )
 
-    # Granting permissions should immediately retry permission-blocked tasks.
-    try:
-        await _resume_pending_permission_delegations_for_device(did)
-    except Exception:
-        pass
+    # Manual mode: permission grants do not auto-resume queued tasks.
 
     return {"status": "queued", "job": job, "device_id": did, "permissions": normalized}
 

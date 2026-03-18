@@ -190,6 +190,8 @@ export default function App() {
   const notificationsWsRef = useRef(null);
   const notificationsReconnectTimerRef = useRef(null);
   const latestResearchTaskIdRef = useRef(null);
+  const permissionPromptRef = useRef(null);
+  const permissionPromptSpokenKeyRef = useRef("");
 
   const pttControllerRef = useRef(null);
   const pttInitPromiseRef = useRef(null);
@@ -311,6 +313,140 @@ export default function App() {
       },
     });
   }, [auditRequirementEvent, buildRequirementDetails]);
+
+  useEffect(() => {
+    permissionPromptRef.current = permissionPrompt;
+  }, [permissionPrompt]);
+
+  useEffect(() => {
+    const req = permissionPrompt;
+    if (!req) return;
+
+    const key = [
+      String(req?.actionMode || "ack"),
+      String(req?.title || ""),
+      String(req?.message || ""),
+    ].join("|");
+    if (permissionPromptSpokenKeyRef.current === key) return;
+    permissionPromptSpokenKeyRef.current = key;
+
+    try {
+      const isContinueConfirm = String(req?.actionMode || "") === "confirm_resume_after_permission";
+      const spoken = isContinueConfirm
+        ? "Permission granted. Do you want me to continue the task now? Say continue or not now."
+        : `${String(req?.title || "Permission required")}. ${String(req?.message || "Additional permission is required.")} Say allow to proceed, or not now to skip.`;
+      speak(spoken);
+    } catch {}
+  }, [permissionPrompt]);
+
+  const resolvePermissionPromptDecision = useCallback(async (req, approved) => {
+    if (!req) return;
+
+    if (!approved) {
+      if (req?.actionMode === "confirm_resume_after_permission") {
+        addLog("system", "Okay, I will not continue the task now. You can resume it manually anytime.");
+        try { speak("Okay. I will wait for your manual continue command."); } catch {}
+        setPermissionPrompt(null);
+        return;
+      }
+
+      auditRequirementEvent({
+        requestedAction: String(req?.sourceText || "device_action"),
+        requirementType: String(req?.requirementType || "missing_requirement"),
+        target: String(req?.target || "system"),
+        permissionOrScope: req?.permissionOrScope || null,
+        status: "denied",
+        details: { action_mode: req?.actionMode || "ack" },
+      });
+      addLog("system", "Requirement not granted yet. I can still help with alternatives that do not need this permission.");
+      setPermissionPrompt(null);
+      return;
+    }
+
+    // Approved path
+    setPermissionPrompt(null);
+
+    if (req?.actionMode === "confirm_resume_after_permission") {
+      if (Array.isArray(req?.pendingActions) && req.pendingActions.length) {
+        await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
+        addLog("system", "Continuing your task now.");
+      } else {
+        addLog("system", "No pending action to continue.");
+      }
+      return;
+    }
+
+    if (req?.actionMode === "grant_permission" && req?.neededPermissions) {
+      const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
+      if (grantRes?.offline) {
+        addLog("system", "Permission saved. Start JarvisPCAgent.exe (or python pc_agent.py) and keep it connected. Continue manually after reconnect.");
+        setPendingResume({
+          type: "device_connection",
+          createdAt: Date.now(),
+          pendingActions: req.pendingActions || [],
+          sourceText: req.sourceText || "",
+        });
+        return;
+      }
+      if (Array.isArray(req?.pendingActions) && req.pendingActions.length) {
+        setPermissionPrompt({
+          title: "Continue Task?",
+          message: "Permission was granted. Do you want me to continue your pending task now?",
+          details: [
+            "Say Continue to run the queued action now.",
+            "Say Not now to keep it pending for manual execution.",
+          ],
+          allowLabel: "Continue",
+          denyLabel: "Not now",
+          actionMode: "confirm_resume_after_permission",
+          pendingActions: req.pendingActions || [],
+          sourceText: req.sourceText || "",
+          requirementType: "manual_confirmation",
+          target: "Pending Task",
+        });
+        addLog("system", "Permission granted. Waiting for your confirmation to continue the task.");
+      } else {
+        addLog("system", "Permission granted.");
+      }
+    } else if (req?.actionMode === "configure_device") {
+      await configureMyPc(sessionId);
+      await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
+      addLog("system", "Device configured. Resumed your original task.");
+    } else if (req?.actionMode === "wait_for_connection") {
+      setPendingResume({
+        type: "device_connection",
+        createdAt: Date.now(),
+        pendingActions: req.pendingActions || [],
+        sourceText: req.sourceText || "",
+      });
+      addLog("system", "Connection requirement noted. You can continue manually after reconnect.");
+    } else if (req?.actionMode === "retry_voice") {
+      wakeDisabledUntilRef.current = 0;
+      wakePermissionHintedRef.current = false;
+      try { wakeRecognizer.current?.start(); } catch {}
+      addLog("system", "Voice permission updated. Wake listening resumed.");
+    } else if (req?.actionMode === "retry_source_text") {
+      const src = String(req?.sourceText || "").trim();
+      if (src) {
+        await sendMessage(src, "voice", sessionId);
+        addLog("system", "Requirement resolved. Retried your original request.");
+      } else {
+        addLog("system", "Requirement acknowledged. Ready to continue once you provide the original request.");
+      }
+    } else if (Array.isArray(req?.pendingActions) && req.pendingActions.length) {
+      await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
+      addLog("system", "Requirement acknowledged. Attempting to resume your original task.");
+    }
+
+    auditRequirementEvent({
+      requestedAction: String(req?.sourceText || "device_action"),
+      requirementType: String(req?.requirementType || "missing_requirement"),
+      target: String(req?.target || "system"),
+      permissionOrScope: req?.permissionOrScope || null,
+      status: "granted",
+      details: { action_mode: req?.actionMode || "ack" },
+    });
+  }, [addLog, auditRequirementEvent, sessionId]);
 
   const buildDeviceCompletionSpeech = useCallback((results, sourceText) => {
     const rows = Array.isArray(results) ? results : [];
@@ -1422,6 +1558,23 @@ export default function App() {
     addLog("input", transcript);
     const textLower = transcript.toLowerCase();
 
+    const pendingPrompt = permissionPromptRef.current;
+    if (pendingPrompt) {
+      const isApprove = /\b(yes|yeah|yep|continue|proceed|allow|grant|approve|ok|okay|do it)\b/i.test(textLower);
+      const isDeny = /\b(no|nope|not now|later|cancel|stop|deny|don't continue|do not continue)\b/i.test(textLower);
+
+      if (isApprove || isDeny) {
+        try {
+          await resolvePermissionPromptDecision(pendingPrompt, isApprove && !isDeny);
+        } catch (err) {
+          addLog("system", `Permission decision failed: ${err?.message || err}`);
+        }
+        try { wakeRecognizer.current?.start(); } catch {}
+        isHandlingCommand.current = false;
+        return;
+      }
+    }
+
     if (isWakePhrase(transcript, assistantNameRef.current || "Jarvis")) {
       startWakeSessionWindow();
       setWakePulse(true);
@@ -2164,7 +2317,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, isWakePhrase, promptForRequirement]);
+  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, isWakePhrase, promptForRequirement, resolvePermissionPromptDecision]);
 
   const startHoldToTalk = useCallback(async () => {
     if (!isAuthenticated) {
@@ -2431,6 +2584,14 @@ export default function App() {
           }
           lastWakeDetectedAtRef.current = now;
 
+          // If the user said wake-word + command in one utterance,
+          // execute immediately instead of waiting for another capture step.
+          let trailingCommand = transcript;
+          const wakeName = normalizeWake(nm || "jarvis");
+          if (wakeName && trailingCommand.startsWith(wakeName)) {
+            trailingCommand = trailingCommand.slice(wakeName.length).trim();
+          }
+
           // In biometrics mode, defer wake-session start and UI pulse until
           // we successfully capture a verified command.
           if (!voiceBiometricsActive) {
@@ -2442,11 +2603,18 @@ export default function App() {
             setTimeout(() => setWakePulse(false), 900);
           }
 
+          if (!trailingCommand) {
+            addLog("system", "Wake word detected. Listening.");
+            return;
+          }
+
+          pendingTranscriptRef.current = trailingCommand;
+
           // stop recognizer safely so we can do single-shot capture
           try { recognizer.stop(); } catch {}
           active = false;
 
-          setTimeout(async () => await handleVoiceCommand(), 60);
+          setTimeout(async () => await handleVoiceCommand(), 20);
           return;
         }
 
@@ -2458,7 +2626,7 @@ export default function App() {
           try { recognizer.stop(); } catch {}
           active = false;
 
-          setTimeout(async () => await handleVoiceCommand(), 60);
+          setTimeout(async () => await handleVoiceCommand(), 20);
           return;
         }
       } catch (err) {
@@ -2549,14 +2717,14 @@ export default function App() {
       active = false;
       try { setWakeListeningOnline(false); } catch {}
       // restart with backoff
-      if (isAuthenticated) scheduleStart(errName === "aborted" ? 700 : 1500);
+      if (isAuthenticated) scheduleStart(errName === "aborted" ? 250 : 900);
     };
 
     recognizer.onend = () => {
       active = false;
       try { setWakeListeningOnline(false); } catch {}
       lastEventAt = Date.now();
-      if (!isHandlingCommand.current && isAuthenticated) scheduleStart(700);
+      if (!isHandlingCommand.current && isAuthenticated) scheduleStart(250);
     };
 
     // Desktop/Electron/WebView builds sometimes end up with a "stuck" recognizer
@@ -2590,7 +2758,7 @@ export default function App() {
     }, 12_000);
 
     // Start after a short delay to avoid slowing initial paint
-    const startTimer = setTimeout(safeStart, 600);
+    const startTimer = setTimeout(safeStart, 120);
     restartTimer = startTimer;
     wakeRecognizer.current = recognizer;
     addLog("system", "Wake-word listener started.");
@@ -2637,19 +2805,13 @@ export default function App() {
         const agents = Array.isArray(status?.agents) ? status.agents : [];
         if (!agents.length) return;
 
-        await dispatchDeviceActions(pendingResume.pendingActions || [], sessionId, pendingResume.sourceText || "auto_resume_after_requirement");
-        addLog("system", "Requirement satisfied. Resumed and queued your original action.");
-        try { speak("Requirement resolved. Continuing your task now."); } catch {}
-        auditRequirementEvent({
-          requestedAction: "device_action",
-          requirementType: "third_party_app_permission",
-          target: "PC Agent",
-          permissionOrScope: "agent_connection",
-          status: "granted",
-          details: { resumed: true },
+        if (pendingResume?.manual_notified) return;
+        addLog("system", "Requirement satisfied. Pending task is ready for manual resume.");
+        try { speak("Connection restored. Resume your task manually."); } catch {}
+        setPendingResume((prev) => {
+          if (!prev || prev.type !== "device_connection") return prev;
+          return { ...prev, manual_notified: true };
         });
-        setPendingResume(null);
-        setPermissionPrompt(null);
       } catch {
         // Keep polling silently.
       }
@@ -2837,76 +2999,16 @@ export default function App() {
             denyLabel={permissionPrompt.denyLabel || "Deny"}
             onDeny={() => {
               const req = permissionPrompt;
-              if (req) {
-                auditRequirementEvent({
-                  requestedAction: String(req?.sourceText || "device_action"),
-                  requirementType: String(req?.requirementType || "missing_requirement"),
-                  target: String(req?.target || "system"),
-                  permissionOrScope: req?.permissionOrScope || null,
-                  status: "denied",
-                  details: { action_mode: req?.actionMode || "ack" },
-                });
-                addLog("system", "Requirement not granted yet. I can still help with alternatives that do not need this permission.");
-              }
-              setPermissionPrompt(null);
+              if (!req) return;
+              resolvePermissionPromptDecision(req, false).catch((err) => {
+                addLog("system", `Permission decision failed: ${err?.message || err}`);
+              });
             }}
             onAllow={async () => {
               const req = permissionPrompt;
+              if (!req) return;
               try {
-                // For all other permission prompts, close the modal immediately before proceeding.
-                setPermissionPrompt(null);
-                if (req?.actionMode === "grant_permission" && req?.neededPermissions) {
-                  const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
-                  if (grantRes?.offline) {
-                    addLog("system", "Permission saved. Start JarvisPCAgent.exe (or python pc_agent.py) and keep it connected. I will resume when available.");
-                    setPendingResume({
-                      type: "device_connection",
-                      createdAt: Date.now(),
-                      pendingActions: req.pendingActions || [],
-                      sourceText: req.sourceText || "",
-                    });
-                    return;
-                  }
-                  await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
-                  addLog("system", "Permission granted. Resumed your original task.");
-                } else if (req?.actionMode === "configure_device") {
-                  await configureMyPc(sessionId);
-                  await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
-                  addLog("system", "Device configured. Resumed your original task.");
-                } else if (req?.actionMode === "wait_for_connection") {
-                  setPendingResume({
-                    type: "device_connection",
-                    createdAt: Date.now(),
-                    pendingActions: req.pendingActions || [],
-                    sourceText: req.sourceText || "",
-                  });
-                  addLog("system", "I will keep monitoring and resume automatically once the requirement is satisfied.");
-                } else if (req?.actionMode === "retry_voice") {
-                  wakeDisabledUntilRef.current = 0;
-                  wakePermissionHintedRef.current = false;
-                  try { wakeRecognizer.current?.start(); } catch {}
-                  addLog("system", "Voice permission updated. Wake listening resumed.");
-                } else if (req?.actionMode === "retry_source_text") {
-                  const src = String(req?.sourceText || "").trim();
-                  if (src) {
-                    await sendMessage(src, "voice", sessionId);
-                    addLog("system", "Requirement resolved. Retried your original request.");
-                  } else {
-                    addLog("system", "Requirement acknowledged. Ready to continue once you provide the original request.");
-                  }
-                } else if (Array.isArray(req?.pendingActions) && req.pendingActions.length) {
-                  await dispatchDeviceActions(req.pendingActions || [], sessionId, req.sourceText || "");
-                  addLog("system", "Requirement acknowledged. Attempting to resume your original task.");
-                }
-
-                auditRequirementEvent({
-                  requestedAction: String(req?.sourceText || "device_action"),
-                  requirementType: String(req?.requirementType || "missing_requirement"),
-                  target: String(req?.target || "system"),
-                  permissionOrScope: req?.permissionOrScope || null,
-                  status: "granted",
-                  details: { action_mode: req?.actionMode || "ack" },
-                });
+                await resolvePermissionPromptDecision(req, true);
               } catch (err) {
                 addLog("system", `Permission grant failed: ${err?.message || err}`);
               }
