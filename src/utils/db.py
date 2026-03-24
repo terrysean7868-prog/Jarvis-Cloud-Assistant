@@ -13,6 +13,19 @@ import threading
 import time
 import atexit
 
+try:
+    from src.ai_training.data_schemas import (
+        ensure_collection_indexes as ensure_training_collection_indexes,
+        normalize_for_collection,
+        sanitize_for_storage,
+        validate_required_fields,
+    )
+except Exception:
+    ensure_training_collection_indexes = None
+    normalize_for_collection = None
+    sanitize_for_storage = None
+    validate_required_fields = None
+
 load_dotenv()
 
 class JSONEncoder(json.JSONEncoder):
@@ -250,6 +263,38 @@ class Database:
         except Exception:
             pass
 
+        # Unified training/runtime log collections + indexes.
+        if callable(ensure_training_collection_indexes):
+            try:
+                ensure_training_collection_indexes(self.db)
+            except Exception:
+                pass
+
+    def _save_normalized_event(self, collection: str, payload: dict) -> bool:
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        if not callable(normalize_for_collection):
+            return False
+        try:
+            doc = normalize_for_collection(collection, payload)
+            if callable(validate_required_fields):
+                ok, _missing = validate_required_fields(doc)
+                if not ok:
+                    return False
+            if callable(sanitize_for_storage):
+                doc = sanitize_for_storage(doc)
+            self.db[collection].update_one({"event_id": doc.get("event_id")}, {"$set": doc}, upsert=True)
+            return True
+        except Exception:
+            return False
+
+    def log_task_event(self, payload: dict) -> bool:
+        return self._save_normalized_event("task_logs", payload)
+
+    def log_training_event(self, payload: dict) -> bool:
+        return self._save_normalized_event("training_events", payload)
+
     def _start_reconnect_thread(self):
         """Start background thread to attempt reconnection if not already running."""
         with self._reconnect_lock:
@@ -325,7 +370,28 @@ class Database:
                 'response_type': 'error' if 'error' in bot_response.lower() else 'success'
             }
         }
-        return collection.insert_one(doc)
+        result = collection.insert_one(doc)
+        try:
+            self._save_normalized_event(
+                "chat_logs",
+                {
+                    "timestamp": doc.get("timestamp"),
+                    "session_id": session_id,
+                    "user_id": (context or {}).get("user_id") if isinstance(context, dict) else "user",
+                    "correlation_id": (context or {}).get("request_id") if isinstance(context, dict) else None,
+                    "source": "chat",
+                    "mode": (context or {}).get("mode") if isinstance(context, dict) else "local",
+                    "lifecycle_state": "completed",
+                    "type": intent or "chat",
+                    "message": user_input,
+                    "user_input": user_input,
+                    "bot_response": bot_response,
+                    "context": context or {},
+                },
+            )
+        except Exception:
+            pass
+        return result
 
     def save_system_event(self, event_type, description, status, details=None):
         """
@@ -352,7 +418,41 @@ class Database:
                 'environment': env.get_str('ENVIRONMENT', 'development')
             }
         }
-        return collection.insert_one(doc)
+        result = collection.insert_one(doc)
+        try:
+            event_type_s = str(event_type or "").strip().lower()
+            status_s = str(status or "").strip().lower()
+            target_collection = "agent_logs"
+            source = "system"
+            if "task" in event_type_s:
+                target_collection = "task_logs"
+                source = "task"
+            elif "self_update" in event_type_s or "rollback" in event_type_s or "update" in event_type_s:
+                target_collection = "self_update_logs"
+            elif "training" in event_type_s or "learn" in event_type_s:
+                target_collection = "training_events"
+            elif status_s == "error" or "error" in event_type_s:
+                target_collection = "error_logs"
+
+            self._save_normalized_event(
+                target_collection,
+                {
+                    "timestamp": doc.get("timestamp"),
+                    "user_id": "system",
+                    "session_id": "system",
+                    "correlation_id": (details or {}).get("request_id") if isinstance(details, dict) else None,
+                    "source": source,
+                    "mode": "cloud" if env.get_bool("JARVIS_CLOUD_MODE", False) else "local",
+                    "lifecycle_state": status_s or "recorded",
+                    "event_type": event_type,
+                    "message": description,
+                    "details": details or {},
+                    "status": status,
+                },
+            )
+        except Exception:
+            pass
+        return result
 
     # =========================================================
     # Tasks (centralized long-running operations store)
@@ -367,6 +467,23 @@ class Database:
             if not tid:
                 return False
             self.db.tasks.update_one({"id": tid}, {"$set": task}, upsert=True)
+            try:
+                self.log_task_event(
+                    {
+                        "timestamp": datetime.now(UTC),
+                        "user_id": ((task.get("meta") or {}).get("user_id") if isinstance(task.get("meta"), dict) else None) or "system",
+                        "session_id": ((task.get("meta") or {}).get("session_id") if isinstance(task.get("meta"), dict) else None) or "unknown",
+                        "correlation_id": tid,
+                        "source": "task",
+                        "mode": "cloud" if env.get_bool("JARVIS_CLOUD_MODE", False) else "local",
+                        "lifecycle_state": task.get("status") or "recorded",
+                        "type": "task_upsert",
+                        "message": task.get("description") or tid,
+                        "task": task,
+                    }
+                )
+            except Exception:
+                pass
             return True
         except Exception:
             return False
@@ -663,6 +780,9 @@ class Database:
             status (str): Command execution status
             result (dict): Command execution result
         """
+        self._ensure_connected()
+        if self.db is None:
+            return None
         collection = self.db.voice_commands
         doc = {
             'timestamp': datetime.now(UTC),
@@ -675,7 +795,26 @@ class Database:
                 'execution_time': result.get('execution_time') if result else None
             }
         }
-        return collection.insert_one(doc)
+        res = collection.insert_one(doc)
+        try:
+            self._save_normalized_event(
+                "agent_logs",
+                {
+                    "timestamp": doc.get("timestamp"),
+                    "user_id": (result or {}).get("user") if isinstance(result, dict) else "user",
+                    "session_id": (result or {}).get("session_id") if isinstance(result, dict) else "unknown",
+                    "correlation_id": (result or {}).get("request_id") if isinstance(result, dict) else None,
+                    "source": "agent",
+                    "mode": (result or {}).get("mode") if isinstance(result, dict) else "local",
+                    "lifecycle_state": status,
+                    "type": command_type,
+                    "message": command_text,
+                    "result": result or {},
+                },
+            )
+        except Exception:
+            pass
+        return res
 
     def save_module_change(self, module_name, change_type, content, author='Jarvis'):
         """

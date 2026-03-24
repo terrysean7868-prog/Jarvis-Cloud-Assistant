@@ -16,6 +16,16 @@ from src.config.secrets import llm_secrets
 
 logger = logging.getLogger(__name__)
 
+try:
+    from src.model_ops.runtime_router import resolve_route as model_ops_resolve_route
+except Exception:
+    model_ops_resolve_route = None
+
+try:
+    from src.learning import SelfLearningEngine
+except Exception:
+    SelfLearningEngine = None
+
 # Import decision-making system
 try:
     from src.core.decision_maker import ContextAwareDecisionMaker, initialize_decision_maker
@@ -38,6 +48,7 @@ class LLMAdapter:
         # Optional smarter model for hard tasks (routing by heuristic complexity).
         # Keep PRIMARY_MODEL as a safe default to avoid breaking existing deployments.
         self.smart_model = (rd.SMART_MODEL or "").strip()
+        self.fast_model = str(os.getenv("JARVIS_FAST_MODEL", "") or "").strip()
         self.smart_model_min_complexity = int(rd.SMART_MODEL_MIN_COMPLEXITY)
         self.primary_key = llm_secrets().primary_api_key
         self.primary_endpoint = (rd.PRIMARY_ENDPOINT or "").strip()
@@ -53,6 +64,7 @@ class LLMAdapter:
             self.provider_timeout_s,
             int(os.getenv("JARVIS_LLM_PROVIDER_BUDGET_S", "16") or "16"),
         )
+        self.provider_cooldown_s = max(10, int(os.getenv("JARVIS_LLM_PROVIDER_COOLDOWN_S", "45") or "45"))
         self.timeout = aiohttp.ClientTimeout(total=self.provider_timeout_s)
         self.max_retries = 2
         # Default response budget. We dynamically increase for complex queries.
@@ -87,6 +99,13 @@ class LLMAdapter:
         self._local_reasoner_state_path = self._resolve_local_reasoner_state_path()
         self._local_reasoner_state = self._load_local_reasoner_state()
         self._local_reasoner_daily_maintenance()
+        self.model_ops_routing_enabled = str(os.getenv("JARVIS_MODEL_OPS_ROUTING_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+        self._last_model_ops_route = None
+        self._response_cache = {}
+        self._provider_fail_until: dict[str, float] = {}
+        self._last_provider_notice_at = 0.0
+        self._recent_intents: list[dict] = []
+        self.learning_engine = SelfLearningEngine(cooldown_seconds=60) if SelfLearningEngine is not None else None
 
     async def _call_ollama_chat(
         self,
@@ -700,6 +719,446 @@ class LLMAdapter:
         except Exception:
             return ""
 
+    @staticmethod
+    def _normalize_query_key(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+    def _cache_response(self, text: str, parsed: dict) -> None:
+        try:
+            key = self._normalize_query_key(text)
+            if not key:
+                return
+            cached = {
+                "text": str((parsed or {}).get("text") or "").strip(),
+                "actions": (parsed or {}).get("actions") if isinstance((parsed or {}).get("actions"), list) else [],
+                "timestamp": time.time(),
+            }
+            if not cached["text"] and not cached["actions"]:
+                return
+            self._response_cache[key] = cached
+            # Keep cache bounded.
+            if len(self._response_cache) > 80:
+                oldest = sorted(self._response_cache.items(), key=lambda it: float((it[1] or {}).get("timestamp") or 0.0))[:20]
+                for k, _ in oldest:
+                    self._response_cache.pop(k, None)
+        except Exception:
+            pass
+
+    def _get_cached_response(self, text: str, *, max_age_s: int = 900) -> dict | None:
+        try:
+            now = time.time()
+            key = self._normalize_query_key(text)
+            direct = self._response_cache.get(key)
+            if isinstance(direct, dict) and (now - float(direct.get("timestamp") or 0.0)) <= max_age_s:
+                return {
+                    "text": str(direct.get("text") or "").strip(),
+                    "actions": direct.get("actions") if isinstance(direct.get("actions"), list) else [],
+                    "source": "fallback-cached-context",
+                }
+
+            best_item = None
+            best_score = 0.0
+            for k, item in self._response_cache.items():
+                if (now - float((item or {}).get("timestamp") or 0.0)) > max_age_s:
+                    continue
+                score = self._text_similarity_score(key, k)
+                if score > best_score:
+                    best_score = score
+                    best_item = item
+
+            if isinstance(best_item, dict) and best_score >= 0.92:
+                return {
+                    "text": str(best_item.get("text") or "").strip(),
+                    "actions": best_item.get("actions") if isinstance(best_item.get("actions"), list) else [],
+                    "source": "fallback-cached-similar",
+                }
+            return None
+        except Exception:
+            return None
+
+    def _provider_available(self, provider_name: str) -> bool:
+        try:
+            name = str(provider_name or "").strip().lower()
+            if not name:
+                return True
+            until = float(self._provider_fail_until.get(name) or 0.0)
+            return time.time() >= until
+        except Exception:
+            return True
+
+    def _mark_provider_failure(self, provider_name: str) -> None:
+        try:
+            name = str(provider_name or "").strip().lower()
+            if not name:
+                return
+            self._provider_fail_until[name] = time.time() + float(self.provider_cooldown_s)
+        except Exception:
+            pass
+
+    def _mark_provider_success(self, provider_name: str) -> None:
+        try:
+            name = str(provider_name or "").strip().lower()
+            if name in self._provider_fail_until:
+                self._provider_fail_until.pop(name, None)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _knowledge_query_type(text: str) -> str:
+        t = str(text or "").strip().lower()
+        if not t:
+            return "general"
+        if re.search(r"\b(codebase|repository|repo|module|class|function|architecture|project)\b", t):
+            return "project"
+        if re.search(r"\b(debug|traceback|exception|stack|error|fail|crash|timeout)\b", t):
+            return "debug"
+        if re.search(r"\b(system|runtime|listener|routing|behavior|state|status)\b", t):
+            return "system_behavior"
+        if re.search(r"\b(task|history|last\s+task|previous\s+task|delegat)\b", t):
+            return "task_history"
+        return "general"
+
+    @staticmethod
+    def _token_set(s: str) -> set[str]:
+        return {w for w in re.findall(r"[a-z0-9]{3,}", str(s or "").lower())}
+
+    @classmethod
+    def _text_similarity_score(cls, q: str, d: str) -> float:
+        a = cls._token_set(q)
+        b = cls._token_set(d)
+        if not a or not b:
+            return 0.0
+        inter = len(a & b)
+        union = len(a | b)
+        return float(inter / union) if union else 0.0
+
+    @staticmethod
+    def _parse_iso_ts(s: str) -> datetime | None:
+        try:
+            raw = str(s or "").strip().replace("Z", "+00:00")
+            if not raw:
+                return None
+            return datetime.fromisoformat(raw)
+        except Exception:
+            return None
+
+    def _rank_rag_candidates(self, query: str, rows: list[dict], *, task_correlation_id: str = "") -> list[dict]:
+        now = datetime.now(timezone.utc)
+        scored: list[tuple[float, dict]] = []
+        qtype = self._knowledge_query_type(query)
+        for r in rows:
+            msg = str((r or {}).get("message") or "").strip()
+            if not msg:
+                continue
+            if len(msg) < 14:
+                continue
+            if re.fullmatch(r"(?i)(ok|done|ack|noted|recorded|yes|no|success|failed)\.?", msg):
+                continue
+            sim = self._text_similarity_score(query, msg)
+            ts = self._parse_iso_ts((r or {}).get("timestamp") or "")
+            recency = 0.0
+            if ts is not None:
+                try:
+                    age_h = max(0.0, (now - ts.astimezone(timezone.utc)).total_seconds() / 3600.0)
+                    recency = max(0.0, 1.0 - min(age_h / 72.0, 1.0))
+                except Exception:
+                    recency = 0.0
+            corr_bonus = 0.0
+            corr = str((r or {}).get("correlation_id") or "").strip()
+            if corr and task_correlation_id and corr == task_correlation_id:
+                corr_bonus = 0.25
+            lifecycle = str((r or {}).get("lifecycle_state") or "").strip().lower()
+            life_bonus = 0.12 if lifecycle in {"completed", "failed", "executing", "in_progress"} else 0.0
+            error_relevance = 0.0
+            if qtype == "debug":
+                row_type = str((r or {}).get("type") or "").strip().lower()
+                if row_type in {"error", "error_context", "exception"} or re.search(r"\b(error|failed|exception|traceback|timeout|denied)\b", msg.lower()):
+                    error_relevance = 0.2
+            score = (sim * 0.56) + (recency * 0.22) + corr_bonus + life_bonus + error_relevance
+            if score <= 0.03:
+                continue
+            scored.append((score, r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [r for _, r in scored]
+
+    def _short_term_memory_block(self) -> str:
+        try:
+            if not self._recent_intents:
+                return "(none)"
+            items = self._recent_intents[-3:]
+            return "\n".join(
+                [
+                    f"- intent={str(it.get('intent') or 'unknown')} task={str(it.get('task') or 'unknown')} source={str(it.get('source') or 'unknown')}"
+                    for it in items
+                ]
+            )
+        except Exception:
+            return "(none)"
+
+    def _long_term_memory_block(self, user_prefs: dict | None = None) -> str:
+        try:
+            lines = []
+            up = user_prefs if isinstance(user_prefs, dict) else {}
+            lang = str(up.get("language") or up.get("language_name") or "").strip() if up else ""
+            persona = str(up.get("persona") or "").strip() if up else ""
+            if lang:
+                lines.append(f"- preferred_language={lang}")
+            if persona:
+                lines.append(f"- preferred_persona={persona}")
+
+            st = self._local_reasoner_state if isinstance(self._local_reasoner_state, dict) else {}
+            stats = st.get("stats") if isinstance(st.get("stats"), dict) else {}
+            learn_events = int(stats.get("learn_events") or 0)
+            hits = int(stats.get("hits") or 0)
+            if learn_events or hits:
+                lines.append(f"- usage_patterns: learn_events={learn_events}, hits={hits}")
+            return "\n".join(lines) if lines else "(none)"
+        except Exception:
+            return "(none)"
+
+    def _build_delegation_hint(self, text: str, decision_hint: dict | None = None) -> str:
+        t = str(text or "").lower()
+        conf = float((decision_hint or {}).get("confidence") or 0.0) if isinstance(decision_hint, dict) else 0.0
+        if re.search(r"\b(open|close|click|type|screenshot|volume|brightness|wifi|bluetooth|app|process)\b", t):
+            if conf >= 0.65:
+                return "if device action is requested and confidence high: delegate to PC agent"
+            return "if device action is requested but confidence low: ask one focused permission/clarification before delegating"
+        return "if request is informational: answer directly; delegate only when explicit device execution is required"
+
+    @staticmethod
+    def _build_retry_suggestion(error_text: str) -> str:
+        e = str(error_text or "").lower()
+        if "timeout" in e:
+            return "Retry with a smaller scope or shorter step sequence; if still timing out, run one step at a time."
+        if "permission" in e or "denied" in e:
+            return "Verify required permission and retry after confirming access for the target action."
+        if "network" in e or "dns" in e or "connection" in e:
+            return "Check connectivity and retry once; if unstable, switch to local fallback actions."
+        if "not found" in e:
+            return "Verify the target name or path and retry using an exact identifier."
+        return "Retry once after verifying prerequisites and recent task state."
+
+    def _build_error_intelligence_hints(self, text: str, *, limit: int = 3) -> list[str]:
+        hints: list[str] = []
+        try:
+            qtype = self._knowledge_query_type(text)
+            if qtype not in {"debug", "system_behavior", "task_history"}:
+                return hints
+            db._ensure_connected()
+            if db.db is None:
+                return hints
+            q_words = [w for w in re.findall(r"[a-z0-9]{3,}", str(text or "").lower())[:8]]
+            regex = {"$regex": "|".join(re.escape(w) for w in q_words), "$options": "i"} if q_words else None
+            query = {"message": regex} if isinstance(regex, dict) else {}
+            rows = list(db.db["error_logs"].find(query, {"message": 1, "payload": 1, "timestamp": 1}).sort("timestamp", -1).limit(18))
+            for row in rows:
+                msg = str((row or {}).get("message") or "").strip()
+                if not msg:
+                    continue
+                payload = (row or {}).get("payload") if isinstance((row or {}).get("payload"), dict) else {}
+                cause = str(payload.get("cause") or payload.get("reason") or payload.get("error_type") or "unknown").strip()
+                retry = self._build_retry_suggestion(msg + " " + cause)
+                hints.append(f"error={msg[:120]} | cause={cause[:80]} | fix={retry}")
+                if len(hints) >= max(1, int(limit)):
+                    break
+        except Exception:
+            return hints
+        return hints
+
+    def _build_actionable_fallback_text(self, text: str) -> str:
+        t = str(text or "").strip().lower()
+        if re.search(r"\b(debug|error|traceback|exception|fail|timeout)\b", t):
+            return (
+                "Provider is unavailable right now. Share the exact error line and I will return a likely cause and fix checklist, "
+                "or ask me to run a minimal retry plan."
+            )
+        if re.search(r"\b(task|plan|workflow|steps|delegate)\b", t):
+            return (
+                "Provider is unavailable right now. I can still generate a deterministic step-by-step task plan and safe execution actions."
+            )
+        if re.search(r"\b(project|repo|codebase|architecture)\b", t):
+            return (
+                "Provider is unavailable right now. I can still do a deterministic project analysis pass using indexed context and recent logs."
+            )
+        return (
+            "Provider is unavailable right now. I can still handle deterministic local actions and concise fallback answers."
+        )
+
+    def _fetch_recent_runtime_context(self, text: str, *, limit: int = 3, include_rag: bool = True) -> dict:
+        out = {
+            "recent_chat": [],
+            "rag_context": [],
+            "last_task_outcome": "",
+            "last_task_correlation_id": "",
+            "error_fix_hints": [],
+            "learning_hints": [],
+            "cached_best_response": "",
+        }
+        try:
+            db._ensure_connected()
+            if db.db is None:
+                return out
+
+            for row in db.db["chat_logs"].find({}, {"message": 1, "timestamp": 1}).sort("timestamp", -1).limit(max(1, int(limit))):
+                msg = str((row or {}).get("message") or "").strip()
+                if msg:
+                    out["recent_chat"].append(msg)
+
+            qtype = self._knowledge_query_type(text)
+            rag_collections: tuple[str, ...] = ()
+            if include_rag and qtype == "project":
+                rag_collections = ("training_events", "agent_logs", "chat_logs")
+            elif include_rag and qtype == "debug":
+                rag_collections = ("error_logs", "task_logs", "agent_logs")
+            elif include_rag and qtype == "system_behavior":
+                rag_collections = ("agent_logs", "task_logs", "training_events")
+            elif include_rag and qtype == "task_history":
+                rag_collections = ("task_logs", "agent_logs", "chat_logs")
+
+            q_words = [w for w in re.findall(r"[a-z0-9]{3,}", str(text or "").lower())[:8]]
+            candidates: list[dict] = []
+            if rag_collections and q_words:
+                pattern = "|".join(re.escape(w) for w in q_words)
+                regex = {"$regex": pattern, "$options": "i"}
+                for cname in rag_collections:
+                    rows = db.db[cname].find(
+                        {"message": regex},
+                        {"message": 1, "timestamp": 1, "correlation_id": 1, "lifecycle_state": 1, "type": 1, "source": 1},
+                    ).sort("timestamp", -1).limit(14)
+                    for row in rows:
+                        d = dict(row or {})
+                        d["collection"] = cname
+                        candidates.append(d)
+
+            task_row = db.db["task_logs"].find_one(
+                {"lifecycle_state": {"$in": ["completed", "failed", "stopped"]}},
+                sort=[("timestamp", -1)],
+            )
+            if isinstance(task_row, dict):
+                st = str(task_row.get("result_status") or task_row.get("lifecycle_state") or "recorded").strip()
+                msg = str(task_row.get("message") or "").strip()
+                corr = str(task_row.get("correlation_id") or "").strip()
+                if corr:
+                    out["last_task_correlation_id"] = corr
+                if msg:
+                    out["last_task_outcome"] = f"{st}: {msg}"
+
+            if candidates:
+                ranked = self._rank_rag_candidates(
+                    str(text or ""),
+                    candidates,
+                    task_correlation_id=str(out.get("last_task_correlation_id") or ""),
+                )
+                total_chars = 0
+                for row in ranked[:4]:
+                    m = str((row or {}).get("message") or "").strip()
+                    if not m:
+                        continue
+                    if len(m) < 14 or re.search(r"\b(ok|done|ack|noted|recorded|yes|no)\b", m.strip().lower()):
+                        continue
+                    source = str((row or {}).get("source") or (row or {}).get("collection") or "ctx").strip()
+                    life = str((row or {}).get("lifecycle_state") or "recorded").strip()
+                    line = f"[{source}|{life}] {m[:220]}"
+                    if total_chars + len(line) > 760:
+                        break
+                    out["rag_context"].append(line)
+                    total_chars += len(line)
+
+            out["error_fix_hints"] = self._build_error_intelligence_hints(text, limit=3)
+            if self.learning_engine is not None:
+                out["learning_hints"] = self.learning_engine.get_learning_hints(text, limit=3)
+                out["cached_best_response"] = self.learning_engine.get_cached_best_response(text) or ""
+        except Exception:
+            return out
+        return out
+
+    @staticmethod
+    def _build_reasoning_hint(text: str) -> str:
+        t = str(text or "").strip().lower()
+        if not t:
+            return "none"
+        system_action = bool(re.search(r"\b(open|close|run|execute|click|type|settings|volume|brightness|wifi|bluetooth|screenshot|task|automation)\b", t))
+        if system_action:
+            return "detect intent -> plan steps -> route/delegate safely -> execute -> respond with result and next step"
+        return "detect intent -> plan concise answer -> respond with only relevant details"
+
+    @staticmethod
+    def _first_sentences(text: str, *, max_sentences: int = 2) -> str:
+        s = str(text or "").strip()
+        if not s:
+            return s
+        parts = re.split(r"(?<=[.!?])\s+", s)
+        return " ".join([p.strip() for p in parts[:max_sentences] if p.strip()]).strip()
+
+    def _naturalize_response_text(self, user_text: str, text: str, *, actions: list[dict] | None = None) -> str:
+        txt = str(text or "").strip()
+        if not txt:
+            return txt
+
+        # Remove stiff lead-ins that make replies feel robotic.
+        txt = re.sub(
+            r"(?i)^\s*(certainly|of course|sure(?: thing)?|absolutely|definitely|understood|noted)\s*[:,\-]\s*",
+            "",
+            txt,
+        ).strip()
+
+        txt = re.sub(r"\s{2,}", " ", txt).strip()
+        complexity = self._estimate_complexity(user_text, "chat")
+        qtype = self._knowledge_query_type(user_text)
+        has_actions = bool(isinstance(actions, list) and actions)
+
+        # Keep simple conversational queries short and direct.
+        if complexity == 0 and not has_actions and qtype == "general":
+            txt = self._first_sentences(txt, max_sentences=2)
+            if len(txt) > 220:
+                txt = txt[:220].rstrip(" ,.;:") + "."
+
+        # Optional follow-up suggestion for longer informational replies.
+        if complexity >= 1 and not has_actions and qtype in {"general", "project", "task_history"}:
+            low = txt.lower()
+            if "if you want" not in low and "want me to" not in low:
+                txt = txt.rstrip()
+                if txt and txt[-1] not in ".!?":
+                    txt += "."
+                txt += " If you want, I can give a short next-step plan."
+
+        return txt
+
+    def _sanitize_output_text(self, user_text: str, parsed: dict) -> dict:
+        out = dict(parsed or {})
+        txt = str(out.get("text") or "").strip()
+        if not txt:
+            return out
+
+        actions = out.get("actions") if isinstance(out.get("actions"), list) else []
+        has_url_action = any(
+            isinstance(a, dict) and str(a.get("type") or "").strip().lower() in {"open_url", "fetch_url", "web_search"}
+            for a in actions
+        )
+        user_wants_url = bool(re.search(r"\b(url|link|website|site|open\s+http|https?://)\b", str(user_text or "").lower()))
+
+        # Remove unsolicited URLs/markdown links from free-text replies to keep responses relevant.
+        if not has_url_action and not user_wants_url:
+            txt = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", txt)
+            txt = re.sub(r"https?://\S+", "", txt).strip()
+            txt = re.sub(r"\s{2,}", " ", txt).strip()
+
+        qtype = self._knowledge_query_type(user_text)
+        if qtype in {"debug", "system_behavior"}:
+            low = txt.lower()
+            if "cause:" not in low or "fix:" not in low or "next step:" not in low:
+                clean = txt.strip() or "Issue detected."
+                txt = (
+                    "Cause: " + clean + "\n"
+                    "Fix: Apply the smallest safe correction and verify with one retry.\n"
+                    "Next step: Share the exact failing line/output for a targeted patch."
+                )
+        else:
+            txt = self._naturalize_response_text(user_text, txt, actions=actions)
+
+        out["text"] = txt
+        return out
+
     async def _ensure_session(self):
         if not self.session:
             self.session = aiohttp.ClientSession(timeout=self.timeout)
@@ -804,14 +1263,45 @@ class LLMAdapter:
     def _choose_model_for_request(self, text: str, mode: str) -> str:
         """Route to a stronger model for complex tasks when configured."""
         try:
+            complexity = self._estimate_complexity(text, mode)
+            if self.fast_model and complexity == 0 and (mode or "").lower() != "voice":
+                return self.fast_model
             if not self.smart_model:
                 return self.primary_model
-            complexity = self._estimate_complexity(text, mode)
             if complexity >= self.smart_model_min_complexity:
                 return self.smart_model
         except Exception:
             pass
         return self.primary_model
+
+    @staticmethod
+    def _map_model_id_to_runtime_model(model_id: str, *, primary_model: str, smart_model: str, backup_model: str) -> str:
+        mid = str(model_id or "").strip().lower()
+        mapping = {
+            "ollama_llama3_1_8b": "llama3.1:8b",
+            "ollama_qwen2_5_7b": "qwen2.5:7b",
+            "openai_compatible_primary": primary_model or smart_model,
+            "openai_compatible_backup": backup_model or primary_model,
+            "local_tiny_fallback": "local-fast-path",
+        }
+        resolved = mapping.get(mid)
+        if resolved:
+            return resolved
+        return model_id or primary_model
+
+    def _resolve_model_ops_route(self, text: str, mode: str) -> dict | None:
+        if not self.model_ops_routing_enabled:
+            return None
+        if not callable(model_ops_resolve_route):
+            return None
+        try:
+            route = model_ops_resolve_route(text=text, mode=mode)
+            if isinstance(route, dict):
+                self._last_model_ops_route = route
+                return route
+        except Exception:
+            return None
+        return None
 
     @staticmethod
     def _looks_uncertain(reply_text: str) -> bool:
@@ -856,14 +1346,14 @@ class LLMAdapter:
 
         if re.match(r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+jarvis)?([\s!?.]*)$", tl):
             return {
-                "text": "Hey! I am online. I can help with chat, research prompts, and connected PC actions.",
+                "text": "Hey, I am here. I can help with chat, research, and connected PC actions.",
                 "actions": [],
                 "source": "deterministic-local-chat",
             }
 
         if "what can you do" in tl or "capabilit" in tl:
             return {
-                "text": "I can chat, answer questions, run research prompts, and trigger connected PC actions like opening apps, URLs, screenshots, and automation tasks when permissions are granted.",
+                "text": "I can answer questions, do quick research, and run connected PC actions like opening apps, URLs, screenshots, and safe automations when permissions allow.",
                 "actions": [],
                 "source": "deterministic-local-chat",
             }
@@ -2814,134 +3304,239 @@ Style tone: {tone}.
         if cycle_ctx:
             effective_context = (cycle_ctx + "\n\n" + effective_context).strip()
 
+        complexity = self._estimate_complexity(text, mode)
+        qtype = self._knowledge_query_type(text)
+        include_rag = bool(complexity >= 1 and qtype in {"project", "debug", "system_behavior", "task_history"})
+        runtime_ctx = self._fetch_recent_runtime_context(text, limit=3, include_rag=include_rag)
+        cached_best = str((runtime_ctx or {}).get("cached_best_response") or "").strip()
+        if cached_best and complexity == 0:
+            return {
+                "text": cached_best,
+                "actions": [],
+                "source": "learning-memory-cache",
+            }
+        if complexity == 0:
+            cached_quick = self._get_cached_response(text, max_age_s=600)
+            if isinstance(cached_quick, dict) and not (cached_quick.get("actions") or []):
+                cached_quick["source"] = "fast-cache"
+                return cached_quick
+        reasoning_hint = self._build_reasoning_hint(text)
+        short_mem = self._short_term_memory_block()
+        long_mem = self._long_term_memory_block(user_prefs=user_prefs)
+        delegation_hint = self._build_delegation_hint(text, decision_hint=decision_hint)
+
         def _build_user_prompt(context_window: int) -> str:
             clipped_ctx = effective_context[-context_window:] if effective_context else "(none)"
-            return f"""
-User said: "{text}"
-
-Context:
-    {clipped_ctx}
-
-Return ONLY valid JSON matching:
-{{
-  "text": "...",
-  "actions": [{{"type": "..."}}]
-}}
-"""
+            recent_chat = "\n".join(f"- {x}" for x in (runtime_ctx.get("recent_chat") or [])[:3]) or "(none)"
+            rag_context = "\n".join(f"- {x}" for x in (runtime_ctx.get("rag_context") or [])[:4]) or "(none)"
+            last_task_outcome = str(runtime_ctx.get("last_task_outcome") or "(none)")
+            error_fix_hints = "\n".join(f"- {x}" for x in (runtime_ctx.get("error_fix_hints") or [])[:3]) or "(none)"
+            learning_hints = "\n".join(f"- {x}" for x in (runtime_ctx.get("learning_hints") or [])[:3]) or "(none)"
+            return (
+                "[USER_QUERY]\n"
+                f"{text}\n\n"
+                "[RECENT_CHAT_CONTEXT]\n"
+                f"{recent_chat}\n\n"
+                "[RAG_CONTEXT]\n"
+                f"{rag_context}\n\n"
+                "[LAST_TASK_OUTCOME]\n"
+                f"{last_task_outcome}\n\n"
+                "[SHORT_TERM_MEMORY]\n"
+                f"{short_mem}\n\n"
+                "[LONG_TERM_MEMORY]\n"
+                f"{long_mem}\n\n"
+                "[RUNTIME_REASONING_HINT]\n"
+                f"{reasoning_hint}\n\n"
+                "[DELEGATION_POLICY_HINT]\n"
+                f"{delegation_hint}\n\n"
+                "[ERROR_FIX_HINTS]\n"
+                f"{error_fix_hints}\n\n"
+                "[LEARNING_HINTS]\n"
+                f"{learning_hints}\n\n"
+                "[EXTERNAL_CONTEXT]\n"
+                f"{clipped_ctx}\n\n"
+                "Return ONLY valid JSON matching:\n"
+                "{\n"
+                "  \"text\": \"...\",\n"
+                "  \"actions\": [{\"type\": \"...\"}]\n"
+                "}\n"
+            )
 
         try:
             start = datetime.now(timezone.utc)
             chosen_model = self._choose_model_for_request(text=text, mode=mode)
-            prompt_windows = [2400, 1400, 800]
+            chosen_provider = str(self.provider or "openai_compatible").strip().lower()
+            route = self._resolve_model_ops_route(text=text, mode=mode)
+            route_task_type = None
+            route_profile = None
+            route_fallback = None
+            if isinstance(route, dict):
+                route_task_type = route.get("task_type")
+                route_profile = route.get("profile")
+                p = route.get("primary") if isinstance(route.get("primary"), dict) else {}
+                f = route.get("fallback") if isinstance(route.get("fallback"), dict) else {}
+                p_model_id = str(p.get("model_id") or "").strip()
+                p_provider = str(p.get("provider") or "").strip().lower()
+                if p_model_id:
+                    chosen_model = self._map_model_id_to_runtime_model(
+                        p_model_id,
+                        primary_model=str(self.primary_model or ""),
+                        smart_model=str(self.smart_model or ""),
+                        backup_model=str(self.backup_model or ""),
+                    )
+                if p_provider:
+                    chosen_provider = p_provider
+                route_fallback = f
+
+            prompt_windows = [1200, 800] if complexity == 0 else [2000, 1200, 800]
             budget_started = time.monotonic()
+            request_budget_s = min(float(self.provider_budget_s), 9.0) if complexity == 0 else float(self.provider_budget_s)
+            request_timeout_s = min(float(self.provider_timeout_s), 6.0) if complexity == 0 else float(self.provider_timeout_s)
+            max_primary_attempts = 1 if complexity == 0 else len(prompt_windows)
 
             logger.info(
-                "[llm.request] mode=%s provider=%s model=%s budget_s=%s",
+                "[llm.request] mode=%s provider=%s model=%s budget_s=%s task_type=%s profile=%s",
                 str(mode or "chat"),
-                str(self.provider or ""),
+                str(chosen_provider or ""),
                 str(chosen_model or ""),
-                str(self.provider_budget_s),
+                str(request_budget_s),
+                str(route_task_type or "unknown"),
+                str(route_profile or "default"),
             )
 
             response = None
             provider_source = "openai"
             routed_model = chosen_model
             last_err = None
+            primary_provider_name = "ollama" if chosen_provider in {"ollama", "local_model"} else "openai"
 
             # Primary provider retries with progressively smaller context windows.
-            for attempt, ctx_window in enumerate(prompt_windows):
-                elapsed = time.monotonic() - budget_started
-                remaining = max(0.0, float(self.provider_budget_s) - elapsed)
-                if remaining <= 0.0:
-                    last_err = TimeoutError("provider budget exhausted before primary response")
-                    logger.warning("[llm.provider.timeout] stage=primary reason=budget_exhausted")
-                    break
-                try:
-                    user_prompt = _build_user_prompt(ctx_window)
-                    if self.provider == "ollama":
-                        provider_source = "ollama"
-                        routed_model = chosen_model
-                        logger.info(
-                            "[llm.provider.start] provider=ollama attempt=%s ctx_window=%s remaining_s=%.2f",
-                            attempt + 1,
-                            ctx_window,
-                            remaining,
-                        )
-                        response = await asyncio.wait_for(
-                            self._call_ollama_chat(
-                                [
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": user_prompt},
-                                ],
-                                temperature=temperature,
-                                model=chosen_model,
-                                endpoint=self.primary_endpoint,
-                            ),
-                            timeout=max(1.0, min(float(self.provider_timeout_s), remaining)),
-                        )
-                    else:
-                        provider_source = "openai"
-                        routed_model = chosen_model
-                        logger.info(
-                            "[llm.provider.start] provider=openai attempt=%s ctx_window=%s remaining_s=%.2f",
-                            attempt + 1,
-                            ctx_window,
-                            remaining,
-                        )
-                        response = await asyncio.wait_for(
-                            self._call_openai(
-                                [
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": user_prompt},
-                                ],
-                                max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
-                                temperature=temperature,
-                                model=chosen_model,
-                                endpoint=self.primary_endpoint,
-                                api_key=self.primary_key,
-                            ),
-                            timeout=max(1.0, min(float(self.provider_timeout_s), remaining)),
-                        )
-                    break
-                except Exception as e_primary:
-                    last_err = e_primary
-                    logger.warning(
-                        "[llm.provider.fail] provider=%s attempt=%s error=%s",
-                        "ollama" if self.provider == "ollama" else "openai",
-                        attempt + 1,
-                        str(e_primary),
-                    )
-                    print(f"[LLM WARN] Primary provider failed (attempt {attempt + 1}): {e_primary}")
-                    if attempt >= 1 and not self._is_transient_provider_error(e_primary):
+            if self._provider_available(primary_provider_name):
+                for attempt, ctx_window in enumerate(prompt_windows[:max_primary_attempts]):
+                    elapsed = time.monotonic() - budget_started
+                    remaining = max(0.0, float(request_budget_s) - elapsed)
+                    if remaining <= 0.0:
+                        last_err = TimeoutError("provider budget exhausted before primary response")
+                        logger.warning("[llm.provider.timeout] stage=primary reason=budget_exhausted")
                         break
+                    try:
+                        user_prompt = _build_user_prompt(ctx_window)
+                        if chosen_provider in {"ollama", "local_model"}:
+                            provider_source = "ollama"
+                            routed_model = chosen_model
+                            logger.info(
+                                "[llm.provider.start] provider=ollama attempt=%s ctx_window=%s remaining_s=%.2f",
+                                attempt + 1,
+                                ctx_window,
+                                remaining,
+                            )
+                            response = await asyncio.wait_for(
+                                self._call_ollama_chat(
+                                    [
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": user_prompt},
+                                    ],
+                                    temperature=temperature,
+                                    model=chosen_model,
+                                    endpoint=self.primary_endpoint,
+                                ),
+                                timeout=max(1.0, min(float(request_timeout_s), remaining)),
+                            )
+                        else:
+                            provider_source = "openai"
+                            routed_model = chosen_model
+                            logger.info(
+                                "[llm.provider.start] provider=openai attempt=%s ctx_window=%s remaining_s=%.2f",
+                                attempt + 1,
+                                ctx_window,
+                                remaining,
+                            )
+                            response = await asyncio.wait_for(
+                                self._call_openai(
+                                    [
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": user_prompt},
+                                    ],
+                                    max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
+                                    temperature=temperature,
+                                    model=chosen_model,
+                                    endpoint=self.primary_endpoint,
+                                    api_key=self.primary_key,
+                                ),
+                                timeout=max(1.0, min(float(request_timeout_s), remaining)),
+                            )
+                        self._mark_provider_success(primary_provider_name)
+                        break
+                    except Exception as e_primary:
+                        last_err = e_primary
+                        logger.warning(
+                            "[llm.provider.fail] provider=%s attempt=%s error=%s",
+                            "ollama" if chosen_provider in {"ollama", "local_model"} else "openai",
+                            attempt + 1,
+                            str(e_primary),
+                        )
+                        print(f"[LLM WARN] Primary provider failed (attempt {attempt + 1}): {e_primary}")
+                        if attempt >= 1 and not self._is_transient_provider_error(e_primary):
+                            break
+                if response is None:
+                    self._mark_provider_failure(primary_provider_name)
+            else:
+                last_err = Exception(f"primary provider cooling down: {primary_provider_name}")
+                logger.info("[llm.provider.skip] provider=%s reason=cooldown", primary_provider_name)
 
             # Fallback provider (Groq/OpenAI-compatible) with compact context.
             if response is None:
-                if not self.backup_key:
+                fallback_provider = "groq"
+                fallback_model = self.backup_model
+                if isinstance(route_fallback, dict):
+                    fb_provider = str(route_fallback.get("provider") or "").strip().lower()
+                    fb_model_id = str(route_fallback.get("model_id") or "").strip()
+                    if fb_provider:
+                        fallback_provider = fb_provider
+                    if fb_model_id:
+                        fallback_model = self._map_model_id_to_runtime_model(
+                            fb_model_id,
+                            primary_model=str(self.primary_model or ""),
+                            smart_model=str(self.smart_model or ""),
+                            backup_model=str(self.backup_model or ""),
+                        )
+
+                if fallback_provider in {"fallback", "local_model"}:
+                    raise last_err or Exception("Primary provider failed and deterministic fallback selected")
+
+                if not self._provider_available(fallback_provider):
+                    raise last_err or Exception(f"Backup provider cooling down: {fallback_provider}")
+
+                if not self.backup_key and fallback_provider in {"groq", "openai_compatible", "openai"}:
                     raise last_err or Exception("Primary provider failed")
                 elapsed = time.monotonic() - budget_started
-                remaining = max(0.0, float(self.provider_budget_s) - elapsed)
+                remaining = max(0.0, float(request_budget_s) - elapsed)
                 if remaining <= 0.0:
                     raise TimeoutError("provider budget exhausted before fallback response")
-                provider_source = "groq"
-                routed_model = self.backup_model
+                provider_source = "groq" if fallback_provider in {"groq", "openai_compatible", "openai"} else fallback_provider
+                routed_model = fallback_model
                 fallback_prompt = _build_user_prompt(prompt_windows[-1])
-                logger.info("[llm.provider.start] provider=groq attempt=1 remaining_s=%.2f", remaining)
-                response = await asyncio.wait_for(
-                    self._call_openai(
-                        [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": fallback_prompt},
-                        ],
-                        max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
-                        temperature=temperature,
-                        model=self.backup_model,
-                        endpoint=self.backup_endpoint,
-                        api_key=self.backup_key,
-                    ),
-                    timeout=max(1.0, min(float(self.provider_timeout_s), remaining)),
-                )
-            if self.provider == "ollama" and isinstance(response, dict):
+                logger.info("[llm.provider.start] provider=%s attempt=1 remaining_s=%.2f", provider_source, remaining)
+                try:
+                    response = await asyncio.wait_for(
+                        self._call_openai(
+                            [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": fallback_prompt},
+                            ],
+                            max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
+                            temperature=temperature,
+                            model=fallback_model,
+                            endpoint=self.backup_endpoint,
+                            api_key=self.backup_key,
+                        ),
+                        timeout=max(1.0, min(float(request_timeout_s), remaining)),
+                    )
+                    self._mark_provider_success(fallback_provider)
+                except Exception:
+                    self._mark_provider_failure(fallback_provider)
+                    raise
+            if chosen_provider in {"ollama", "local_model"} and isinstance(response, dict):
                 msg = response.get("message") or {}
                 content = str(msg.get("content") or "").strip()
             else:
@@ -2966,6 +3561,8 @@ Return ONLY valid JSON matching:
                 parsed["text"] = content
             if "actions" not in parsed:
                 parsed["actions"] = []
+
+            parsed = self._sanitize_output_text(text, parsed)
 
             # Post-process: if user asked to write/type in an app, ensure we emit type_text.
             # This makes the system robust even when the LLM returns only open_app.
@@ -3056,6 +3653,34 @@ Return ONLY valid JSON matching:
             except Exception:
                 pass
 
+            # Error intelligence: when no actions are needed for debug/system reasoning,
+            # ensure actionable cause/fix/next-step guidance from recent error signals.
+            try:
+                qtype = self._knowledge_query_type(text)
+                no_actions = not isinstance(parsed.get("actions"), list) or not parsed.get("actions")
+                if no_actions and qtype in {"debug", "system_behavior", "task_history"}:
+                    hints = runtime_ctx.get("error_fix_hints") if isinstance(runtime_ctx, dict) else []
+                    if isinstance(hints, list) and hints:
+                        top = str(hints[0]).strip()
+                        cause = top
+                        fix = "Apply the smallest safe corrective step and retry once."
+                        m = re.search(r"cause=([^|]+)", top, flags=re.IGNORECASE)
+                        if m:
+                            cause = m.group(1).strip()
+                        m = re.search(r"fix=([^|]+)", top, flags=re.IGNORECASE)
+                        if m:
+                            fix = m.group(1).strip()
+                        parsed["text"] = (
+                            f"Cause: {cause}\n"
+                            "Fix steps:\n"
+                            f"1) {fix}\n"
+                            "2) Re-run the failing command once to confirm.\n"
+                            "3) Capture the first traceback/error line if it still fails.\n"
+                            "Next step: Share that first failing line for a targeted patch."
+                        )
+            except Exception:
+                pass
+
             # Attach emotion hint for UI (optional).
             try:
                 if "emotion" not in parsed:
@@ -3076,6 +3701,8 @@ Return ONLY valid JSON matching:
                 "provider": provider_source,
                 "model": routed_model,
                 "fallback_used": provider_source in {"groq"},
+                "task_type": route_task_type,
+                "deployment_profile": route_profile,
             }
             logger.info(
                 "[llm.response] source=%s latency=%s fallback_used=%s",
@@ -3083,6 +3710,39 @@ Return ONLY valid JSON matching:
                 parsed.get("latency"),
                 str(provider_source in {"groq"}),
             )
+
+            try:
+                if self.learning_engine is not None:
+                    self.learning_engine.record_model_performance(
+                        task_type=str(route_task_type or self._knowledge_query_type(text) or "simple_chat"),
+                        model_id=str(routed_model or chosen_model or "unknown"),
+                        provider=str(provider_source or chosen_provider or "unknown"),
+                        success=True,
+                        latency_ms=float(max(0.0, latency * 1000.0)),
+                        fallback_used=bool(provider_source in {"groq", "fallback"}),
+                        error_kind=None,
+                    )
+            except Exception:
+                pass
+
+            try:
+                self._cache_response(text, parsed)
+            except Exception:
+                pass
+
+            try:
+                self._recent_intents.append(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "intent": self._knowledge_query_type(text),
+                        "task": route_task_type or "unknown",
+                        "source": provider_source,
+                    }
+                )
+                if len(self._recent_intents) > 12:
+                    self._recent_intents = self._recent_intents[-12:]
+            except Exception:
+                pass
 
             self._learn_from_actions(text, parsed.get("actions") or [])
 
@@ -3092,6 +3752,20 @@ Return ONLY valid JSON matching:
         except Exception as e:
             print(f"[LLM ERROR] {e}")
             db.save_system_event("llm_error", str(e), "error")
+
+            try:
+                if self.learning_engine is not None:
+                    self.learning_engine.record_model_performance(
+                        task_type=str(self._knowledge_query_type(text) or "simple_chat"),
+                        model_id=str((self._last_model_ops_route or {}).get("primary", {}).get("model_id") or self.primary_model or "unknown"),
+                        provider=str((self._last_model_ops_route or {}).get("primary", {}).get("provider") or self.provider or "unknown"),
+                        success=False,
+                        latency_ms=0.0,
+                        fallback_used=False,
+                        error_kind=str(e.__class__.__name__ or "provider_error"),
+                    )
+            except Exception:
+                pass
 
             # If the model call failed (often due to rate limits) but the request is clearly
             # time-sensitive / web-required, trigger a web lookup instead of returning a vague fallback.
@@ -3132,6 +3806,16 @@ Return ONLY valid JSON matching:
                         "actions": [{"type": "web_search", "query": q, "num_results": 5}],
                         "source": "fallback-web",
                     }
+            except Exception:
+                pass
+
+            # Cached-context fallback for short/simple prompts when providers fail.
+            try:
+                simple = bool(re.fullmatch(r"[\w\s?.!,:+\-/*]{1,180}", str(text or "").strip()))
+                if simple:
+                    cached = self._get_cached_response(text)
+                    if isinstance(cached, dict):
+                        return cached
             except Exception:
                 pass
 
@@ -3266,12 +3950,16 @@ Return ONLY valid JSON matching:
             # Fallback humanlike reply
             # IMPORTANT: This is returned when the model call/parsing fails.
             # Avoid "thinking..." style filler that looks like a pending response.
+            now = time.time()
+            if (now - float(self._last_provider_notice_at or 0.0)) < 90.0:
+                return {
+                    "text": self._build_actionable_fallback_text(text),
+                    "actions": [],
+                    "source": "fallback",
+                }
+            self._last_provider_notice_at = now
             return {
-                "text": (
-                    "I couldn't generate a response right now (AI provider unavailable or misconfigured). "
-                    "Please try again in a moment. If this keeps happening, check your API key/network "
-                    "(env: OPENAI_API_KEY/PRIMARY_API_KEY; fallback: GROQ_API_KEY/BACKUP_API_KEY)."
-                ),
+                "text": self._build_actionable_fallback_text(text),
                 "actions": [],
                 "source": "fallback",
             }

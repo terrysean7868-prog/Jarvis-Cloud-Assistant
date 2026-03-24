@@ -588,6 +588,39 @@ export async function getSelfImprovementProposals(sessionId = null, timeoutMs = 
   return await res.json();
 }
 
+export async function getSelfImprovementSuggestions(sessionId = null, limit = 100, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  if (sessionId) qs.set("session_id", String(sessionId));
+  qs.set("limit", String(limit || 100));
+  const url = `${API_URL}/api/self-improvement/suggestions${qs.toString() ? `?${qs.toString()}` : ""}`;
+
+  const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
+export async function getLearningMetrics(sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
+  const qs = new URLSearchParams();
+  if (sessionId) qs.set("session_id", String(sessionId));
+  const url = `${API_URL}/api/learning/metrics${qs.toString() ? `?${qs.toString()}` : ""}`;
+
+  const res = await timeoutFetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  }, timeoutMs);
+
+  if (!res.ok) {
+    await throwHttpError(res);
+  }
+  return await res.json();
+}
+
 export async function decideSelfImprovementProposal(proposalId, decision, sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
   const body = {
     proposal_id: String(proposalId || "").trim(),

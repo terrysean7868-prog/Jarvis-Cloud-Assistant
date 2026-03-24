@@ -55,6 +55,8 @@
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
   gap: 12px;
+  min-width: 0;
+  align-items: stretch;
 }
 
 .anatomy-grid {
@@ -80,6 +82,10 @@
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 12px;
   padding: 12px;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel-title {
@@ -150,6 +156,7 @@
   gap: 8px;
   max-height: 320px;
   overflow: auto;
+  min-width: 0;
 }
 
 .panel-item {
@@ -157,6 +164,7 @@
   border-radius: 10px;
   padding: 9px;
   background: rgba(0, 0, 0, 0.3);
+  min-width: 0;
 }
 
 .panel-item h4 {
@@ -168,6 +176,7 @@
   margin: 0;
   font-size: 12px;
   color: rgba(192, 224, 244, 0.95);
+  overflow-wrap: anywhere;
 }
 
 .graph-wrap {
@@ -187,6 +196,8 @@
   overflow: auto;
   white-space: pre-wrap;
   font-size: 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 1024px) {
@@ -196,5 +207,9 @@
     right: 8px;
     bottom: 8px;
     border-radius: 12px;
+  }
+
+  .panel-row .panel-btn {
+    flex: 1 1 100%;
   }
 }

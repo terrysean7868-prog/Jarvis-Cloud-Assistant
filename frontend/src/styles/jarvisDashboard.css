@@ -319,6 +319,7 @@
   justify-content: center;
   min-height: 0;
   height: 100%;
+  width: 100%;
 }
 
 .jd-right .jd-panel:last-child .jd-panelBody {
@@ -330,10 +331,12 @@
 .jd-hexPickerWrap {
   width: 190px;
   max-width: 100%;
+  max-height: 100%;
   padding: 0;
   border-radius: 0;
   background: transparent;
   box-shadow: none;
+  margin: auto;
 }
 
 .jd-metricsGrid {
@@ -434,5 +437,9 @@
 
   .jd-metricWide {
     grid-column: auto;
+  }
+
+  .jd-hexPickerWrap {
+    width: min(190px, 72vw);
   }
 }

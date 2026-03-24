@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 from src.utils.git_sync import git_sync
 from src.config.secrets import llm_secrets
+from src.utils.db import db
 
 logger = logging.getLogger("jarvis.self_update")
 
@@ -59,6 +60,17 @@ def _append_update_audit(event: Dict[str, Any]) -> None:
         }
         with open(UPDATE_AUDIT_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Best-effort normalized Mongo log for self-update lifecycle.
+        try:
+            db.save_system_event(
+                event_type="self_update_audit",
+                description=str(record.get("description") or record.get("action") or "self_update"),
+                status=str(record.get("status") or "recorded"),
+                details=record,
+            )
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("Failed to append update audit log: %s", e)
 

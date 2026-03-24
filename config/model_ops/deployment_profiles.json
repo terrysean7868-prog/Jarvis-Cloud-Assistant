@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "local_only": {
+      "primary_chat_model": "ollama_llama3_1_8b",
+      "fallback_model": "local_tiny_fallback",
+      "code_debug_model": "ollama_qwen2_5_7b",
+      "embedding_model": "local_embedding_default",
+      "embedding_provider": "local",
+      "rag_enabled": true,
+      "timeout_seconds": 18,
+      "fallback_routing": "deterministic_local",
+      "required_env": [
+        "JARVIS_LLM_PROVIDER=ollama"
+      ],
+      "safe_defaults": {
+        "offline": true,
+        "free_only": true
+      }
+    },
+    "cloud_only": {
+      "primary_chat_model": "openai_compatible_primary",
+      "fallback_model": "openai_compatible_backup",
+      "code_debug_model": "openai_compatible_primary",
+      "embedding_model": "remote_embedding_default",
+      "embedding_provider": "openai_compatible",
+      "rag_enabled": true,
+      "timeout_seconds": 18,
+      "fallback_routing": "provider_fallback",
+      "required_env": [
+        "PRIMARY_API_KEY",
+        "PRIMARY_ENDPOINT"
+      ],
+      "safe_defaults": {
+        "offline": false,
+        "free_only": false
+      }
+    },
+    "hybrid_local_primary_cloud_fallback": {
+      "primary_chat_model": "ollama_llama3_1_8b",
+      "fallback_model": "openai_compatible_backup",
+      "code_debug_model": "openai_compatible_primary",
+      "embedding_model": "remote_embedding_default",
+      "embedding_provider": "openai_compatible",
+      "rag_enabled": true,
+      "timeout_seconds": 16,
+      "fallback_routing": "local_then_remote",
+      "required_env": [
+        "JARVIS_LLM_PROVIDER=ollama"
+      ],
+      "safe_defaults": {
+        "offline": "partial",
+        "free_only": false
+      }
+    },
+    "local_chat_cloud_reasoning": {
+      "primary_chat_model": "ollama_qwen2_5_7b",
+      "fallback_model": "openai_compatible_backup",
+      "code_debug_model": "openai_compatible_primary",
+      "embedding_model": "remote_embedding_default",
+      "embedding_provider": "openai_compatible",
+      "rag_enabled": true,
+      "timeout_seconds": 16,
+      "fallback_routing": "task_aware",
+      "required_env": [],
+      "safe_defaults": {
+        "offline": "partial",
+        "free_only": false
+      }
+    },
+    "local_primary_api_backup": {
+      "primary_chat_model": "ollama_llama3_1_8b",
+      "fallback_model": "openai_compatible_backup",
+      "code_debug_model": "ollama_qwen2_5_7b",
+      "embedding_model": "local_embedding_default",
+      "embedding_provider": "local",
+      "rag_enabled": true,
+      "timeout_seconds": 16,
+      "fallback_routing": "provider_fallback",
+      "required_env": [],
+      "safe_defaults": {
+        "offline": true,
+        "free_only": false
+      }
+    },
+    "free_only_local_stack": {
+      "primary_chat_model": "ollama_qwen2_5_7b",
+      "fallback_model": "local_tiny_fallback",
+      "code_debug_model": "ollama_llama3_1_8b",
+      "embedding_model": "local_embedding_default",
+      "embedding_provider": "local",
+      "rag_enabled": true,
+      "timeout_seconds": 20,
+      "fallback_routing": "deterministic_local",
+      "required_env": [
+        "JARVIS_LLM_PROVIDER=ollama"
+      ],
+      "safe_defaults": {
+        "offline": true,
+        "free_only": true
+      }
+    }
+  }
+}

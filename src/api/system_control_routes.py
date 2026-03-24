@@ -5,6 +5,11 @@ from typing import Any, Callable, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+try:
+    from src.utils.db import db as database
+except Exception:
+    database = None
+
 
 class OpenAppRequest(BaseModel):
     app_name: str
@@ -96,6 +101,30 @@ def build_system_control_router(
             },
         }
 
+    def _first_agent_result(delegate_payload: dict[str, Any]) -> dict[str, Any]:
+        payload = (delegate_payload or {}).get("agent_result") or {}
+        results = payload.get("results") or []
+        if isinstance(results, list) and results and isinstance(results[0], dict):
+            first = dict(results[0])
+            # New contract: {status, result, error, execution_time}
+            if isinstance(first.get("result"), dict):
+                return _to_json_safe(dict(first.get("result") or {}))
+            return _to_json_safe(first)
+        direct = (delegate_payload or {}).get("result")
+        if isinstance(direct, dict):
+            return _to_json_safe(dict(direct))
+        return {}
+
+    def _ensure_cloud_envelope(payload: Any, *, default_message: str = "Delegated to PC agent") -> dict[str, Any]:
+        out = dict(payload) if isinstance(payload, dict) else {"status": "failed", "mode": "cloud", "execution": None}
+        out.setdefault("mode", "cloud")
+        out.setdefault("execution", _to_json_safe(payload) if isinstance(payload, dict) else None)
+        if "result" not in out:
+            out["result"] = _first_agent_result(out)
+        if "message" not in out:
+            out["message"] = default_message
+        return _to_json_safe(out)
+
     async def _cloud_exec(
         *,
         session_id: str | None,
@@ -105,6 +134,22 @@ def build_system_control_router(
         require_admin: bool,
         await_timeout_s: float = 2.5,
     ) -> dict[str, Any]:
+        if database is not None:
+            try:
+                database.save_system_event(
+                    "agent_execution_requested",
+                    f"Delegated {feature}",
+                    "pending",
+                    {
+                        "feature": feature,
+                        "session_id": session_id,
+                        "source": "system_control",
+                        "mode": "cloud",
+                        "actions": actions,
+                    },
+                )
+            except Exception:
+                pass
         if callable(cloud_delegate_or_queue):
             delegated = await cloud_delegate_or_queue(
                 session_id=session_id,
@@ -115,7 +160,25 @@ def build_system_control_router(
                 await_timeout_s=await_timeout_s,
             )
             if isinstance(delegated, dict):
-                return _to_json_safe(delegated)
+                if database is not None:
+                    try:
+                        st = str(delegated.get("status") or "queued_for_agent").strip().lower()
+                        database.save_system_event(
+                            "agent_execution_result",
+                            f"Delegated {feature} status={st}",
+                            "error" if st in {"failed", "error", "forbidden"} else "success",
+                            {
+                                "feature": feature,
+                                "session_id": session_id,
+                                "source": "system_control",
+                                "mode": "cloud",
+                                "delegated_status": st,
+                                "actions": actions,
+                            },
+                        )
+                    except Exception:
+                        pass
+                return _ensure_cloud_envelope(delegated)
             return {"status": "failed", "mode": "cloud", "message": "Invalid delegated payload"}
         cloud_feature_disabled(feature)
         return {
@@ -123,13 +186,6 @@ def build_system_control_router(
             "mode": "cloud",
             "feature": feature,
         }
-
-    def _first_agent_result(delegate_payload: dict[str, Any]) -> dict[str, Any]:
-        payload = (delegate_payload or {}).get("agent_result") or {}
-        results = payload.get("results") or []
-        if isinstance(results, list) and results and isinstance(results[0], dict):
-            return _to_json_safe(dict(results[0]))
-        return {}
 
     @router.post("/api/capture-screen")
     async def capture_screen_endpoint(region: dict | None = None):

@@ -8,6 +8,7 @@ import re
 import signal
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from datetime import datetime, UTC
 
@@ -34,9 +35,8 @@ try:
 except Exception:
     pass
 
-# NOTE: This agent is intentionally defensive.
-# We avoid importing optional/heavy modules at startup to prevent dependency issues
-# and to reduce the chance of accidental data exposure.
+# NOTE: This agent is intentionally defensive and execution-only.
+# It receives cloud actions, executes them, and returns structured results.
 
 # system_ops may not exist on some platforms; in this repo it should.
 try:
@@ -232,12 +232,71 @@ def _supported_actions_catalog() -> list[str]:
         "list",
         "mkdir",
         "cleanup",
-        "self_update",
-        "self_add",
         "agent_set_permissions",
         "agent_stop",
         "agent_shutdown",
     ])
+
+
+def _normalize_contract_status(value: str | None) -> str:
+    s = str(value or "").strip().lower()
+    if s in {"success", "ok", "completed"}:
+        return "completed"
+    if s in {"error", "failed", "forbidden"}:
+        return "failed"
+    if not s:
+        return "completed"
+    return s
+
+
+def _normalize_incoming_action(action_payload: dict | None, *, job_id: str, action_index: int) -> tuple[dict, str, str]:
+    payload = action_payload if isinstance(action_payload, dict) else {}
+
+    # New contract: {action, params, task_id}
+    if isinstance(payload.get("action"), str):
+        action_name = str(payload.get("action") or "").strip()
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        task_id = str(payload.get("task_id") or f"{job_id}:{action_index}").strip()
+        normalized = {"type": action_name, **params}
+        return normalized, action_name, task_id
+
+    # Backward-compatible legacy contract: {type, ...}
+    action_name = str(payload.get("type") or "").strip()
+    task_id = str(payload.get("task_id") or f"{job_id}:{action_index}").strip()
+    return payload, action_name, task_id
+
+
+async def _execute_action_contract(action_payload: dict | None, *, job_id: str, action_index: int) -> dict:
+    normalized_action, action_name, task_id = _normalize_incoming_action(
+        action_payload,
+        job_id=job_id,
+        action_index=action_index,
+    )
+
+    started = time.perf_counter()
+    try:
+        raw_result = await _execute_action(normalized_action)
+        if not isinstance(raw_result, dict):
+            raw_result = {"status": "completed", "value": raw_result}
+    except Exception as e:
+        raw_result = {"status": "error", "message": str(e)}
+
+    elapsed = float(max(0.0, time.perf_counter() - started))
+    raw_status = str((raw_result or {}).get("status") or "")
+    status = _normalize_contract_status(raw_status)
+
+    error = None
+    if status == "failed":
+        error = str((raw_result or {}).get("message") or (raw_result or {}).get("error") or "execution_failed")
+
+    return {
+        "status": status,
+        "result": raw_result,
+        "error": error,
+        "execution_time": round(elapsed, 4),
+        "task_id": task_id,
+        "action": action_name,
+    }
 
 
 def _current_capabilities() -> dict:
@@ -299,15 +358,6 @@ def _get_screen_access():
         return screen_access
     except Exception:
         return None
-
-
-def _get_self_update():
-    # Lazy import: self_update pulls in OpenAI + pydantic plugins.
-    try:
-        from src.utils.self_update import self_update_file, self_add_feature
-        return self_update_file, self_add_feature
-    except Exception:
-        return None, None
 
 
 def _ws_url_from_base(base: str) -> str:
@@ -1798,47 +1848,13 @@ async def _execute_action(action: dict) -> dict:
     if t == "system_info":
         return system_ops.get_system_info()
 
-    if t == "self_update":
-        if not ALLOW_SELF_UPDATE:
-            return {"status": "forbidden", "action_type": t, "message": "Self-update disabled on agent"}
-        self_update_file, _self_add_feature = _get_self_update()
-        if not self_update_file:
-            return {"status": "error", "action_type": t, "message": "Self-update not available on this agent"}
-        description = action.get("description", "")
-        file_path = action.get("file_path", "")
-        if not file_path:
-            dl = str(description or "").strip().lower()
-            if any(k in dl for k in ("anatomy", "architecture view", "anatomy view")):
-                file_path = "frontend/src/pages/AnatomyView.jsx"
-            elif any(k in dl for k in ("autonomy dashboard", "task graph", "goal graph", "graph editor", "node editor")):
-                file_path = "frontend/src/pages/AutonomyDashboard.jsx"
-            elif any(k in dl for k in ("update console", "management console", "kanban")):
-                file_path = "frontend/src/components/UpdateManagementConsole.jsx"
-            elif any(k in dl for k in ("frontend api", "api client", "utils api")):
-                file_path = "frontend/src/utils/api.js"
-            elif any(k in dl for k in ("frontend", "ui", "react", "dashboard")):
-                file_path = "frontend/src/App.jsx"
-            elif any(k in dl for k in ("pc agent", "device action", "agent runtime")):
-                file_path = "apps/pc_agent/pc_agent.py"
-            elif any(k in dl for k in ("background loop", "runtime control", "pause resume", "tick once")):
-                file_path = "src/autonomy/background_loop.py"
-            elif any(k in dl for k in ("autonomy runtime", "runtime", "control state")):
-                file_path = "src/autonomy/runtime.py"
-            elif any(k in dl for k in ("autonomy", "task graph", "goal", "backend api", "anatomy state")):
-                file_path = "apps/web/app.py"
-            else:
-                file_path = "src/core/llm_adapter.py"
-        return self_update_file(description, file_path)
-
-    if t == "self_add":
-        if not ALLOW_SELF_UPDATE:
-            return {"status": "forbidden", "action_type": t, "message": "Self-update disabled on agent"}
-        _self_update_file, self_add_feature = _get_self_update()
-        if not self_add_feature:
-            return {"status": "error", "action_type": t, "message": "Self-add not available on this agent"}
-        description = action.get("description", "")
-        feature_type = action.get("feature_type", "module")
-        return self_add_feature(description, feature_type)
+    if t in ("self_update", "self_add"):
+        # Execution-only node: no local intelligence/autonomous code generation.
+        return {
+            "status": "forbidden",
+            "action_type": t,
+            "message": "Action is cloud-intelligence only and is not supported on execution-only agent",
+        }
 
     if t == "agent_set_permissions":
         if ACTION_ALLOWLIST is not None and t not in ACTION_ALLOWLIST:
@@ -2006,11 +2022,20 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                                 actions = payload.get("actions") or []
 
                                 results = []
-                                for a in actions:
+                                for idx, a in enumerate(actions):
                                     try:
-                                        results.append(await _execute_action(a))
+                                        results.append(await _execute_action_contract(a, job_id=str(job_id or ""), action_index=idx))
                                     except Exception as e:
-                                        results.append({"status": "error", "message": str(e), "action": a})
+                                        results.append(
+                                            {
+                                                "status": "failed",
+                                                "result": None,
+                                                "error": str(e),
+                                                "execution_time": 0.0,
+                                                "task_id": f"{str(job_id or '')}:{idx}",
+                                                "action": str((a or {}).get("action") or (a or {}).get("type") or "unknown"),
+                                            }
+                                        )
 
                                 # If permissions/capabilities changed, publish updated capabilities immediately.
                                 try:

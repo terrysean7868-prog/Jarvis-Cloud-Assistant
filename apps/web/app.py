@@ -70,6 +70,54 @@ from src.api.internet_routes import build_internet_router
 from src.api.session_routes import build_session_router
 from src.api.system_control_routes import build_system_control_router
 from src.api.telegram_routes import build_telegram_router
+try:
+    from src.learning import SelfLearningEngine
+except Exception:
+    SelfLearningEngine = None
+
+try:
+    from src.model_ops import (
+        list_models as model_ops_list_models,
+        capability_summary as model_ops_capability_summary,
+        recommend_with_mode as model_ops_recommend_with_mode,
+        inspect_dataset as model_ops_inspect_dataset,
+        compute_readiness as model_ops_compute_readiness,
+        prepare_finetune_run as model_ops_prepare_finetune_run,
+        list_profiles as model_ops_list_profiles,
+        update_profile as model_ops_update_profile,
+        load_registry as model_ops_load_registry,
+        check_health as model_ops_check_health,
+        run_benchmark as model_ops_run_benchmark,
+        latest_benchmark_report as model_ops_latest_benchmark_report,
+        update_benchmark as model_ops_update_benchmark,
+        update_health as model_ops_update_health,
+        update_readiness as model_ops_update_readiness,
+    )
+    from src.model_ops.model_recommender import save_recommendation as model_ops_save_recommendation
+    MODEL_OPS_AVAILABLE = True
+except Exception:
+    model_ops_list_models = None
+    model_ops_capability_summary = None
+    model_ops_recommend_with_mode = None
+    model_ops_inspect_dataset = None
+    model_ops_compute_readiness = None
+    model_ops_prepare_finetune_run = None
+    model_ops_list_profiles = None
+    model_ops_update_profile = None
+    model_ops_load_registry = None
+    model_ops_check_health = None
+    model_ops_run_benchmark = None
+    model_ops_latest_benchmark_report = None
+    model_ops_update_benchmark = None
+    model_ops_update_health = None
+    model_ops_update_readiness = None
+    model_ops_save_recommendation = None
+    MODEL_OPS_AVAILABLE = False
+
+try:
+    from src.ai_training.data_schemas import normalize_for_collection as normalize_training_doc
+except Exception:
+    normalize_training_doc = None
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +336,106 @@ _DEVICE_PERMISSIONS_INDEX_READY = False
 _AGENT_CONFIG_INDEX_READY = False
 _REQUIREMENTS_AUDIT_INDEX_READY = False
 
+# Lightweight in-memory production telemetry (best-effort, process-local).
+_OPS_TELEMETRY = {
+    "chat_total": 0,
+    "timeout_total": 0,
+    "fallback_total": 0,
+    "latency_ms_total": 0.0,
+    "latency_samples": 0,
+    "delegated_exec_success": 0,
+    "delegated_exec_failure": 0,
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+
+
+def _ops_touch() -> None:
+    try:
+        _OPS_TELEMETRY["updated_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception:
+        pass
+
+
+def _ops_inc(key: str, amount: int = 1) -> None:
+    try:
+        _OPS_TELEMETRY[key] = int(_OPS_TELEMETRY.get(key) or 0) + int(amount)
+        _ops_touch()
+    except Exception:
+        pass
+
+
+def _ops_add_latency_ms(value_ms: float) -> None:
+    try:
+        v = float(value_ms)
+        if v < 0:
+            return
+        _OPS_TELEMETRY["latency_ms_total"] = float(_OPS_TELEMETRY.get("latency_ms_total") or 0.0) + v
+        _OPS_TELEMETRY["latency_samples"] = int(_OPS_TELEMETRY.get("latency_samples") or 0) + 1
+        _ops_touch()
+    except Exception:
+        pass
+
+
+def _parse_latency_to_ms(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value) * 1000.0 if float(value) < 1000 else float(value)
+        s = str(value).strip().lower()
+        if not s:
+            return None
+        if s.endswith("ms"):
+            return float(s[:-2].strip())
+        if s.endswith("s"):
+            return float(s[:-1].strip()) * 1000.0
+        return float(s)
+    except Exception:
+        return None
+
+
+def _collect_global_delegated_counts() -> dict[str, int]:
+    counts = {"queued_for_agent": 0, "pending_permission": 0}
+    try:
+        col = _delegated_tasks_collection()
+        if col is None:
+            return counts
+        for st in ("queued_for_agent", "pending_permission"):
+            counts[st] = int(col.count_documents({"status": st}))
+    except Exception:
+        return counts
+    return counts
+
+
+def _ops_telemetry_snapshot() -> dict[str, Any]:
+    chat_total = int(_OPS_TELEMETRY.get("chat_total") or 0)
+    timeout_total = int(_OPS_TELEMETRY.get("timeout_total") or 0)
+    fallback_total = int(_OPS_TELEMETRY.get("fallback_total") or 0)
+    latency_samples = int(_OPS_TELEMETRY.get("latency_samples") or 0)
+    latency_total = float(_OPS_TELEMETRY.get("latency_ms_total") or 0.0)
+    delegated_counts = _collect_global_delegated_counts()
+    delegated_success = int(_OPS_TELEMETRY.get("delegated_exec_success") or 0)
+    delegated_failure = int(_OPS_TELEMETRY.get("delegated_exec_failure") or 0)
+    delegated_total = delegated_success + delegated_failure
+
+    return {
+        "chat_total": chat_total,
+        "timeout_total": timeout_total,
+        "timeout_rate": (float(timeout_total) / float(chat_total)) if chat_total else 0.0,
+        "fallback_total": fallback_total,
+        "fallback_rate": (float(fallback_total) / float(chat_total)) if chat_total else 0.0,
+        "average_response_latency_ms": (latency_total / float(latency_samples)) if latency_samples else 0.0,
+        "latency_samples": latency_samples,
+        "queued_for_agent_count": int(delegated_counts.get("queued_for_agent") or 0),
+        "pending_permission_count": int(delegated_counts.get("pending_permission") or 0),
+        "delegated_execution": {
+            "success": delegated_success,
+            "failure": delegated_failure,
+            "success_rate": (float(delegated_success) / float(delegated_total)) if delegated_total else 0.0,
+        },
+        "updated_at": _OPS_TELEMETRY.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+    }
+
 
 def _remember_job_owner(job: dict) -> None:
     """Best-effort: remember which authenticated user initiated this job."""
@@ -379,6 +527,34 @@ def _normalize_flow_status(value: str | None, *, default: str = "awaiting_agent"
         "completed",
     }
     return s if s in allowed else default
+
+
+def _extract_agent_contract_entry(payload: dict[str, Any] | None) -> dict[str, Any]:
+    rows = (payload or {}).get("results") or []
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return dict(rows[0])
+    return {}
+
+
+def _extract_agent_contract_result(payload: dict[str, Any] | None) -> dict[str, Any]:
+    first = _extract_agent_contract_entry(payload)
+    result = first.get("result")
+    if isinstance(result, dict):
+        return _to_json_safe(dict(result))
+    # Backward compatibility with legacy agent shape.
+    if first:
+        return _to_json_safe(dict(first))
+    return {}
+
+
+def _cloud_envelope(*, status: str, execution: Any, result: Any = None, message: str = "") -> dict[str, Any]:
+    return {
+        "status": _normalize_flow_status(status, default="delegated"),
+        "mode": "cloud",
+        "execution": _to_json_safe(execution),
+        "result": _to_json_safe(result) if result is not None else None,
+        "message": str(message or "").strip() or None,
+    }
 
 
 def _remember_job_result(payload: dict[str, Any]) -> None:
@@ -691,13 +867,15 @@ async def _delegate_or_queue_cloud_action(
             status_value="awaiting_agent",
             reason="missing_device_assignment",
         )
-        return {
-            "status": "awaiting_agent",
-            "mode": "cloud",
-            "feature": feature,
-            "task": task,
-            "message": "No device is assigned yet. Task is waiting for agent assignment.",
-        }
+        out = _cloud_envelope(
+            status="awaiting_agent",
+            execution={"feature": feature, "task": task},
+            result=None,
+            message="No device is assigned yet. Task is waiting for agent assignment.",
+        )
+        out["feature"] = feature
+        out["task"] = task
+        return out
 
     if not await device_hub.is_connected(did):
         task = _queue_delegated_task(
@@ -710,54 +888,65 @@ async def _delegate_or_queue_cloud_action(
             status_value="queued_for_agent",
             reason="agent_offline",
         )
-        return {
-            "status": "queued_for_agent",
-            "mode": "cloud",
-            "feature": feature,
-            "device_id": did,
-            "task": task,
-            "message": "PC agent is offline. Task queued for manual resume after reconnect.",
-        }
+        out = _cloud_envelope(
+            status="queued_for_agent",
+            execution={"feature": feature, "device_id": did, "task": task},
+            result=None,
+            message="PC agent is offline. Task queued for manual resume after reconnect.",
+        )
+        out["feature"] = feature
+        out["device_id"] = did
+        out["task"] = task
+        return out
 
     job = await _dispatch_actions_to_device(did, username=username or "user", actions=actions, source_text=source_text)
     job_id = str((job or {}).get("job_id") or "").strip()
 
     payload = await _await_job_result(job_id, timeout_s=await_timeout_s)
     if not payload:
-        return {
-            "status": "delegated",
-            "mode": "cloud",
-            "feature": feature,
-            "device_id": did,
-            "job": job,
-            "message": "Delegated to PC agent and awaiting completion.",
-        }
+        out = _cloud_envelope(
+            status="delegated",
+            execution={"feature": feature, "device_id": did, "job": job},
+            result=None,
+            message="Delegated to PC agent and awaiting completion.",
+        )
+        out["feature"] = feature
+        out["device_id"] = did
+        out["job"] = job
+        return out
 
-    results = (payload or {}).get("results") or []
-    first = results[0] if isinstance(results, list) and results else {}
+    first = _extract_agent_contract_entry(payload)
     raw_first_status = str((first or {}).get("status") or "").strip().lower()
     if raw_first_status in {"success", "ok"}:
         first_status = "completed"
-    elif raw_first_status in {"error", "forbidden"}:
+    elif raw_first_status in {"error", "forbidden", "failed"}:
         first_status = "failed"
     else:
         first_status = _normalize_flow_status(raw_first_status, default="completed")
 
-    return {
-        "status": first_status,
-        "mode": "cloud",
-        "feature": feature,
-        "device_id": did,
-        "job": job,
-        "agent_result": payload,
-    }
+    result_body = _extract_agent_contract_result(payload)
+    out = _cloud_envelope(
+        status=first_status,
+        execution={"feature": feature, "device_id": did, "job": job, "agent_result": payload},
+        result=result_body,
+        message="PC agent execution completed." if first_status == "completed" else "PC agent execution finished with errors.",
+    )
+    out["feature"] = feature
+    out["device_id"] = did
+    out["job"] = job
+    out["agent_result"] = payload
+    return out
 
 
 def _delegated_first_result(delegated: dict[str, Any]) -> dict[str, Any] | None:
-    payload = (delegated.get("agent_result") or {}).get("results") or []
-    first = payload[0] if isinstance(payload, list) and payload else None
-    if isinstance(first, dict):
-        return _to_json_safe(dict(first))
+    payload = delegated.get("agent_result") if isinstance(delegated.get("agent_result"), dict) else {}
+    first = _extract_agent_contract_result(payload)
+    if isinstance(first, dict) and first:
+        return first
+    # fallback: some callers may already pass normalized cloud envelope result
+    direct = delegated.get("result")
+    if isinstance(direct, dict):
+        return _to_json_safe(dict(direct))
     return None
 
 
@@ -1422,6 +1611,32 @@ def _log_requirement_event(
             "created_at": now,
         }
         col.insert_one(payload)
+
+        # New normalized schema write (keeps legacy collection intact).
+        try:
+            if callable(normalize_training_doc) and hasattr(database, "db") and database.db is not None:
+                n = normalize_training_doc(
+                    "requirement_logs",
+                    {
+                        "timestamp": payload.get("ts"),
+                        "user_id": payload.get("user_id") or "user",
+                        "session_id": (details or {}).get("session_id") if isinstance(details, dict) else "unknown",
+                        "correlation_id": (details or {}).get("request_id") if isinstance(details, dict) else None,
+                        "source": "system",
+                        "mode": "cloud" if CLOUD_MODE else "local",
+                        "lifecycle_state": payload.get("status") or "pending",
+                        "type": payload.get("requirement_type") or "requirement",
+                        "message": payload.get("requested_action") or payload.get("target") or "requirement",
+                        "legacy_payload": payload,
+                    },
+                )
+                database.db["requirement_logs"].update_one(
+                    {"event_id": n.get("event_id")},
+                    {"$set": n},
+                    upsert=True,
+                )
+        except Exception:
+            pass
     except Exception:
         return
 
@@ -1908,12 +2123,38 @@ def _is_remote_device_action(a: dict) -> bool:
 async def _dispatch_actions_to_device(device_id: str, username: str, actions: list[dict], source_text: str):
     """Forward actions to a connected local agent."""
     _require_pc_agent_enabled()
+    job_id = f"job_{os.urandom(8).hex()}"
+
+    contract_actions: list[dict[str, Any]] = []
+    for idx, a in enumerate(actions or []):
+        if not isinstance(a, dict):
+            continue
+        if isinstance(a.get("action"), str):
+            contract_actions.append(
+                {
+                    "action": str(a.get("action") or "").strip(),
+                    "params": a.get("params") if isinstance(a.get("params"), dict) else {},
+                    "task_id": str(a.get("task_id") or f"{job_id}:{idx}").strip(),
+                }
+            )
+            continue
+
+        action_name = str(a.get("type") or "").strip()
+        params = {k: v for k, v in a.items() if k not in {"type", "task_id"}}
+        contract_actions.append(
+            {
+                "action": action_name,
+                "params": params,
+                "task_id": str(a.get("task_id") or f"{job_id}:{idx}").strip(),
+            }
+        )
+
     job = {
-        "job_id": f"job_{os.urandom(8).hex()}",
+        "job_id": job_id,
         "device_id": device_id,
         "username": username,
         "source_text": source_text,
-        "actions": actions,
+        "actions": contract_actions,
     }
     _remember_job_owner(job)
     await device_hub.send_job(device_id, job)
@@ -1936,7 +2177,17 @@ async def _run_device_cycle_evaluation(goal: str, user_id: str, device_id: str, 
         # Reconstruct a minimal planned_response from execution results.
         # We don't have the original actions list, but we can infer it from the results.
         planned_response = {
-            "actions": [{"type": r.get("action_type")} for r in execution_results if isinstance(r, dict)]
+            "actions": [
+                {
+                    "type": (
+                        (r.get("result") or {}).get("action_type")
+                        if isinstance(r.get("result"), dict)
+                        else r.get("action_type")
+                    )
+                }
+                for r in execution_results
+                if isinstance(r, dict)
+            ]
         }
         
         # Invoke the full cycle: Evaluate phase + Improve phase
@@ -2099,6 +2350,10 @@ async def agent_ws(ws: WebSocket):
                             flow_status = "failed"
                         else:
                             flow_status = _normalize_flow_status(raw_status, default="completed")
+                        if flow_status == "completed":
+                            _ops_inc("delegated_exec_success")
+                        elif flow_status == "failed":
+                            _ops_inc("delegated_exec_failure")
                         _mark_delegated_task(
                             job_id=jid,
                             status_value=flow_status,
@@ -3566,6 +3821,7 @@ llm = LLMAdapter()
 brain = JarvisBrain(llm=llm)
 executor = ActionExecutor(brain=brain)
 module_cycle_service = ModuleUpdateCycleService(executor=executor, self_add_feature=self_add_feature)
+learning_engine = SelfLearningEngine() if SelfLearningEngine is not None else None
 autonomy_runtime = AutonomyRuntime(
     device_hub=device_hub,
     enabled=bool(getattr(rd, "AUTONOMY_ENABLED", True)),
@@ -4131,6 +4387,7 @@ async def autonomy_status(session_id: str | None = None):
             "health": autonomy_runtime._health_check(),
             "tools": autonomy_runtime.tools.list_tools(),
             "delegated_summary": _delegated_status_counts(delegated_rows),
+            "ops_telemetry": _ops_telemetry_snapshot(),
         }
     except Exception as e:
         return {
@@ -4144,7 +4401,20 @@ async def autonomy_status(session_id: str | None = None):
             "tools": [],
             "message": str(e),
             "delegated_summary": _delegated_status_counts([]),
+            "ops_telemetry": _ops_telemetry_snapshot(),
         }
+
+
+@app.get("/api/ops/telemetry")
+async def ops_telemetry(session_id: str | None = None):
+    """Lightweight production telemetry snapshot for staging verification."""
+    if CLOUD_MODE:
+        _require_authenticated_session(session_id)
+    return {
+        "status": "ok",
+        "telemetry": _ops_telemetry_snapshot(),
+        "uptime_seconds": int(max(0, time.time() - START_TS)),
+    }
 
 
 def _extract_graph_from_goal(goal: dict | None) -> dict:
@@ -4858,6 +5128,7 @@ def _parse_admin_update_voice_command(text: str) -> dict | None:
 # =========================================================
 @app.post("/api/chat")
 async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
+    started_at = time.perf_counter()
     # Cloud mode must require auth for chat to prevent public abuse/cost.
     # Voice-only mode below already enforces this, but keep it explicit when chat mode is enabled.
     if CLOUD_MODE and not msg.session_id:
@@ -5018,6 +5289,63 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         str((response or {}).get("source") or "unknown"),
         len(actions) if isinstance(actions, list) else 0,
     )
+
+    # Lightweight production telemetry (best-effort, never blocks chat flow).
+    try:
+        _ops_inc("chat_total")
+        elapsed_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
+        parsed_latency = _parse_latency_to_ms((response or {}).get("latency"))
+        _ops_add_latency_ms(parsed_latency if parsed_latency is not None else elapsed_ms)
+
+        src = str((response or {}).get("source") or "").strip().lower()
+        routing = (response or {}).get("routing") if isinstance((response or {}).get("routing"), dict) else {}
+        fallback_used = bool(routing.get("fallback_used")) or src.startswith("fallback")
+        if fallback_used:
+            _ops_inc("fallback_total")
+
+        txt = str((response or {}).get("text") or "").strip().lower()
+        if ("timeout" in txt) or ("timed out" in txt):
+            _ops_inc("timeout_total")
+    except Exception:
+        pass
+
+    # Persist normalized chat event (best effort, no impact on runtime path).
+    try:
+        if username or msg.user:
+            database.save_chat(
+                user_input=msg.text,
+                bot_response=str((response or {}).get("text") or ""),
+                session_id=msg.session_id,
+                intent=str((response or {}).get("intent") or "chat"),
+                context={
+                    "user_id": (username or msg.user or "user"),
+                    "request_id": request_id,
+                    "mode": msg.mode or "chat",
+                    "source": (response or {}).get("source") or "unknown",
+                },
+            )
+    except Exception:
+        pass
+
+    # Controlled learning signal + periodic evaluator (best effort, suggestion-only).
+    try:
+        if learning_engine is not None:
+            learning_signal = learning_engine.log_response_quality(
+                user_id=(username or msg.user or "user"),
+                query=str(msg.text or ""),
+                response_text=str((response or {}).get("text") or ""),
+                actions=(actions if isinstance(actions, list) else []),
+                source=str((response or {}).get("source") or "chat"),
+                request_id=request_id,
+            )
+            response["learning_signal"] = {
+                "quality_score": learning_signal.get("quality_score"),
+                "weak": learning_signal.get("weak"),
+            }
+            # Internally cooldown-gated to prevent loops/regressions.
+            background_tasks.add_task(learning_engine.run_controlled_learning_cycle, lookback_hours=48)
+    except Exception:
+        pass
 
     # Persist voice command telemetry (MongoDB)
     try:
@@ -5675,6 +6003,11 @@ class SelfImprovementDecisionRequest(BaseModel):
     session_id: str | None = None
 
 
+class LearningEvaluateRequest(BaseModel):
+    session_id: str | None = None
+    lookback_hours: int = 48
+
+
 @app.get("/api/self-improvement/proposals")
 async def list_self_improvement_proposals(session_id: str | None = None):
     """Return pending self-improvement proposals for explicit human approval."""
@@ -5749,12 +6082,338 @@ async def decide_self_improvement_proposal(req: SelfImprovementDecisionRequest):
         "updated": updated,
     }
 
+
+@app.get("/api/self-improvement/suggestions")
+async def list_self_improvement_suggestions(session_id: str | None = None, limit: int = 100):
+    principal = None
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(session_id)
+    elif session_id:
+        principal = _get_principal(session_id)
+
+    role = str((principal or {}).get("role") or "user").lower()
+    if CLOUD_MODE and role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    rows: list[dict[str, Any]] = []
+    try:
+        database._ensure_connected()
+        if database.db is not None:
+            rows = list(
+                database.db["self_improvement_suggestions"]
+                .find({}, {"_id": 0})
+                .sort("created_at", -1)
+                .limit(max(1, min(int(limit or 100), 300)))
+            )
+    except Exception:
+        rows = []
+    return {"status": "ok", "suggestions": rows, "count": len(rows)}
+
+
+@app.post("/api/learning/evaluate")
+async def run_learning_evaluation(req: LearningEvaluateRequest):
+    principal = None
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(req.session_id)
+        if str((principal or {}).get("role") or "user").lower() != "admin":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    if learning_engine is None:
+        return {"status": "skipped", "reason": "learning_engine_unavailable"}
+
+    out = learning_engine.run_controlled_learning_cycle(lookback_hours=max(1, min(int(req.lookback_hours or 48), 168)))
+    return {"status": "success", "result": out}
+
+
+@app.get("/api/learning/metrics")
+async def learning_metrics(session_id: str | None = None):
+    principal = None
+    if CLOUD_MODE:
+        principal = _require_authenticated_session(session_id)
+        if str((principal or {}).get("role") or "user").lower() != "admin":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    elif session_id:
+        principal = _get_principal(session_id)
+
+    _ = principal
+    database._ensure_connected()
+    if database.db is None:
+        return {"status": "skipped", "reason": "db_unavailable"}
+
+    cycle = database.db["learning_cycle_reports"].find_one({}, {"_id": 0}, sort=[("created_at", -1)]) or {}
+    open_suggestion_count = int(database.db["self_improvement_suggestions"].count_documents({"status": "open"}))
+    top_suggestion = (
+        database.db["self_improvement_suggestions"].find_one({"status": "open"}, {"_id": 0, "issue": 1, "priority": 1}, sort=[("priority", -1), ("created_at", -1)])
+        or {}
+    )
+
+    perf_rows = list(
+        database.db["model_performance_stats"]
+        .find({}, {"_id": 0, "model_id": 1, "success": 1, "latency_ms": 1, "fallback_used": 1})
+        .sort("recorded_at", -1)
+        .limit(1000)
+    )
+    by_model: dict[str, dict[str, Any]] = {}
+    for row in perf_rows:
+        mid = str((row or {}).get("model_id") or "unknown")
+        item = by_model.setdefault(mid, {"model_id": mid, "calls": 0, "failure": 0, "latency_total": 0.0, "fallback": 0})
+        item["calls"] += 1
+        ok = bool((row or {}).get("success"))
+        item["failure"] += 0 if ok else 1
+        item["latency_total"] += float((row or {}).get("latency_ms") or 0.0)
+        item["fallback"] += 1 if bool((row or {}).get("fallback_used")) else 0
+
+    summary: list[dict[str, Any]] = []
+    for v in by_model.values():
+        calls = max(1, int(v.get("calls") or 1))
+        summary.append(
+            {
+                "model_id": v.get("model_id"),
+                "calls": calls,
+                "failure_rate": round(float(v.get("failure") or 0) / calls, 4),
+                "avg_latency_ms": round(float(v.get("latency_total") or 0.0) / calls, 3),
+                "fallback_rate": round(float(v.get("fallback") or 0) / calls, 4),
+            }
+        )
+    summary.sort(key=lambda x: float(x.get("failure_rate") or 0.0), reverse=True)
+    top_failing = summary[0] if summary else {}
+
+    latest_success_score = float(cycle.get("success_score") or 0.0)
+    failure_patterns = cycle.get("failure_patterns") if isinstance(cycle.get("failure_patterns"), list) else []
+    top_failure_pattern = str(failure_patterns[0]) if failure_patterns else ""
+
+    return {
+        "status": "success",
+        "metrics": {
+            "latest_success_score": round(latest_success_score, 4),
+            "top_failure_pattern": top_failure_pattern,
+            "open_suggestion_count": open_suggestion_count,
+            "top_failing_model": top_failing,
+            "last_learning_cycle_at": cycle.get("created_at"),
+            "top_suggestion": top_suggestion,
+        },
+    }
+
+
+@app.get("/api/model-ops/performance")
+async def model_ops_performance(session_id: str, limit: int = 500):
+    _require_authenticated_session(session_id)
+    database._ensure_connected()
+    if database.db is None:
+        return {"status": "skipped", "reason": "db_unavailable"}
+
+    rows = list(
+        database.db["model_performance_stats"]
+        .find({}, {"_id": 0})
+        .sort("recorded_at", -1)
+        .limit(max(1, min(int(limit or 500), 2000)))
+    )
+    if not rows:
+        return {"status": "success", "summary": {}, "rows": []}
+
+    by_model: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        model_id = str((r or {}).get("model_id") or "unknown")
+        it = by_model.setdefault(
+            model_id,
+            {
+                "model_id": model_id,
+                "provider": str((r or {}).get("provider") or "unknown"),
+                "calls": 0,
+                "success": 0,
+                "failure": 0,
+                "latency_total_ms": 0.0,
+                "fallback_calls": 0,
+            },
+        )
+        it["calls"] += 1
+        ok = bool((r or {}).get("success"))
+        it["success"] += 1 if ok else 0
+        it["failure"] += 0 if ok else 1
+        it["latency_total_ms"] += float((r or {}).get("latency_ms") or 0.0)
+        it["fallback_calls"] += 1 if bool((r or {}).get("fallback_used")) else 0
+
+    summary = []
+    for v in by_model.values():
+        calls = max(1, int(v.get("calls") or 1))
+        summary.append(
+            {
+                "model_id": v.get("model_id"),
+                "provider": v.get("provider"),
+                "calls": calls,
+                "success_rate": round(float(v.get("success") or 0) / calls, 4),
+                "failure_rate": round(float(v.get("failure") or 0) / calls, 4),
+                "avg_latency_ms": round(float(v.get("latency_total_ms") or 0.0) / calls, 3),
+                "fallback_rate": round(float(v.get("fallback_calls") or 0) / calls, 4),
+            }
+        )
+    summary.sort(key=lambda x: float(x.get("failure_rate") or 0.0), reverse=True)
+
+    return {"status": "success", "summary": summary, "rows": rows[:200]}
+
 @app.get("/api/wakeup-context")
 async def get_wakeup_context(session_id: str | None = None):
     """Get wakeup context mapping"""
     if CLOUD_MODE:
         _require_authenticated_session(session_id)
     return {"context": task_manager.get_wakeup_context()}
+
+
+# =========================================================
+# Model Ops API
+# =========================================================
+class ModelOpsRecommendRequest(BaseModel):
+    session_id: str
+    mode: str | None = "hybrid"
+    constraints: Dict[str, Any] | None = None
+
+
+class ModelOpsReadinessRequest(BaseModel):
+    session_id: str
+    dataset_dir: str | None = None
+    target_model_id: str | None = None
+
+
+class ModelOpsPrepareFinetuneRequest(BaseModel):
+    session_id: str
+    profile_name: str | None = None
+    target_model_id: str | None = None
+    dataset_dir: str | None = None
+    dry_run: bool = True
+
+
+class ModelOpsSelectProfileRequest(BaseModel):
+    session_id: str
+    profile_name: str
+
+
+class ModelOpsBenchmarkRequest(BaseModel):
+    session_id: str
+    profile_name: str | None = None
+
+
+def _require_model_ops_available() -> None:
+    if not MODEL_OPS_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Model Ops subsystem unavailable")
+
+
+@app.get("/api/model-ops/status")
+async def model_ops_status(session_id: str):
+    _require_authenticated_session(session_id)
+    _require_model_ops_available()
+    reg = model_ops_load_registry() if callable(model_ops_load_registry) else {}
+    health = model_ops_check_health() if callable(model_ops_check_health) else {}
+    if callable(model_ops_update_health):
+        try:
+            model_ops_update_health(health)
+        except Exception:
+            pass
+    return {
+        "status": "success",
+        "model_ops_available": True,
+        "registry": reg,
+        "health": health,
+    }
+
+
+@app.get("/api/model-ops/catalog")
+async def model_ops_catalog(session_id: str):
+    _require_authenticated_session(session_id)
+    _require_model_ops_available()
+    models = model_ops_list_models() if callable(model_ops_list_models) else []
+    matrix = model_ops_capability_summary() if callable(model_ops_capability_summary) else {}
+    return {"status": "success", "models": models, "capability_matrix": matrix}
+
+
+@app.post("/api/model-ops/recommend")
+async def model_ops_recommend(req: ModelOpsRecommendRequest):
+    _require_authenticated_session(req.session_id)
+    _require_model_ops_available()
+    mode = (req.mode or "hybrid").strip().lower()
+    constraints = req.constraints if isinstance(req.constraints, dict) else {}
+    out = model_ops_recommend_with_mode(mode, constraints) if callable(model_ops_recommend_with_mode) else {}
+    saved = None
+    if callable(model_ops_save_recommendation):
+        try:
+            saved = model_ops_save_recommendation(out, prefix=f"recommend_{mode}")
+        except Exception:
+            saved = None
+    return {"status": "success", "recommendation": out, "saved_path": saved}
+
+
+@app.post("/api/model-ops/readiness-check")
+async def model_ops_readiness_check(req: ModelOpsReadinessRequest):
+    _require_authenticated_session(req.session_id)
+    _require_model_ops_available()
+    stats = model_ops_inspect_dataset(req.dataset_dir) if callable(model_ops_inspect_dataset) else {}
+    readiness = model_ops_compute_readiness(stats, model_supports_finetune=True) if callable(model_ops_compute_readiness) else {}
+    if callable(model_ops_update_readiness):
+        try:
+            model_ops_update_readiness(readiness)
+        except Exception:
+            pass
+    return {"status": "success", "readiness": readiness}
+
+
+@app.post("/api/model-ops/prepare-finetune")
+async def model_ops_prepare_finetune(req: ModelOpsPrepareFinetuneRequest):
+    _require_admin_session(req.session_id)
+    _require_model_ops_available()
+    res = model_ops_prepare_finetune_run(
+        profile_name=req.profile_name,
+        target_model_id=req.target_model_id,
+        dataset_dir=req.dataset_dir,
+        dry_run=bool(req.dry_run),
+    ) if callable(model_ops_prepare_finetune_run) else {}
+    return {"status": "success", "result": res}
+
+
+@app.get("/api/model-ops/deployment-profiles")
+async def model_ops_profiles(session_id: str):
+    _require_authenticated_session(session_id)
+    _require_model_ops_available()
+    profiles = model_ops_list_profiles() if callable(model_ops_list_profiles) else {}
+    reg = model_ops_load_registry() if callable(model_ops_load_registry) else {}
+    return {"status": "success", "profiles": profiles, "active_profile": reg.get("active_profile")}
+
+
+@app.post("/api/model-ops/select-profile")
+async def model_ops_select_profile(req: ModelOpsSelectProfileRequest):
+    _require_admin_session(req.session_id)
+    _require_model_ops_available()
+    profiles = model_ops_list_profiles() if callable(model_ops_list_profiles) else {}
+    if req.profile_name not in profiles:
+        raise HTTPException(status_code=400, detail="Unknown deployment profile")
+    reg = model_ops_update_profile(req.profile_name) if callable(model_ops_update_profile) else {}
+    return {"status": "success", "registry": reg}
+
+
+@app.post("/api/model-ops/benchmark")
+async def model_ops_benchmark(req: ModelOpsBenchmarkRequest):
+    _require_admin_session(req.session_id)
+    _require_model_ops_available()
+    active = None
+    if callable(model_ops_load_registry):
+        try:
+            active = (model_ops_load_registry() or {}).get("active_profile")
+        except Exception:
+            active = None
+    profile_name = (req.profile_name or active or "local_primary_api_backup").strip()
+    report = model_ops_run_benchmark(profile_name) if callable(model_ops_run_benchmark) else {}
+    if callable(model_ops_update_benchmark):
+        try:
+            model_ops_update_benchmark(report.get("path") or "", report.get("summary") or {})
+        except Exception:
+            pass
+    return {"status": "success", "benchmark": report}
+
+
+@app.get("/api/model-ops/benchmark-report")
+async def model_ops_benchmark_report(session_id: str):
+    _require_authenticated_session(session_id)
+    _require_model_ops_available()
+    report = model_ops_latest_benchmark_report() if callable(model_ops_latest_benchmark_report) else {"status": "not_found"}
+    return report
 
 # =========================================================
 # Error Handling API

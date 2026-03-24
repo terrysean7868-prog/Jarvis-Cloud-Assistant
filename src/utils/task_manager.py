@@ -120,6 +120,23 @@ class TaskManager:
             "meta": meta or {},
         }
         self.tasks.append(task)
+        try:
+            db.log_task_event(
+                {
+                    "timestamp": task.get("created_at"),
+                    "user_id": ((meta or {}).get("user_id") if isinstance(meta, dict) else None) or "user",
+                    "session_id": ((meta or {}).get("session_id") if isinstance(meta, dict) else None) or "unknown",
+                    "correlation_id": task_id,
+                    "source": "task",
+                    "mode": "cloud" if settings.cloud_mode else "local",
+                    "lifecycle_state": TaskStatus.PENDING.value,
+                    "type": "task_created",
+                    "message": description,
+                    "task": task,
+                }
+            )
+        except Exception:
+            pass
         self._save_tasks()
         return task_id
 
@@ -162,6 +179,24 @@ class TaskManager:
             except Exception:
                 pass
 
+        try:
+            db.log_task_event(
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "user_id": ((task.get("meta") or {}).get("user_id") if isinstance(task.get("meta"), dict) else None) or "user",
+                    "session_id": ((task.get("meta") or {}).get("session_id") if isinstance(task.get("meta"), dict) else None) or "unknown",
+                    "correlation_id": task_id,
+                    "source": "task",
+                    "mode": "cloud" if settings.cloud_mode else "local",
+                    "lifecycle_state": task.get("status") or "recorded",
+                    "type": "task_updated",
+                    "message": task.get("description") or task_id,
+                    "task": task,
+                }
+            )
+        except Exception:
+            pass
+
         self._save_tasks()
         return {"status": "success", "task": task}
     
@@ -179,6 +214,22 @@ class TaskManager:
         task["current_step"] = 0
         self.current_task = task
         self.stop_requested = False
+        try:
+            db.log_task_event(
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "user_id": ((task.get("meta") or {}).get("user_id") if isinstance(task.get("meta"), dict) else None) or "user",
+                    "session_id": ((task.get("meta") or {}).get("session_id") if isinstance(task.get("meta"), dict) else None) or "unknown",
+                    "correlation_id": task_id,
+                    "source": "task",
+                    "mode": "cloud" if settings.cloud_mode else "local",
+                    "lifecycle_state": TaskStatus.IN_PROGRESS.value,
+                    "type": "task_started",
+                    "message": task.get("description") or task_id,
+                }
+            )
+        except Exception:
+            pass
         self._save_tasks()
         
         return {"status": "success", "task": task}
@@ -190,18 +241,81 @@ class TaskManager:
         
         if self.stop_requested:
             self.current_task["status"] = TaskStatus.STOPPED.value
+            try:
+                db.log_task_event(
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "user_id": ((self.current_task.get("meta") or {}).get("user_id") if isinstance(self.current_task.get("meta"), dict) else None) or "user",
+                        "session_id": ((self.current_task.get("meta") or {}).get("session_id") if isinstance(self.current_task.get("meta"), dict) else None) or "unknown",
+                        "correlation_id": self.current_task.get("id"),
+                        "source": "task",
+                        "mode": "cloud" if settings.cloud_mode else "local",
+                        "lifecycle_state": TaskStatus.STOPPED.value,
+                        "result_status": "failed",
+                        "type": "task_stopped",
+                        "message": self.current_task.get("description") or "Task stopped",
+                    }
+                )
+            except Exception:
+                pass
             self._save_tasks()
             return {"status": "stopped", "message": "Task stopped by user"}
         
         # Save result of previous step
         if result:
             self.current_task["results"].append(result)
+            try:
+                task_id = self.current_task.get("id")
+                rs = "recorded"
+                if isinstance(result, dict):
+                    rs_raw = str(result.get("status") or result.get("result") or "").strip().lower()
+                    if rs_raw in {"success", "completed", "ok", "done"}:
+                        rs = "success"
+                    elif rs_raw in {"failed", "error", "blocked", "denied", "stopped"}:
+                        rs = "failed"
+                    elif rs_raw in {"pending", "running", "in_progress", "executing"}:
+                        rs = "in_progress"
+                db.log_task_event(
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "user_id": ((self.current_task.get("meta") or {}).get("user_id") if isinstance(self.current_task.get("meta"), dict) else None) or "user",
+                        "session_id": ((self.current_task.get("meta") or {}).get("session_id") if isinstance(self.current_task.get("meta"), dict) else None) or "unknown",
+                        "correlation_id": task_id,
+                        "source": "task",
+                        "mode": "cloud" if settings.cloud_mode else "local",
+                        "lifecycle_state": TaskStatus.IN_PROGRESS.value,
+                        "result_status": rs,
+                        "type": "task_step_result",
+                        "message": self.current_task.get("description") or str(task_id or "task"),
+                        "step_index": int(max(0, (self.current_task.get("current_step") or 0) - 1)),
+                        "step_result": result,
+                    }
+                )
+            except Exception:
+                pass
         
         # Check if task is complete
         if self.current_task["current_step"] >= len(self.current_task["steps"]):
             self.current_task["status"] = TaskStatus.COMPLETED.value
             self.current_task["completed_at"] = datetime.now().isoformat()
             task_id = self.current_task["id"]
+            try:
+                db.log_task_event(
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "user_id": ((self.current_task.get("meta") or {}).get("user_id") if isinstance(self.current_task.get("meta"), dict) else None) or "user",
+                        "session_id": ((self.current_task.get("meta") or {}).get("session_id") if isinstance(self.current_task.get("meta"), dict) else None) or "unknown",
+                        "correlation_id": task_id,
+                        "source": "task",
+                        "mode": "cloud" if settings.cloud_mode else "local",
+                        "lifecycle_state": TaskStatus.COMPLETED.value,
+                        "result_status": "success",
+                        "type": "task_completed",
+                        "message": self.current_task.get("description") or task_id,
+                    }
+                )
+            except Exception:
+                pass
             self.current_task = None
             self._save_tasks()
             return {"status": "completed", "task_id": task_id}
@@ -225,6 +339,23 @@ class TaskManager:
             self.current_task["status"] = TaskStatus.STOPPED.value
             self.current_task["completed_at"] = datetime.now().isoformat()
             task_id = self.current_task["id"]
+            try:
+                db.log_task_event(
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "user_id": ((self.current_task.get("meta") or {}).get("user_id") if isinstance(self.current_task.get("meta"), dict) else None) or "user",
+                        "session_id": ((self.current_task.get("meta") or {}).get("session_id") if isinstance(self.current_task.get("meta"), dict) else None) or "unknown",
+                        "correlation_id": task_id,
+                        "source": "task",
+                        "mode": "cloud" if settings.cloud_mode else "local",
+                        "lifecycle_state": TaskStatus.STOPPED.value,
+                        "result_status": "failed",
+                        "type": "task_stop_requested",
+                        "message": self.current_task.get("description") or task_id,
+                    }
+                )
+            except Exception:
+                pass
             self.current_task = None
             self._save_tasks()
             return {"status": "success", "message": "Task stopped", "task_id": task_id}
@@ -234,6 +365,22 @@ class TaskManager:
         """Pause current task"""
         if self.current_task:
             self.current_task["status"] = TaskStatus.PAUSED.value
+            try:
+                db.log_task_event(
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "user_id": ((self.current_task.get("meta") or {}).get("user_id") if isinstance(self.current_task.get("meta"), dict) else None) or "user",
+                        "session_id": ((self.current_task.get("meta") or {}).get("session_id") if isinstance(self.current_task.get("meta"), dict) else None) or "unknown",
+                        "correlation_id": self.current_task.get("id"),
+                        "source": "task",
+                        "mode": "cloud" if settings.cloud_mode else "local",
+                        "lifecycle_state": TaskStatus.PAUSED.value,
+                        "type": "task_paused",
+                        "message": self.current_task.get("description") or "Task paused",
+                    }
+                )
+            except Exception:
+                pass
             self._save_tasks()
             return {"status": "success", "message": "Task paused"}
         return {"status": "error", "message": "No task running"}
@@ -242,6 +389,22 @@ class TaskManager:
         """Resume paused task"""
         if self.current_task and self.current_task["status"] == TaskStatus.PAUSED.value:
             self.current_task["status"] = TaskStatus.IN_PROGRESS.value
+            try:
+                db.log_task_event(
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "user_id": ((self.current_task.get("meta") or {}).get("user_id") if isinstance(self.current_task.get("meta"), dict) else None) or "user",
+                        "session_id": ((self.current_task.get("meta") or {}).get("session_id") if isinstance(self.current_task.get("meta"), dict) else None) or "unknown",
+                        "correlation_id": self.current_task.get("id"),
+                        "source": "task",
+                        "mode": "cloud" if settings.cloud_mode else "local",
+                        "lifecycle_state": TaskStatus.IN_PROGRESS.value,
+                        "type": "task_resumed",
+                        "message": self.current_task.get("description") or "Task resumed",
+                    }
+                )
+            except Exception:
+                pass
             self._save_tasks()
             return {"status": "success", "message": "Task resumed"}
         return {"status": "error", "message": "No paused task"}

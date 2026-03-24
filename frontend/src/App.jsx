@@ -1267,10 +1267,17 @@ export default function App() {
   }, [isAuthenticated, sessionId]);
 
   const normalizeWake = useCallback((s) => {
-    return String(s || "")
+    const raw = String(s || "")
       .toLowerCase()
       .replace(/[^a-z0-9\s]/g, " ")
       .replace(/\s+/g, " ")
+      .trim();
+    if (!raw) return "";
+
+    // Trim common ASR filler/noise so wake matching is deterministic.
+    return raw
+      .replace(/^(um+|uh+|hmm+|erm+|ah+)\s+/g, "")
+      .replace(/\s+(please|pls|okay|ok)+$/g, "")
       .trim();
   }, []);
 
@@ -1281,9 +1288,17 @@ export default function App() {
     const nm = normalizeWake(assistantName || "jarvis");
     if (!nm) return null;
 
-    const onlyWakePrefix = `hey ${nm}`;
-    if (t === onlyWakePrefix) return "";
-    if (t.startsWith(`${onlyWakePrefix} `)) return t.slice(onlyWakePrefix.length).trim();
+    const wakePrefixes = [
+      nm,
+      `hey ${nm}`,
+      `hi ${nm}`,
+      `ok ${nm}`,
+      `okay ${nm}`,
+    ];
+    for (const prefix of wakePrefixes) {
+      if (t === prefix) return "";
+      if (t.startsWith(`${prefix} `)) return t.slice(prefix.length).trim();
+    }
     return null;
   }, [normalizeWake]);
 
@@ -2543,25 +2558,44 @@ export default function App() {
 
     let active = false;
     let startAttempts = 0;
+    let restartBurstCount = 0;
+    let restartBurstWindowStart = Date.now();
+    let lastRestartLogAt = 0;
     let restartTimer = null;
     let watchdogTimer = null;
     let lastEventAt = Date.now();
 
-    const scheduleStart = (ms) => {
+    const scheduleStart = (ms, reason = "retry") => {
       try {
         if (restartTimer) clearTimeout(restartTimer);
       } catch {}
-      restartTimer = setTimeout(safeStart, ms);
+      restartTimer = setTimeout(() => safeStart(reason), ms);
     };
 
-    const safeStart = () => {
+    const safeStart = (reason = "manual") => {
       if (active) return;
 
-      const disabledUntil = Number(wakeDisabledUntilRef.current || 0);
       const now = Date.now();
+      if ((now - restartBurstWindowStart) > 60_000) {
+        restartBurstWindowStart = now;
+        restartBurstCount = 0;
+      }
+      restartBurstCount += 1;
+      if (restartBurstCount > 20) {
+        wakeDisabledUntilRef.current = now + 30_000;
+        try { setWakeListeningOnline(false); } catch {}
+        if ((now - lastRestartLogAt) > 8_000) {
+          lastRestartLogAt = now;
+          addLog("system", "listener restarted too frequently; pausing for recovery.");
+        }
+        scheduleStart(31_000, "cooldown");
+        return;
+      }
+
+      const disabledUntil = Number(wakeDisabledUntilRef.current || 0);
       if (disabledUntil && now < disabledUntil) {
         const wait = Math.max(250, Math.min(disabledUntil - now, 60_000));
-        scheduleStart(wait);
+        scheduleStart(wait, "disabled_wait");
         return;
       }
 
@@ -2570,9 +2604,18 @@ export default function App() {
         active = true;
         startAttempts = 0;
         lastEventAt = Date.now();
+        if ((Date.now() - lastRestartLogAt) > 5_000 && reason !== "manual") {
+          lastRestartLogAt = Date.now();
+          addLog("system", "listener restarted");
+        }
       } catch (err) {
         startAttempts++;
-        if (startAttempts < 6) scheduleStart(400 + startAttempts * 200);
+        if (startAttempts < 6) {
+          scheduleStart(400 + startAttempts * 200, "start_failed");
+        } else {
+          wakeDisabledUntilRef.current = Date.now() + 10_000;
+          scheduleStart(10_500, "start_backoff");
+        }
       }
     };
 
@@ -2603,6 +2646,7 @@ export default function App() {
             return;
           }
           lastWakeDetectedAtRef.current = now;
+          addLog("system", "wake detected");
 
           // If the user said wake-word + command in one utterance,
           // execute immediately instead of waiting for another capture step.
@@ -2650,9 +2694,10 @@ export default function App() {
       }
     };
 
-    recognizer.onerror = (ev) => {
+    recognizer.onerror = async (ev) => {
       const errName = ev?.error || "unknown";
       lastEventAt = Date.now();
+      addLog("system", `mic error: ${errName}`);
 
       // Some errors are not recoverable without user action (permissions / missing mic).
       // Avoid an infinite restart loop that spams logs in packaged desktop builds.
@@ -2664,29 +2709,52 @@ export default function App() {
           if (errName === "language-not-supported") {
             addLog("system", `Wake listener disabled: language not supported (${voiceLang || "en-US"}).`);
           } else if (errName === "audio-capture") {
-            addLog("system", "Wake listener disabled: microphone not available.");
+            let hasAudioInput = false;
+            try {
+              const devices = await navigator.mediaDevices?.enumerateDevices?.();
+              hasAudioInput = Array.isArray(devices) && devices.some((d) => d?.kind === "audioinput");
+            } catch {
+              hasAudioInput = false;
+            }
+
+            const target = "Microphone Input Device";
+            const targetApp = "Operating System Sound Input Settings";
+            const guidance = hasAudioInput
+              ? [
+                  "Close other apps that may be using the microphone (Zoom/Teams/Recorder/browser tabs).",
+                  "Open OS Sound Input settings and confirm the correct microphone is selected.",
+                  "Restart Jarvis after releasing the microphone device.",
+                ]
+              : [
+                  "Connect/enable a microphone device in OS Sound settings.",
+                  "Set the microphone as an active input device.",
+                  "Restart Jarvis after the microphone appears in input devices.",
+                ];
+
+            addLog("system", hasAudioInput
+              ? "Wake listener disabled: microphone is busy/unavailable for this app."
+              : "Wake listener disabled: no microphone input device detected.");
             promptForRequirement({
               requestedAction: "voice_input",
-              requirementType: "operating_system_permission",
-              target: "Microphone Access",
-              title: "Permission required: Microphone access",
-              message: "Your system currently does not expose a microphone input to the app.",
+              requirementType: "operating_system_audio_device",
+              target,
+              title: "Microphone input required",
+              message: hasAudioInput
+                ? "A microphone exists but is currently unavailable to Jarvis."
+                : "No active microphone input device is available to Jarvis.",
               requirement: {
-                requirement_type: "operating_system_permission",
-                target: "Microphone Access",
-                target_application: "Operating System Privacy Settings",
+                requirement_type: "operating_system_audio_device",
+                target,
+                target_application: targetApp,
                 required_by: "user",
-                why: "Voice commands require OS-level microphone access.",
-                guidance: [
-                  "Open OS Privacy/Security settings.",
-                  "Enable microphone access for this app/browser.",
-                  "Restart the app if required.",
-                ],
+                why: "Voice commands require an available microphone input device.",
+                guidance,
                 resume_automatically: true,
               },
               actionMode: "retry_voice",
             });
           } else {
+            addLog("system", "permission missing: microphone permission denied");
             addLog(
               "system",
               "Wake listener disabled: microphone permission denied. Enable microphone access for this app/browser, then reload Jarvis."
@@ -2733,14 +2801,14 @@ export default function App() {
       active = false;
       try { setWakeListeningOnline(false); } catch {}
       // restart with backoff
-      if (isAuthenticated) scheduleStart(errName === "aborted" ? 250 : 900);
+      if (isAuthenticated) scheduleStart(errName === "aborted" ? 250 : 900, `error_${errName}`);
     };
 
     recognizer.onend = () => {
       active = false;
       try { setWakeListeningOnline(false); } catch {}
       lastEventAt = Date.now();
-      if (!isHandlingCommand.current && isAuthenticated) scheduleStart(250);
+      if (!isHandlingCommand.current && isAuthenticated) scheduleStart(250, "onend");
     };
 
     // Desktop/Electron/WebView builds sometimes end up with a "stuck" recognizer
@@ -2760,13 +2828,13 @@ export default function App() {
           try { recognizer.stop(); } catch {}
           active = false;
           lastEventAt = now;
-          scheduleStart(1200);
+          scheduleStart(1200, "watchdog_quiet");
           return;
         }
 
         // If we are not active, attempt a gentle restart.
         if (!active) {
-          scheduleStart(1200);
+          scheduleStart(1200, "watchdog_inactive");
         }
       } catch {
         // ignore
@@ -2774,7 +2842,7 @@ export default function App() {
     }, 12_000);
 
     // Start after a short delay to avoid slowing initial paint
-    const startTimer = setTimeout(safeStart, 120);
+    const startTimer = setTimeout(() => safeStart("boot"), 120);
     restartTimer = startTimer;
     wakeRecognizer.current = recognizer;
     addLog("system", "Wake-word listener started.");

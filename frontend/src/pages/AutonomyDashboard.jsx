@@ -86,6 +86,12 @@ export default function AutonomyDashboard({ sessionId, logs = [], onTabChange = 
   }, []);
 
   const refresh = useCallback(async () => {
+    if (!sessionId) {
+      setGoals([]);
+      setStatus(null);
+      setError("Login required to load autonomy dashboard data.");
+      return;
+    }
     try {
       const [gRes, sRes] = await Promise.allSettled([
         getAutonomyGoals({ sessionId, statuses: "pending,running,awaiting_confirmation,failed,completed,cancelled", limit: 80 }),
