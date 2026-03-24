@@ -1859,22 +1859,21 @@ class LLMAdapter:
                 return p
             for k in app_paths.keys():
                 k2 = str(k or "").strip().lower()
-                baseline = "I can still help with basic actions, but advanced responses are temporarily limited."
+                if k2 and (p == k2 or p.startswith(k2 + " ")):
                     return k2
         except Exception:
-                        baseline + " Share the exact error line and I will return a likely cause and fix checklist, "
-                        "or ask me to run a minimal retry plan."
+            pass
         return ""
 
     @staticmethod
-                        baseline + " I can still generate a deterministic step-by-step task plan and safe execution actions."
+    def _preparse_deterministic_voice_actions(user_text: str) -> dict | None:
         """Deterministic intent parser for voice mode.
 
         Goal: when the user says a simple PC command, do the *obvious* thing without
-                        baseline + " I can still do a deterministic project analysis pass using indexed context and recent logs."
+        relying on the LLM (which may be unavailable/rate-limited in production).
 
         Keep this conservative to avoid breaking complex requests.
-                    baseline
+        """
         t = (user_text or "").strip()
         if not t:
             return None
