@@ -776,6 +776,26 @@ class LLMAdapter:
         except Exception:
             return None
 
+    def _compact_repeat_reply(self, user_text: str, cached_text: str) -> str:
+        """Return a concise repeat-aware response that references prior output."""
+        base = str(cached_text or "").strip()
+        if not base:
+            return "Same as above."
+
+        try:
+            first = self._first_sentences(base, max_sentences=1)
+            if len(first) > 180:
+                first = first[:180].rstrip(" ,.;:") + "."
+        except Exception:
+            first = base[:180].rstrip(" ,.;:") + ("." if len(base) > 180 else "")
+
+        intent = self._classify_primary_intent(user_text)
+        if intent == "generation_intent":
+            return "I already drafted this above. Want me to apply it now?"
+        if intent == "action_intent":
+            return "Same as before. I can run this for you now if you want."
+        return f"Same as above: {first}"
+
     def _provider_available(self, provider_name: str) -> bool:
         try:
             name = str(provider_name or "").strip().lower()
@@ -1143,6 +1163,13 @@ class LLMAdapter:
             txt = re.sub(r"https?://\S+", "", txt).strip()
             txt = re.sub(r"\s{2,}", " ", txt).strip()
 
+        primary_intent = self._classify_primary_intent(user_text)
+        if primary_intent != "informational_intent":
+            txt = re.sub(r"(?im)^\s*I\s+found\s+this\s*:?\s*", "", txt).strip()
+            txt = re.sub(r"(?im)^\s*Risks\s*/\s*assumptions\s*:?\s*", "", txt).strip()
+            txt = re.sub(r"(?im)^\s*Decision\s*/\s*next\s+steps\s*:?\s*", "", txt).strip()
+            txt = re.sub(r"(?im)^\s*Source\s+URLs\s*:?\s*", "", txt).strip()
+
         qtype = self._knowledge_query_type(user_text)
         if qtype in {"debug", "system_behavior"}:
             low = txt.lower()
@@ -1304,6 +1331,59 @@ class LLMAdapter:
         return None
 
     @staticmethod
+    def _classify_primary_intent(user_text: str) -> str:
+        """Classify top-level intent with strict routing priority.
+
+        Priority:
+        1) action_intent
+        2) generation_intent
+        3) clarification_intent
+        4) informational_intent
+        """
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            return "clarification_intent"
+
+        action_intent = bool(
+            re.search(
+                r"\b(open|launch|start|run|execute|close|quit|exit|switch\s+to|focus|go\s+to|"
+                r"take\s+(a\s+)?screenshot|capture\s+screen|set\s+(volume|brightness)|"
+                r"turn\s+on|turn\s+off|enable|disable|lock\s+screen|restart|shutdown|"
+                r"open\s+settings|create\s+folder|make\s+folder|delete\s+file|read\s+file|list\s+files)\b",
+                tl,
+            )
+        )
+
+        generation_intent = bool(
+            re.search(
+                r"\b(write|draft|compose|generate|create|make)\b.*\b(email|mail|message|reply|"
+                r"post|content|letter|proposal|summary|bio|description|code|snippet|text)\b",
+                tl,
+            )
+            or re.search(r"\b(email|mail)\b.*\b(write|draft|compose|generate|create|send)\b", tl)
+        )
+
+        informational_intent = bool(
+            re.search(r"\b(what|why|how|when|where|which|who)\b", tl)
+            or re.search(r"\b(explain|define|meaning|research|documentation|docs|guide|tutorial)\b", tl)
+        )
+
+        clarification_intent = bool(
+            re.fullmatch(r"(do it|do this|do that|same as before|like before|continue|go ahead)\.?", tl)
+            or re.search(r"\b(this|that|it)\b", tl)
+        )
+
+        if action_intent:
+            return "action_intent"
+        if generation_intent:
+            return "generation_intent"
+        if clarification_intent:
+            return "clarification_intent"
+        if informational_intent:
+            return "informational_intent"
+        return "clarification_intent"
+
+    @staticmethod
     def _looks_uncertain(reply_text: str) -> bool:
         tl = (reply_text or "").strip().lower()
         if not tl:
@@ -1325,14 +1405,41 @@ class LLMAdapter:
 
     @staticmethod
     def _is_informational_question(user_text: str) -> bool:
+        return LLMAdapter._classify_primary_intent(user_text) == "informational_intent"
+
+    @staticmethod
+    def _build_direct_generation_response(user_text: str) -> dict | None:
+        """Deterministic generation fast-path for content requests.
+
+        This path intentionally avoids web/RAG for generation tasks.
+        """
         tl = (user_text or "").strip().lower()
         if not tl:
-            return False
-        if re.search(r"\b(what|why|how|when|where|which|who)\b", tl):
-            return True
-        if re.search(r"\b(explain|define|meaning|documentation|docs|guide|tutorial)\b", tl):
-            return True
-        return False
+            return None
+
+        if re.search(r"\b(email|mail)\b", tl) and re.search(r"\b(write|draft|compose|generate|create|make|send)\b", tl):
+            draft = LLMAdapter._build_reasonable_draft(user_text)
+            if not draft:
+                return None
+            return {
+                "text": f"{draft}\n\nDo you want me to open Outlook and create a draft?",
+                "actions": [],
+                "source": "deterministic-generation",
+            }
+
+        if re.search(r"\b(write|draft|compose|generate|create|make)\b", tl) and re.search(
+            r"\b(message|reply|post|content|summary|bio|description|code|snippet|text)\b", tl
+        ):
+            draft = LLMAdapter._build_reasonable_draft(user_text)
+            if not draft:
+                return None
+            return {
+                "text": draft,
+                "actions": [],
+                "source": "deterministic-generation",
+            }
+
+        return None
 
     @staticmethod
     def _quick_local_chat_reply(user_text: str) -> dict | None:
@@ -1434,6 +1541,45 @@ class LLMAdapter:
         if at == "device_action":
             return "Applying that setting."
         return "Done."
+
+    def _postprocess_proactive_followup(self, user_text: str, parsed: dict) -> dict:
+        """Add concise assistant-style confirmations and optional follow-up suggestions."""
+        if not isinstance(parsed, dict):
+            return parsed
+
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+        txt = str(parsed.get("text") or "").strip()
+        intent = self._classify_primary_intent(user_text)
+
+        if actions:
+            first = actions[0] if actions and isinstance(actions[0], dict) else {}
+            at = str(first.get("type") or "").strip().lower()
+            important = {"open_app", "switch_app", "close_app", "execute_command", "device_action"}
+            if at in important:
+                confirm = self._action_text_from_first_action(actions).strip()
+                if confirm.endswith("."):
+                    confirm = confirm[:-1] + " now."
+                if (not txt) or ("opening" not in txt.lower() and "switching" not in txt.lower() and "closing" not in txt.lower() and "applying" not in txt.lower()):
+                    parsed["text"] = confirm
+            return parsed
+
+        # No actions: add optional proactive suggestion for generation/helpful tasks.
+        suggestion = ""
+        tl = (user_text or "").strip().lower()
+        if intent == "generation_intent":
+            if re.search(r"\b(email|mail)\b", tl):
+                suggestion = "Do you want me to open Outlook and create this draft?"
+            elif re.search(r"\b(fix|debug|error|issue)\b", tl):
+                suggestion = "Want me to fix this automatically?"
+            else:
+                suggestion = "I can run this for you if you want."
+
+        if suggestion and suggestion.lower() not in txt.lower():
+            parsed["text"] = (txt + "\n\n" + suggestion).strip() if txt else suggestion
+
+        return parsed
 
     def _is_local_reasoner_candidate(self, text: str, mode: str, decision_hint: dict | None) -> bool:
         # Universal LLM-only mode: disable local/deterministic reasoner.
@@ -2687,6 +2833,10 @@ class LLMAdapter:
         if any(m in t for m in self_system_markers):
             return False
 
+        primary_intent = LLMAdapter._classify_primary_intent(user_text)
+        if primary_intent in {"action_intent", "generation_intent", "clarification_intent"}:
+            return False
+
         # If global factual mode is enabled, default to web-first for non-local informational queries.
         # This applies across ALL topics (not domain-specific).
         local_action_markers = (
@@ -2886,6 +3036,9 @@ class LLMAdapter:
             if tl.startswith("you are ") or ("provided web context" in tl):
                 return parsed
 
+            if LLMAdapter._classify_primary_intent(user_text) != "informational_intent":
+                return parsed
+
             if not LLMAdapter._should_use_web_lookup(user_text):
                 return parsed
 
@@ -2961,6 +3114,61 @@ class LLMAdapter:
             return parsed
 
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
+        primary_intent = self._classify_primary_intent(text)
+
+        try:
+            repeated = self._get_cached_response(text, max_age_s=240)
+            if isinstance(repeated, dict) and not (repeated.get("actions") or []):
+                repeated_text = str(repeated.get("text") or "").strip()
+                if repeated_text and primary_intent in {"generation_intent", "action_intent", "clarification_intent"}:
+                    return {
+                        "text": self._compact_repeat_reply(text, repeated_text),
+                        "actions": [],
+                        "source": "repeat-aware-cache",
+                        "routing": {
+                            "provider": "deterministic",
+                            "model": "local-fast-path",
+                            "fallback_used": True,
+                        },
+                    }
+        except Exception:
+            pass
+
+        if primary_intent == "action_intent":
+            try:
+                deterministic_action = self._preparse_deterministic_voice_actions(text)
+                if isinstance(deterministic_action, dict) and isinstance(deterministic_action.get("actions"), list) and deterministic_action.get("actions"):
+                    deterministic_action["routing"] = {
+                        "provider": "deterministic",
+                        "model": "local-fast-path",
+                        "fallback_used": True,
+                    }
+                    try:
+                        deterministic_action["emotion"] = deterministic_action.get("emotion") or self._infer_emotion(deterministic_action.get("text") or text)
+                    except Exception:
+                        pass
+                    return deterministic_action
+            except Exception:
+                pass
+
+        if primary_intent == "generation_intent":
+            try:
+                generated = self._build_direct_generation_response(text)
+                if isinstance(generated, dict):
+                    generated = self._postprocess_proactive_followup(text, generated)
+                    generated["routing"] = {
+                        "provider": "deterministic",
+                        "model": "local-fast-path",
+                        "fallback_used": True,
+                    }
+                    try:
+                        generated["emotion"] = generated.get("emotion") or self._infer_emotion(generated.get("text") or text)
+                    except Exception:
+                        pass
+                    return generated
+            except Exception:
+                pass
+
         quick = self._quick_local_chat_reply(text)
         if isinstance(quick, dict):
             quick["routing"] = {
@@ -2996,7 +3204,7 @@ class LLMAdapter:
         # We only do this when we did NOT match a deterministic PC command above.
         try:
             if (mode or "").lower() == "voice":
-                if self._should_use_web_lookup(text):
+                if primary_intent == "informational_intent" and self._should_use_web_lookup(text):
                     parsed = {"text": "Looking it up online.", "actions": []}
                     try:
                         parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
@@ -3018,7 +3226,7 @@ class LLMAdapter:
 
             is_internal = tl.startswith("you are ") or ("provided web context" in tl)
             if not is_internal:
-                if (offline_only or offline_web_only or (offline_analysis and self._is_high_level_analysis_task(text))) and self._should_use_web_lookup(text):
+                if primary_intent == "informational_intent" and (offline_only or offline_web_only or (offline_analysis and self._is_high_level_analysis_task(text))) and self._should_use_web_lookup(text):
                     parsed = {"text": "Looking it up online.", "actions": []}
                     try:
                         parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
@@ -3031,7 +3239,7 @@ class LLMAdapter:
 
                 # Also bypass OpenAI when there's no key configured, but only for
                 # web-required high-level questions (keeps local automation usable).
-                if (not self.primary_key and not self.backup_key) and self._should_use_web_lookup(text) and self._is_high_level_analysis_task(text):
+                if primary_intent == "informational_intent" and (not self.primary_key and not self.backup_key) and self._should_use_web_lookup(text) and self._is_high_level_analysis_task(text):
                     parsed = {"text": "Looking it up online.", "actions": []}
                     try:
                         parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
@@ -3058,7 +3266,7 @@ class LLMAdapter:
                         tl,
                     )
                 )
-                if explicit_research and self._should_use_web_lookup(text):
+                if primary_intent == "informational_intent" and explicit_research and self._should_use_web_lookup(text):
                     parsed = {"text": "Researching online.", "actions": []}
                     try:
                         parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
@@ -3133,7 +3341,7 @@ class LLMAdapter:
         # This triggers the existing 2-pass web pipeline (search -> continue with web context).
         try:
             auto_unknown = bool(rd.AUTO_WEB_ON_UNKNOWN)
-            if auto_unknown and self._is_informational_question(text):
+            if auto_unknown and primary_intent == "informational_intent" and self._is_informational_question(text):
                 conf = 0.0
                 intent = None
                 if isinstance(decision_hint, dict):
@@ -3650,6 +3858,13 @@ Style tone: {tone}.
             # Final pass: de-duplicate actions (prevents repeated open_app, etc.).
             try:
                 parsed["actions"] = self._dedupe_actions(parsed.get("actions") or [])
+            except Exception:
+                pass
+
+            # Assistant-style behavior: concise confirmation for important actions
+            # and optional proactive follow-up suggestions when useful.
+            try:
+                parsed = self._postprocess_proactive_followup(text, parsed)
             except Exception:
                 pass
 
@@ -4406,6 +4621,10 @@ Style tone: {tone}.
             or re.search(r"\b(it\s+company|company|corporate|hr\s+team)\b", tl)
         )
 
+        # If recipient is known, generate a usable first draft directly.
+        if has_recipient:
+            return False
+
         return not (has_recipient and (has_purpose or has_style_or_business_context))
 
     @staticmethod
@@ -4682,10 +4901,15 @@ Style tone: {tone}.
                 return parsed
 
             if vague:
-                question = (
-                    "To make sure I do exactly what you want: what is the specific outcome you want, "
-                    "and are there any constraints (time range/region/output format)?"
-                )
+                if re.search(r"\b(email|mail|outlook)\b", tl):
+                    question = "Do you want me to write the email or open Outlook?"
+                elif re.search(r"\b(open|run|execute|start|launch)\b", tl):
+                    question = "Do you want me to run this now, or just generate the steps?"
+                else:
+                    question = (
+                        "To make sure I do exactly what you want: what is the specific outcome you want, "
+                        "and are there any constraints (time range/region/output format)?"
+                    )
                 parsed["text"] = question if not out_text else (out_text + "\n\n" + question)
                 parsed["actions"] = []
                 parsed["clarification"] = {
