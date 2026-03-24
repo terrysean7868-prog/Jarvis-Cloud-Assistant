@@ -1384,6 +1384,50 @@ class LLMAdapter:
         return "clarification_intent"
 
     @staticmethod
+    def _is_mixed_action_generation_intent(user_text: str) -> bool:
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            return False
+
+        has_action = bool(
+            re.search(
+                r"\b(open|launch|start|run|execute|close|switch\s+to|focus|go\s+to|"
+                r"take\s+(a\s+)?screenshot|capture\s+screen|set\s+(volume|brightness)|"
+                r"turn\s+on|turn\s+off|enable|disable|open\s+settings)\b",
+                tl,
+            )
+        )
+        has_generation = bool(
+            re.search(
+                r"\b(write|draft|compose|generate|create|make)\b.*\b(email|mail|message|reply|content|code|text)\b",
+                tl,
+            )
+            or re.search(r"\b(email|mail)\b.*\b(write|draft|compose|generate|create|send)\b", tl)
+        )
+        has_joiner = bool(re.search(r"\b(and|then|also|plus)\b", tl))
+        return has_action and has_generation and has_joiner
+
+    @staticmethod
+    def _build_mixed_intent_generation_first_response(user_text: str) -> dict | None:
+        if not LLMAdapter._is_mixed_action_generation_intent(user_text):
+            return None
+
+        draft = LLMAdapter._build_reasonable_draft(user_text)
+        if not draft:
+            return None
+
+        app = LLMAdapter._maybe_map_local_app_name(user_text)
+        if not app:
+            app = "Notepad"
+
+        app_label = str(app or "Notepad").strip()
+        return {
+            "text": f"{draft}\n\nDo you want me to open {app_label} and paste this?",
+            "actions": [],
+            "source": "deterministic-mixed-intent",
+        }
+
+    @staticmethod
     def _looks_uncertain(reply_text: str) -> bool:
         tl = (reply_text or "").strip().lower()
         if not tl:
@@ -1815,22 +1859,22 @@ class LLMAdapter:
                 return p
             for k in app_paths.keys():
                 k2 = str(k or "").strip().lower()
-                if k2 and (p == k2 or p.startswith(k2 + " ")):
+                baseline = "I can still help with basic actions, but advanced responses are temporarily limited."
                     return k2
         except Exception:
-            pass
-
+                        baseline + " Share the exact error line and I will return a likely cause and fix checklist, "
+                        "or ask me to run a minimal retry plan."
         return ""
 
     @staticmethod
-    def _preparse_deterministic_voice_actions(user_text: str) -> dict | None:
+                        baseline + " I can still generate a deterministic step-by-step task plan and safe execution actions."
         """Deterministic intent parser for voice mode.
 
         Goal: when the user says a simple PC command, do the *obvious* thing without
-        relying on the LLM (which may be unavailable/rate-limited in production).
+                        baseline + " I can still do a deterministic project analysis pass using indexed context and recent logs."
 
         Keep this conservative to avoid breaking complex requests.
-        """
+                    baseline
         t = (user_text or "").strip()
         if not t:
             return None
@@ -3114,6 +3158,22 @@ class LLMAdapter:
             return parsed
 
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
+        try:
+            mixed = self._build_mixed_intent_generation_first_response(text)
+            if isinstance(mixed, dict):
+                mixed["routing"] = {
+                    "provider": "deterministic",
+                    "model": "local-fast-path",
+                    "fallback_used": True,
+                }
+                try:
+                    mixed["emotion"] = mixed.get("emotion") or self._infer_emotion(mixed.get("text") or text)
+                except Exception:
+                    pass
+                return mixed
+        except Exception:
+            pass
+
         primary_intent = self._classify_primary_intent(text)
 
         try:
@@ -3684,6 +3744,13 @@ Style tone: {tone}.
                             str(e_primary),
                         )
                         print(f"[LLM WARN] Primary provider failed (attempt {attempt + 1}): {e_primary}")
+                        if attempt < (max_primary_attempts - 1):
+                            try:
+                                backoff = min(0.25 * float(attempt + 1), 0.7)
+                                if backoff > 0:
+                                    await asyncio.sleep(backoff)
+                            except Exception:
+                                pass
                         if attempt >= 1 and not self._is_transient_provider_error(e_primary):
                             break
                 if response is None:
@@ -3724,26 +3791,42 @@ Style tone: {tone}.
                 provider_source = "groq" if fallback_provider in {"groq", "openai_compatible", "openai"} else fallback_provider
                 routed_model = fallback_model
                 fallback_prompt = _build_user_prompt(prompt_windows[-1])
-                logger.info("[llm.provider.start] provider=%s attempt=1 remaining_s=%.2f", provider_source, remaining)
-                try:
-                    response = await asyncio.wait_for(
-                        self._call_openai(
-                            [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": fallback_prompt},
-                            ],
-                            max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
-                            temperature=temperature,
-                            model=fallback_model,
-                            endpoint=self.backup_endpoint,
-                            api_key=self.backup_key,
-                        ),
-                        timeout=max(1.0, min(float(request_timeout_s), remaining)),
-                    )
-                    self._mark_provider_success(fallback_provider)
-                except Exception:
-                    self._mark_provider_failure(fallback_provider)
-                    raise
+                fallback_attempts = 2
+                for fb_attempt in range(fallback_attempts):
+                    elapsed = time.monotonic() - budget_started
+                    remaining = max(0.0, float(request_budget_s) - elapsed)
+                    if remaining <= 0.0:
+                        break
+                    logger.info("[llm.provider.start] provider=%s attempt=%s remaining_s=%.2f", provider_source, fb_attempt + 1, remaining)
+                    try:
+                        response = await asyncio.wait_for(
+                            self._call_openai(
+                                [
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": fallback_prompt},
+                                ],
+                                max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
+                                temperature=temperature,
+                                model=fallback_model,
+                                endpoint=self.backup_endpoint,
+                                api_key=self.backup_key,
+                            ),
+                            timeout=max(1.0, min(float(request_timeout_s), remaining)),
+                        )
+                        self._mark_provider_success(fallback_provider)
+                        break
+                    except Exception as e_fallback:
+                        last_err = e_fallback
+                        if fb_attempt < (fallback_attempts - 1):
+                            try:
+                                backoff = min(0.3 * float(fb_attempt + 1), 0.8)
+                                if backoff > 0:
+                                    await asyncio.sleep(backoff)
+                            except Exception:
+                                pass
+                            continue
+                        self._mark_provider_failure(fallback_provider)
+                        raise
             if chosen_provider in {"ollama", "local_model"} and isinstance(response, dict):
                 msg = response.get("message") or {}
                 content = str(msg.get("content") or "").strip()

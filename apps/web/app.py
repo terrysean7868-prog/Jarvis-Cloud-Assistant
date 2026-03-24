@@ -846,6 +846,19 @@ async def _delegate_or_queue_cloud_action(
     await_timeout_s: float = 2.5,
 ) -> dict[str, Any]:
     _require_pc_agent_enabled()
+    executable_actions, blocked_actions = _split_agent_executable_actions(actions)
+    if blocked_actions:
+        out = _cloud_envelope(
+            status="failed",
+            execution={"feature": feature, "blocked_actions": blocked_actions},
+            result=None,
+            message="This request includes generation/planning actions. Generate content first, then delegate executable device actions.",
+        )
+        out["feature"] = feature
+        out["blocked_actions"] = blocked_actions
+        return out
+
+    actions = executable_actions
     principal = _require_admin_session(session_id) if require_admin else _require_authenticated_session(session_id)
     username = str((principal or {}).get("username") or "").strip().lower()
     role = str((principal or {}).get("role") or "user").strip().lower()
@@ -2120,9 +2133,41 @@ def _is_remote_device_action(a: dict) -> bool:
         "self_update", "self_add",
     }
 
+
+def _is_generation_or_thinking_action(a: dict) -> bool:
+    t = str((a or {}).get("type") or "").strip().lower()
+    if t in {"generate_email", "generate_content", "summarize", "analyze", "think", "reason"}:
+        return True
+    # mcp_tool and similar meta-tools should not be sent to device execution agent.
+    if t in {"mcp_tool", "set_mode"}:
+        return True
+    return False
+
+
+def _split_agent_executable_actions(actions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    executable: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for a in (actions or []):
+        if not isinstance(a, dict):
+            continue
+        if _is_generation_or_thinking_action(a):
+            blocked.append(a)
+            continue
+        if not _is_remote_device_action(a):
+            blocked.append(a)
+            continue
+        executable.append(a)
+    return executable, blocked
+
 async def _dispatch_actions_to_device(device_id: str, username: str, actions: list[dict], source_text: str):
     """Forward actions to a connected local agent."""
     _require_pc_agent_enabled()
+    executable_actions, blocked_actions = _split_agent_executable_actions(actions)
+    if blocked_actions:
+        blocked_types = [str((a or {}).get("type") or "") for a in blocked_actions]
+        raise ValueError(f"non_executable_actions_for_agent: {blocked_types}")
+
+    actions = executable_actions
     job_id = f"job_{os.urandom(8).hex()}"
 
     contract_actions: list[dict[str, Any]] = []
@@ -2953,6 +2998,15 @@ async def device_dispatch(req: DeviceDispatchRequest):
                 "index": i,
                 "hint": "Each action must include a non-empty 'type'.",
             })
+
+    executable_actions, blocked_actions = _split_agent_executable_actions(actions)
+    if blocked_actions:
+        raise HTTPException(status_code=400, detail={
+            "message": "Invalid device dispatch payload",
+            "hint": "Only executable device/file/system actions can be dispatched to PC agent. Generation/thinking actions must run before dispatch.",
+            "blocked_actions": [str((a or {}).get("type") or "") for a in blocked_actions],
+        })
+    actions = executable_actions
 
     agent = await device_hub.get_agent(did)
     caps = (agent or {}).get("capabilities") or None
