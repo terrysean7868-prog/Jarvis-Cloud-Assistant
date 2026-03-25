@@ -63,7 +63,7 @@ def main() -> int:
     parser.add_argument("--yes", action="store_true", help="Actually drop collections (required to make changes).")
     parser.add_argument(
         "--uri",
-        default=os.getenv("MONGODB_URI") or os.getenv("MONGO_URI"),
+        default=os.getenv("MONGODB_URI"),
         help="MongoDB connection string (defaults from env: MONGODB_URI/MONGO_URI).",
     )
     parser.add_argument(

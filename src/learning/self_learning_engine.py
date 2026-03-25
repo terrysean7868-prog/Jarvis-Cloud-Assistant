@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import threading
 from collections import Counter
@@ -40,6 +41,52 @@ def _pattern_key(kind: str, text: str) -> str:
     return hashlib.sha1(src.encode("utf-8", errors="ignore")).hexdigest()[:24]
 
 
+def _extract_fix_hint(payload: dict[str, Any] | None) -> str:
+    p = payload if isinstance(payload, dict) else {}
+    for key in ("fix_suggestion", "resolution", "recommendation", "result", "next_step"):
+        val = str(p.get(key) or "").strip()
+        if val:
+            return val
+    return "Apply deterministic fix checklist and retry with safer parameters."
+
+
+def _is_generic_pattern(text: str) -> bool:
+    t = _norm_text(text)
+    if not t:
+        return True
+    if len(t) < 8:
+        return True
+    generic_terms = {
+        "hello",
+        "hi",
+        "thanks",
+        "ok",
+        "yes",
+        "no",
+        "help",
+        "please help",
+        "try again",
+        "do it",
+        "open app",
+        "open",
+        "run",
+    }
+    return t in generic_terms
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    s = str(value or "").strip().replace("Z", "+00:00")
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        return None
+
+
 class SelfLearningEngine:
     """Controlled learning loop using existing logs and datasets.
 
@@ -54,13 +101,46 @@ class SelfLearningEngine:
         self._last_cycle_at: datetime | None = None
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _learning_confidence(row: dict[str, Any], *, query: str = "") -> float:
+        pattern_type = str((row or {}).get("pattern_type") or "").strip().lower()
+        response_outcome = str((row or {}).get("response_outcome") or "").strip().lower()
+        quality = max(0.0, min(1.0, float((row or {}).get("quality_score") or 0.0)))
+        priority = max(0.0, float((row or {}).get("priority_score") or 0.0))
+        freq = max(0, int((row or {}).get("frequency") or 0))
+        recency_days = 365.0
+        updated_at = _parse_iso((row or {}).get("updated_at"))
+        if updated_at is not None:
+            recency_days = max(0.0, (datetime.now(UTC) - updated_at).total_seconds() / 86400.0)
+        recency_score = max(0.0, min(1.0, math.exp(-recency_days / 10.0)))
+        repeat_score = max(0.0, min(1.0, math.log10(freq + 1.0)))
+        correction_usefulness = 1.0 if str((row or {}).get("best_response") or "").strip() else 0.0
+        failure_impact = 0.0
+        if pattern_type in {"failure_fix", "error"}:
+            failure_impact = 1.0
+        if response_outcome == "failed":
+            failure_impact = max(failure_impact, 0.9)
+        sim = _similarity(query, str((row or {}).get("input_pattern") or "")) if query else 0.0
+        generic_penalty = 0.25 if _is_generic_pattern(str((row or {}).get("input_pattern") or "")) else 0.0
+        confidence = (
+            (quality * 0.2)
+            + (min(1.0, priority / 2.0) * 0.2)
+            + (failure_impact * 0.28)
+            + (correction_usefulness * 0.1)
+            + (repeat_score * 0.16)
+            + (recency_score * 0.07)
+            + (sim * 0.05)
+            - generic_penalty
+        )
+        return max(0.0, min(1.0, float(confidence)))
+
     def _ensure_indexes(self) -> None:
         db._ensure_connected()
         if db.db is None:
             return
         try:
             db.db["learning_memory"].create_index([("pattern_key", 1)], unique=True)
-            db.db["learning_memory"].create_index([("pattern_type", 1), ("frequency", -1)])
+            db.db["learning_memory"].create_index([("pattern_type", 1), ("priority_score", -1), ("frequency", -1)])
             db.db["learning_memory"].create_index([("updated_at", -1)])
         except Exception:
             pass
@@ -91,13 +171,32 @@ class SelfLearningEngine:
 
         key = _pattern_key(pattern_type, input_pattern)
         now = _now_iso()
+        quality_score = max(0.0, min(1.0, float(entry.get("quality_score") or 0.7)))
+        freq = int(max(1, int(entry.get("frequency") or 1)))
+        repeat_score = max(0.0, min(1.0, math.log10(freq + 1.0)))
+        response_outcome = str(entry.get("response_outcome") or "").strip().lower() or None
+        failure_impact = 1.0 if pattern_type in {"failure_fix", "error"} else 0.0
+        if response_outcome == "failed":
+            failure_impact = max(failure_impact, 0.9)
+        correction_usefulness = 1.0 if str(entry.get("best_response") or entry.get("fix_pattern") or "").strip() else 0.0
+        priority_score = round(
+            (quality_score * 0.4)
+            + (failure_impact * 0.3)
+            + (correction_usefulness * 0.18)
+            + (repeat_score * 0.12),
+            4,
+        )
         set_payload = {
             "pattern_type": pattern_type,
             "pattern_key": key,
             "input_pattern": input_pattern,
             "best_response": str(entry.get("best_response") or "").strip() or None,
             "failure_case": str(entry.get("failure_case") or "").strip() or None,
+            "fix_pattern": str(entry.get("fix_pattern") or "").strip() or None,
             "improvement_hint": str(entry.get("improvement_hint") or "").strip() or None,
+            "response_outcome": response_outcome,
+            "quality_score": round(quality_score, 4),
+            "priority_score": priority_score,
             "updated_at": now,
             "source": "self_learning_engine",
         }
@@ -107,7 +206,7 @@ class SelfLearningEngine:
             {
                 "$set": set_payload,
                 "$setOnInsert": {"created_at": now},
-                "$inc": {"frequency": int(max(1, int(entry.get("frequency") or 1)))},
+                "$inc": {"frequency": freq},
             },
             upsert=True,
         )
@@ -121,6 +220,9 @@ class SelfLearningEngine:
         actions: list[dict[str, Any]] | None = None,
         source: str = "chat",
         request_id: str | None = None,
+        response_status: str | None = None,
+        fallback_used: bool | None = None,
+        task_result_status: str | None = None,
     ) -> dict[str, Any]:
         """Record response quality signal (read-only inference + observational write)."""
         self._ensure_indexes()
@@ -153,11 +255,32 @@ class SelfLearningEngine:
             weak_reasons.append("empty_or_short_response")
         if re.search(r"\b(not\s+sure|cannot|couldn\s*t|unavailable|try\s+again)\b", r_norm):
             weak_reasons.append("uncertain_response")
+        status_s = str(response_status or "").strip().lower()
+        if status_s in {"failed", "error"}:
+            weak_reasons.append("response_failed")
+        task_status = str(task_result_status or "").strip().lower()
+        if task_status in {"failed", "error", "blocked", "denied", "stopped"}:
+            weak_reasons.append("task_failed")
+        fallback_flag = bool(fallback_used) or ("fallback" in str(source or "").strip().lower())
+        if fallback_flag:
+            weak_reasons.append("fallback_used")
+
+        response_outcome = "success"
+        if (
+            "response_failed" in weak_reasons
+            or "task_failed" in weak_reasons
+            or re.search(r"\b(failed|error|exception|unable)\b", r_norm)
+        ):
+            response_outcome = "failed"
+        elif weak_reasons or (repeats >= 3 and len(r_norm) < 24):
+            response_outcome = "weak"
 
         quality_score = 1.0
-        quality_score -= min(0.75, 0.2 * len(weak_reasons))
+        quality_score -= min(0.8, 0.2 * len(weak_reasons))
         if actions:
             quality_score += 0.1
+        if response_outcome == "failed":
+            quality_score -= 0.2
         quality_score = max(0.0, min(1.0, quality_score))
 
         payload = {
@@ -170,19 +293,37 @@ class SelfLearningEngine:
             "weak": bool(weak_reasons),
             "weak_reasons": weak_reasons,
             "quality_score": round(float(quality_score), 4),
+            "response_outcome": response_outcome,
             "action_count": len(actions or []),
             "repeat_count_hint": int(repeats),
+            "fallback_used": bool(fallback_flag),
+            "task_result_status": task_status or None,
         }
         db.db["response_quality_signals"].insert_one(payload)
 
         # Update learning memory with successful or weak outcomes.
-        if weak_reasons:
+        if response_outcome == "failed":
+            self._upsert_learning_entry(
+                {
+                    "pattern_type": "failure_fix",
+                    "input_pattern": query,
+                    "failure_case": " | ".join(weak_reasons),
+                    "fix_pattern": "Provide direct diagnosis, root cause, and one deterministic recovery step.",
+                    "improvement_hint": "When failure repeats, include one concrete fallback path in the first response.",
+                    "response_outcome": response_outcome,
+                    "quality_score": quality_score,
+                    "frequency": 1,
+                }
+            )
+        elif weak_reasons:
             self._upsert_learning_entry(
                 {
                     "pattern_type": "chat",
                     "input_pattern": query,
                     "failure_case": " | ".join(weak_reasons),
                     "improvement_hint": "Provide a clearer direct answer and include one concrete next step.",
+                    "response_outcome": response_outcome,
+                    "quality_score": quality_score,
                     "frequency": 1,
                 }
             )
@@ -193,6 +334,8 @@ class SelfLearningEngine:
                     "input_pattern": query,
                     "best_response": response_text,
                     "improvement_hint": "Reuse concise structure for similar future prompts.",
+                    "response_outcome": response_outcome,
+                    "quality_score": quality_score,
                     "frequency": 1,
                 }
             )
@@ -202,6 +345,7 @@ class SelfLearningEngine:
             "quality_score": round(float(quality_score), 4),
             "weak": bool(weak_reasons),
             "weak_reasons": weak_reasons,
+            "response_outcome": response_outcome,
         }
 
     def record_model_performance(
@@ -239,30 +383,38 @@ class SelfLearningEngine:
         if not q:
             return []
 
-        rows = list(db.db["learning_memory"].find({}, {"_id": 0}).sort("updated_at", -1).limit(250))
+        q_norm = _norm_text(q)
+        is_debug_or_task = bool(re.search(r"\b(debug|error|traceback|exception|task|failed|fix|retry|timeout)\b", q_norm))
+        rows = list(db.db["learning_memory"].find({}, {"_id": 0}).sort("updated_at", -1).limit(500))
         scored: list[tuple[float, dict[str, Any]]] = []
         for row in rows:
             pat = str(row.get("input_pattern") or "")
             if not pat:
                 continue
+            confidence = self._learning_confidence(row, query=q)
             sim = _similarity(q, pat)
-            freq_bonus = min(0.3, float(int(row.get("frequency") or 0)) / 30.0)
-            score = sim + freq_bonus
-            if score < 0.22:
+            if confidence < 0.48 and sim < 0.7:
                 continue
-            scored.append((score, row))
+            if _is_generic_pattern(pat) and confidence < 0.88:
+                continue
+            if is_debug_or_task and str(row.get("pattern_type") or "").strip().lower() == "failure_fix":
+                confidence = min(1.0, confidence + 0.18)
+            scored.append((confidence, row))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         hints: list[str] = []
-        for _, row in scored[: max(1, int(limit))]:
+        for conf, row in scored[: max(1, int(limit) * 2)]:
             best = str(row.get("best_response") or "").strip()
             fail = str(row.get("failure_case") or "").strip()
+            fix_pattern = str(row.get("fix_pattern") or "").strip()
             improve = str(row.get("improvement_hint") or "").strip()
-            if best:
+            if best and conf >= 0.72:
                 hints.append(f"best_response_pattern: {best[:180]}")
-            if fail:
+            if fix_pattern and conf >= 0.68:
+                hints.append(f"failure_fix_pattern: failure={fail[:90] or 'unknown'} | fix={fix_pattern[:140]}")
+            elif fail and conf >= 0.7:
                 hints.append(f"avoid_failure_pattern: {fail[:140]}")
-            if improve:
+            if improve and conf >= 0.66:
                 hints.append(f"improvement_hint: {improve[:140]}")
             if len(hints) >= max(1, int(limit)):
                 break
@@ -277,9 +429,17 @@ class SelfLearningEngine:
             return None
         rows = list(
             db.db["learning_memory"]
-            .find({"pattern_type": "chat", "best_response": {"$exists": True, "$ne": None}}, {"_id": 0})
-            .sort("frequency", -1)
-            .limit(120)
+            .find(
+                {
+                    "pattern_type": "chat",
+                    "best_response": {"$exists": True, "$ne": None},
+                    "response_outcome": "success",
+                    "quality_score": {"$gte": 0.75},
+                },
+                {"_id": 0},
+            )
+            .sort([("priority_score", -1), ("frequency", -1), ("updated_at", -1)])
+            .limit(200)
         )
         best_score = 0.0
         best_text: str | None = None
@@ -288,13 +448,89 @@ class SelfLearningEngine:
             ans = str(row.get("best_response") or "").strip()
             if not pat or not ans:
                 continue
+            if _is_generic_pattern(pat):
+                continue
             sim = _similarity(q, pat)
             freq = int(row.get("frequency") or 0)
-            if sim >= 0.93 and freq >= 2:
-                if sim > best_score:
-                    best_score = sim
+            conf = self._learning_confidence(row, query=q)
+            if sim >= 0.95 and freq >= 3 and conf >= 0.82:
+                score = (sim * 0.72) + (conf * 0.28)
+                if score > best_score:
+                    best_score = score
                     best_text = ans
         return best_text
+
+    def build_learning_quality_report(self, *, lookback_hours: int = 96) -> dict[str, Any]:
+        self._ensure_indexes()
+        if db.db is None:
+            return {"status": "skipped", "reason": "db_unavailable"}
+
+        since = (datetime.now(UTC) - timedelta(hours=max(1, int(lookback_hours)))).isoformat()
+        lm_rows = list(db.db["learning_memory"].find({}, {"_id": 0}).limit(3000))
+        quality_rows = list(
+            db.db["response_quality_signals"].find(
+                {"recorded_at": {"$gte": since}},
+                {"_id": 0, "query": 1, "response_outcome": 1, "quality_score": 1, "weak_reasons": 1, "recorded_at": 1},
+            ).limit(4000)
+        )
+
+        def _top_rows(rows: list[dict[str, Any]], *, n: int = 5) -> list[dict[str, Any]]:
+            ranked = sorted(rows, key=lambda r: self._learning_confidence(r), reverse=True)
+            out: list[dict[str, Any]] = []
+            for r in ranked[: n * 3]:
+                out.append(
+                    {
+                        "pattern_type": str(r.get("pattern_type") or "unknown"),
+                        "input_pattern": str(r.get("input_pattern") or "")[:120],
+                        "failure_case": str(r.get("failure_case") or "")[:120],
+                        "fix_pattern": str(r.get("fix_pattern") or "")[:120],
+                        "best_response": str(r.get("best_response") or "")[:120],
+                        "frequency": int(r.get("frequency") or 0),
+                        "quality_score": float(r.get("quality_score") or 0.0),
+                        "priority_score": float(r.get("priority_score") or 0.0),
+                        "confidence": round(self._learning_confidence(r), 4),
+                    }
+                )
+                if len(out) >= n:
+                    break
+            return out
+
+        top_failure_fix = _top_rows([r for r in lm_rows if str(r.get("pattern_type") or "") == "failure_fix"], n=5)
+        top_corrected = _top_rows(
+            [r for r in lm_rows if str(r.get("pattern_type") or "") == "chat" and str(r.get("response_outcome") or "") == "success"],
+            n=5,
+        )
+
+        weak_counter: Counter[str] = Counter()
+        for r in quality_rows:
+            if str(r.get("response_outcome") or "") != "weak":
+                continue
+            q = _norm_text(str(r.get("query") or ""))
+            if q:
+                weak_counter[q] += 1
+        top_repeated_weak = [{"query": q, "count": int(c)} for q, c in weak_counter.most_common(5)]
+
+        low_conf_rows = []
+        for r in lm_rows:
+            conf = self._learning_confidence(r)
+            if conf < 0.48:
+                low_conf_rows.append(
+                    {
+                        "pattern_type": str(r.get("pattern_type") or "unknown"),
+                        "input_pattern": str(r.get("input_pattern") or "")[:120],
+                        "confidence": round(conf, 4),
+                        "frequency": int(r.get("frequency") or 0),
+                    }
+                )
+        low_conf_rows = sorted(low_conf_rows, key=lambda x: float(x.get("confidence") or 0.0))[:5]
+
+        return {
+            "status": "success",
+            "top_failure_fix_patterns": top_failure_fix,
+            "top_repeated_weak_patterns": top_repeated_weak,
+            "top_corrected_response_patterns": top_corrected,
+            "low_confidence_patterns_to_ignore": low_conf_rows,
+        }
 
     def _suggest(self, *, issue: str, root_cause: str, suggested_fix: str, affected_module: str, priority: int = 5) -> None:
         self._ensure_indexes()
@@ -333,6 +569,45 @@ class SelfLearningEngine:
         chats = list(db.db["chat_logs"].find({"timestamp": {"$gte": since}}, {"_id": 0, "message": 1, "payload": 1, "timestamp": 1}).limit(1200))
         tasks = list(db.db["task_logs"].find({"timestamp": {"$gte": since}}, {"_id": 0, "message": 1, "result_status": 1, "payload": 1, "timestamp": 1}).limit(1200))
         errors = list(db.db["error_logs"].find({"timestamp": {"$gte": since}}, {"_id": 0, "message": 1, "payload": 1, "timestamp": 1}).limit(1200))
+        quality_rows = list(
+            db.db["response_quality_signals"].find(
+                {"recorded_at": {"$gte": since}},
+                {"_id": 0, "query": 1, "response_text": 1, "response_outcome": 1, "quality_score": 1, "recorded_at": 1},
+            ).sort("recorded_at", 1).limit(2500)
+        )
+
+        # Backfill older unknown outcomes to reduce noisy labels.
+        try:
+            unknown_rows = list(
+                db.db["response_quality_signals"].find(
+                    {
+                        "recorded_at": {"$gte": since},
+                        "$or": [
+                            {"response_outcome": {"$exists": False}},
+                            {"response_outcome": "unknown"},
+                            {"response_outcome": None},
+                        ],
+                    },
+                    {"_id": 1, "query": 1, "response_text": 1, "quality_score": 1, "weak": 1, "weak_reasons": 1, "repeat_count_hint": 1, "fallback_used": 1},
+                ).limit(2500)
+            )
+            for row in unknown_rows:
+                qn = _norm_text(str((row or {}).get("query") or ""))
+                rn = _norm_text(str((row or {}).get("response_text") or ""))
+                qr = float((row or {}).get("quality_score") or 0.0)
+                weak = bool((row or {}).get("weak"))
+                repeats = int((row or {}).get("repeat_count_hint") or 0)
+                fallback = bool((row or {}).get("fallback_used"))
+                outcome = "success"
+                if re.search(r"\b(fail|error|exception|unable|timeout)\b", rn):
+                    outcome = "failed"
+                elif weak or repeats >= 2 or fallback or qr < 0.55:
+                    outcome = "weak"
+                if _is_generic_pattern(qn) and outcome == "success":
+                    outcome = "weak"
+                db.db["response_quality_signals"].update_one({"_id": row.get("_id")}, {"$set": {"response_outcome": outcome}})
+        except Exception:
+            pass
 
         query_counts: Counter[str] = Counter()
         for c in chats:
@@ -345,21 +620,26 @@ class SelfLearningEngine:
         repeated_queries.sort(key=lambda x: x[1], reverse=True)
 
         fail_msgs: list[str] = []
+        fail_fixes: list[tuple[str, str]] = []
         success_msgs: list[str] = []
         for t in tasks:
             st = str((t or {}).get("result_status") or "").strip().lower()
             msg = str((t or {}).get("message") or "").strip()
+            payload = (t or {}).get("payload") if isinstance((t or {}).get("payload"), dict) else {}
             if not msg:
                 continue
             if st in {"failed", "error", "blocked", "denied", "stopped"}:
                 fail_msgs.append(msg)
+                fail_fixes.append((msg, _extract_fix_hint(payload)))
             elif st in {"success", "completed"}:
                 success_msgs.append(msg)
 
         for e in errors:
             msg = str((e or {}).get("message") or "").strip()
+            payload = (e or {}).get("payload") if isinstance((e or {}).get("payload"), dict) else {}
             if msg:
                 fail_msgs.append(msg)
+                fail_fixes.append((msg, _extract_fix_hint(payload)))
 
         fail_counter = Counter([_norm_text(m) for m in fail_msgs if _norm_text(m)])
         success_counter = Counter([_norm_text(m) for m in success_msgs if _norm_text(m)])
@@ -382,6 +662,23 @@ class SelfLearningEngine:
                     "input_pattern": key,
                     "failure_case": key,
                     "improvement_hint": "Map this error pattern to a deterministic fix checklist.",
+                    "response_outcome": "failed",
+                    "quality_score": 0.2,
+                    "frequency": int(freq),
+                }
+            )
+
+        fail_fix_counter = Counter([( _norm_text(f), _norm_text(x)) for f, x in fail_fixes if _norm_text(f) and _norm_text(x)])
+        for (failure_case, fix_pattern), freq in fail_fix_counter.most_common(25):
+            self._upsert_learning_entry(
+                {
+                    "pattern_type": "failure_fix",
+                    "input_pattern": failure_case,
+                    "failure_case": failure_case,
+                    "fix_pattern": fix_pattern,
+                    "improvement_hint": "Prefer this validated fix pattern when this failure is detected.",
+                    "response_outcome": "failed",
+                    "quality_score": 0.35,
                     "frequency": int(freq),
                 }
             )
@@ -393,9 +690,39 @@ class SelfLearningEngine:
                     "input_pattern": key,
                     "best_response": "successful execution pattern",
                     "improvement_hint": "Reuse this successful task decomposition when similar intents are detected.",
+                    "response_outcome": "success",
+                    "quality_score": 0.9,
                     "frequency": int(freq),
                 }
             )
+
+        # Corrected-response pattern mining: failed/weak first, then success for similar query.
+        corrected_patterns = 0
+        latest_non_success_by_query: dict[str, dict[str, Any]] = {}
+        for row in quality_rows:
+            query = _norm_text(str((row or {}).get("query") or ""))
+            if not query:
+                continue
+            outcome = str((row or {}).get("response_outcome") or "").strip().lower()
+            if outcome in {"failed", "weak"}:
+                latest_non_success_by_query[query] = row
+                continue
+            if outcome == "success" and query in latest_non_success_by_query:
+                response_text = str((row or {}).get("response_text") or "").strip()
+                if not response_text:
+                    continue
+                corrected_patterns += 1
+                self._upsert_learning_entry(
+                    {
+                        "pattern_type": "chat",
+                        "input_pattern": query,
+                        "best_response": response_text,
+                        "improvement_hint": "Corrected response pattern: prioritize this answer style for repeated/corrected query.",
+                        "response_outcome": "success",
+                        "quality_score": max(0.75, float((row or {}).get("quality_score") or 0.75)),
+                        "frequency": 2,
+                    }
+                )
 
         # Generate structured self-improvement suggestions (no auto code changes).
         top_fail = fail_counter.most_common(1)
@@ -429,9 +756,11 @@ class SelfLearningEngine:
             "success_score": round(success_score, 4),
             "failure_patterns": [k for k, _ in fail_counter.most_common(8)],
             "repeated_queries": [{"query": q, "frequency": int(c)} for q, c in repeated_queries[:8]],
+            "corrected_response_patterns": int(corrected_patterns),
             "improvement_suggestions_count": int(
                 db.db["self_improvement_suggestions"].count_documents({"status": "open"}) if db.db is not None else 0
             ),
+            "learning_quality_report": self.build_learning_quality_report(lookback_hours=lookback_hours),
             "status": "completed",
         }
 

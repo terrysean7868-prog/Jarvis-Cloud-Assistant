@@ -121,7 +121,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--uri",
-        default=os.getenv("MONGODB_URI") or os.getenv("MONGO_URI") or "",
+        default=os.getenv("MONGODB_URI") or "",
         help="MongoDB URI (defaults to env MONGODB_URI/MONGO_URI).",
     )
     parser.add_argument(

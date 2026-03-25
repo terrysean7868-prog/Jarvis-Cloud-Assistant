@@ -12,7 +12,6 @@ import json
 from urllib.parse import urljoin
 from src.core.jarvis_brain import JarvisBrain
 from src.config import runtime_defaults as rd
-from src.config import env
 from src.config.settings import settings as jarvis_settings
 from src.config.secrets import n8n_secrets
 from src.utils.git_sync import git_sync  # ✅ now importing the function, not a class
@@ -70,19 +69,10 @@ pyautogui = None
 # Detect headless environment - pyautogui requires DISPLAY on Linux
 _is_headless_env = False
 if platform.system() != "Windows":
-    if "DISPLAY" not in os.environ:
-        _is_headless_env = True
-    # Check for server environment indicators
-    # Render sets PORT, RENDER_SERVICE_ID, or path contains /opt/render
-    if (env.get("RENDER") or env.get("DYNO") or env.get("DOCKER") or 
-        env.get("PORT") or "/opt/render" in os.getcwd()):
-        _is_headless_env = True
+    _is_headless_env = True
 
 if not _is_headless_env:
     try:
-        # Set DISPLAY if needed to prevent KeyError in mouseinfo
-        if platform.system() != "Windows" and "DISPLAY" not in os.environ:
-            os.environ["DISPLAY"] = ":0"
         import pyautogui
         PYAUTOGUI_AVAILABLE = True
     except (ImportError, KeyError, Exception):

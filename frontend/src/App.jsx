@@ -43,9 +43,7 @@ const PermissionModal = lazy(() => import("./components/PermissionModal"));
 
 export default function App() {
   const WAKE_SESSION_MINUTES = useMemo(() => {
-    const raw = (typeof process !== "undefined" && process.env && process.env.REACT_APP_WAKE_SESSION_MINUTES)
-      ? String(process.env.REACT_APP_WAKE_SESSION_MINUTES)
-      : "15";
+    const raw = "15";
     const n = Number(raw);
     return Number.isFinite(n) ? Math.max(1, Math.min(n, 120)) : 15;
   }, []);
@@ -87,9 +85,7 @@ export default function App() {
   }, [preferredLanguage]);
 
   const googleSttEnabled = useMemo(() => {
-    const raw = (typeof process !== "undefined" && process.env && process.env.REACT_APP_GOOGLE_SPEECH_ENABLED)
-      ? String(process.env.REACT_APP_GOOGLE_SPEECH_ENABLED)
-      : "false";
+    const raw = "false";
     return ["1", "true", "yes", "y"].includes(raw.toLowerCase());
   }, []);
 
@@ -143,6 +139,8 @@ export default function App() {
   const [agentCfgLoaded, setAgentCfgLoaded] = useState(false);
   const [agentCfgError, setAgentCfgError] = useState(null);
   const [systemInfo, setSystemInfo] = useState(null);
+  const [systemHealth, setSystemHealth] = useState(null);
+  const [agentOffline, setAgentOffline] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionId, setSessionId] = useState(null);
   const [username, setUsername] = useState(null);
@@ -1220,6 +1218,11 @@ export default function App() {
     const tryDeviceStatus = async () => {
       try {
         const status = await getDeviceStatus(sessionId, 2500);
+        const fullHealth = status?.system_health;
+        if (fullHealth && typeof fullHealth === "object") {
+          setSystemHealth(fullHealth);
+        }
+        setAgentOffline(!!status?.agent_offline);
         const agents = Array.isArray(status?.agents) ? status.agents : [];
         const sys = agents[0]?.capabilities?.system_info || null;
         if (sys && typeof sys === "object") {
@@ -3131,7 +3134,34 @@ export default function App() {
 
       {isAuthenticated && username && (
         <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
+            {(String(systemHealth?.status || "ok").toLowerCase() !== "ok") && (
+              <div style={{
+                background: "rgba(255, 193, 7, 0.18)",
+                border: "1px solid rgba(255, 193, 7, 0.65)",
+                color: "#ffd86a",
+                borderRadius: 10,
+                padding: "6px 10px",
+                fontSize: 12,
+                fontWeight: 600,
+              }}>
+                System degraded
+              </div>
+            )}
+            {agentOffline && (
+              <div style={{
+                background: "rgba(255, 77, 79, 0.18)",
+                border: "1px solid rgba(255, 77, 79, 0.65)",
+                color: "#ff9a9b",
+                borderRadius: 10,
+                padding: "6px 10px",
+                fontSize: 12,
+                fontWeight: 600,
+              }}>
+                Agent offline
+              </div>
+            )}
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 8 }}>
               {activeDisplay === "autonomy" ? (
                 <button
@@ -3207,6 +3237,7 @@ export default function App() {
               setShowAuthModal(true);
               speak("Logged out successfully.");
             }} style={{ background: "transparent", border: "none", color: "#ff5050", cursor: "pointer" }}>Logout</button>
+            </div>
           </div>
         </div>
       )}

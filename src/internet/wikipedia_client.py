@@ -17,9 +17,6 @@ from typing import Any
 import aiohttp
 from urllib.parse import quote
 
-from src.config import env
-
-
 WIKI_API_BASE = "https://{lang}.wikipedia.org"
 WIKI_ACTION_API = WIKI_API_BASE + "/w/api.php"
 WIKI_REST_SUMMARY = WIKI_API_BASE + "/api/rest_v1/page/summary/{title}"
@@ -32,11 +29,7 @@ def _wiki_headers() -> dict[str, str]:
     Provide a descriptive UA with a contact method. Allow override via env.
     """
 
-    ua = (
-        env.get("JARVIS_WIKI_USER_AGENT")
-        or env.get("WIKIPEDIA_USER_AGENT")
-        or "Jarvis-Cloud-Assistant/1.0 (https://github.com; contact: admin@example.com)"
-    )
+    ua = "Jarvis-Cloud-Assistant/1.0 (https://github.com; contact: admin@example.com)"
     ua = (ua or "").strip() or "Jarvis-Cloud-Assistant/1.0 (https://github.com; contact: admin@example.com)"
 
     return {

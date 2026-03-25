@@ -13,6 +13,7 @@ from pathlib import Path
 from src.utils.db import db
 from src.config import runtime_defaults as rd
 from src.config.secrets import llm_secrets
+from src.config.settings import settings as jarvis_settings
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ class LLMAdapter:
         # Optional smarter model for hard tasks (routing by heuristic complexity).
         # Keep PRIMARY_MODEL as a safe default to avoid breaking existing deployments.
         self.smart_model = (rd.SMART_MODEL or "").strip()
-        self.fast_model = str(os.getenv("JARVIS_FAST_MODEL", "") or "").strip()
+        self.fast_model = str(jarvis_settings.llm_fast_model or "").strip()
         self.smart_model_min_complexity = int(rd.SMART_MODEL_MIN_COMPLEXITY)
         self.primary_key = llm_secrets().primary_api_key
         self.primary_endpoint = (rd.PRIMARY_ENDPOINT or "").strip()
@@ -57,14 +58,16 @@ class LLMAdapter:
         self.backup_model = rd.BACKUP_MODEL
         self.backup_key = llm_secrets().backup_api_key
         self.backup_endpoint = (rd.BACKUP_ENDPOINT or "").strip()
+        self.cloud_mode = bool(jarvis_settings.cloud_mode)
         self.persona = rd.PERSONA
         self.session = None
-        self.provider_timeout_s = max(5, int(os.getenv("JARVIS_LLM_PROVIDER_TIMEOUT_S", "12") or "12"))
+        self.provider_timeout_s = max(5, int(jarvis_settings.llm_provider_timeout_s))
         self.provider_budget_s = max(
             self.provider_timeout_s,
-            int(os.getenv("JARVIS_LLM_PROVIDER_BUDGET_S", "16") or "16"),
+            int(jarvis_settings.llm_provider_budget_s),
         )
-        self.provider_cooldown_s = max(10, int(os.getenv("JARVIS_LLM_PROVIDER_COOLDOWN_S", "45") or "45"))
+        self.provider_cooldown_s = 30
+        self.provider_failure_threshold = 3
         self.timeout = aiohttp.ClientTimeout(total=self.provider_timeout_s)
         self.max_retries = 2
         # Default response budget. We dynamically increase for complex queries.
@@ -99,10 +102,11 @@ class LLMAdapter:
         self._local_reasoner_state_path = self._resolve_local_reasoner_state_path()
         self._local_reasoner_state = self._load_local_reasoner_state()
         self._local_reasoner_daily_maintenance()
-        self.model_ops_routing_enabled = str(os.getenv("JARVIS_MODEL_OPS_ROUTING_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+        self.model_ops_routing_enabled = bool(jarvis_settings.model_ops_routing_enabled)
         self._last_model_ops_route = None
         self._response_cache = {}
         self._provider_fail_until: dict[str, float] = {}
+        self._provider_fail_count: dict[str, int] = {}
         self._last_provider_notice_at = 0.0
         self._recent_intents: list[dict] = []
         self.learning_engine = SelfLearningEngine(cooldown_seconds=60) if SelfLearningEngine is not None else None
@@ -137,6 +141,16 @@ class LLMAdapter:
             return key or "global"
         except Exception:
             return "global"
+
+    @staticmethod
+    def _is_local_provider_url(url: str | None) -> bool:
+        try:
+            u = str(url or "").strip().lower()
+            if not u:
+                return False
+            return ("127.0.0.1" in u) or ("localhost" in u) or ("::1" in u)
+        except Exception:
+            return False
 
     @staticmethod
     def _resolve_local_reasoner_state_path() -> Path:
@@ -811,13 +825,24 @@ class LLMAdapter:
             name = str(provider_name or "").strip().lower()
             if not name:
                 return
-            self._provider_fail_until[name] = time.time() + float(self.provider_cooldown_s)
+            failures = int(self._provider_fail_count.get(name) or 0) + 1
+            self._provider_fail_count[name] = failures
+            if failures >= int(self.provider_failure_threshold):
+                self._provider_fail_until[name] = time.time() + float(self.provider_cooldown_s)
+                logger.warning(
+                    "[llm.circuit.open] provider=%s failures=%s cooldown_s=%s",
+                    name,
+                    failures,
+                    self.provider_cooldown_s,
+                )
         except Exception:
             pass
 
     def _mark_provider_success(self, provider_name: str) -> None:
         try:
             name = str(provider_name or "").strip().lower()
+            if name in self._provider_fail_count:
+                self._provider_fail_count.pop(name, None)
             if name in self._provider_fail_until:
                 self._provider_fail_until.pop(name, None)
         except Exception:
@@ -3655,6 +3680,10 @@ Style tone: {tone}.
                     chosen_provider = p_provider
                 route_fallback = f
 
+            if self.cloud_mode and chosen_provider in {"ollama", "local_model"}:
+                logger.info("[LLM] Skipping local provider in cloud mode")
+                chosen_provider = "openai_compatible"
+
             prompt_windows = [1200, 800] if complexity == 0 else [2000, 1200, 800]
             budget_started = time.monotonic()
             request_budget_s = min(float(self.provider_budget_s), 9.0) if complexity == 0 else float(self.provider_budget_s)
@@ -3676,9 +3705,16 @@ Style tone: {tone}.
             routed_model = chosen_model
             last_err = None
             primary_provider_name = "ollama" if chosen_provider in {"ollama", "local_model"} else "openai"
+            primary_endpoint_is_local = self._is_local_provider_url(self.primary_endpoint)
+            fallback_endpoint_is_local = self._is_local_provider_url(self.backup_endpoint)
 
             # Primary provider retries with progressively smaller context windows.
-            if self._provider_available(primary_provider_name):
+            if self.cloud_mode and (
+                primary_provider_name == "ollama" or primary_endpoint_is_local
+            ):
+                logger.info("[LLM] Skipping local provider in cloud mode")
+                last_err = Exception("primary provider skipped in cloud mode: local endpoint/provider")
+            elif self._provider_available(primary_provider_name):
                 for attempt, ctx_window in enumerate(prompt_windows[:max_primary_attempts]):
                     elapsed = time.monotonic() - budget_started
                     remaining = max(0.0, float(request_budget_s) - elapsed)
@@ -3777,6 +3813,10 @@ Style tone: {tone}.
 
                 if fallback_provider in {"fallback", "local_model"}:
                     raise last_err or Exception("Primary provider failed and deterministic fallback selected")
+
+                if self.cloud_mode and fallback_endpoint_is_local:
+                    logger.info("[LLM] Skipping local provider in cloud mode")
+                    raise last_err or Exception("Backup provider skipped in cloud mode: local endpoint")
 
                 if not self._provider_available(fallback_provider):
                     raise last_err or Exception(f"Backup provider cooling down: {fallback_provider}")
@@ -3957,6 +3997,14 @@ Style tone: {tone}.
                 no_actions = not isinstance(parsed.get("actions"), list) or not parsed.get("actions")
                 if no_actions and qtype in {"debug", "system_behavior", "task_history"}:
                     hints = runtime_ctx.get("error_fix_hints") if isinstance(runtime_ctx, dict) else []
+                    learning_hints = runtime_ctx.get("learning_hints") if isinstance(runtime_ctx, dict) else []
+                    top_learning_fix = ""
+                    if isinstance(learning_hints, list):
+                        for h in learning_hints:
+                            hs = str(h or "").strip()
+                            if hs.lower().startswith("failure_fix_pattern:"):
+                                top_learning_fix = hs
+                                break
                     if isinstance(hints, list) and hints:
                         top = str(hints[0]).strip()
                         cause = top
@@ -3967,6 +4015,10 @@ Style tone: {tone}.
                         m = re.search(r"fix=([^|]+)", top, flags=re.IGNORECASE)
                         if m:
                             fix = m.group(1).strip()
+                        if top_learning_fix:
+                            m_fix = re.search(r"fix=([^|]+)", top_learning_fix, flags=re.IGNORECASE)
+                            if m_fix and str(m_fix.group(1) or "").strip():
+                                fix = str(m_fix.group(1) or "").strip()
                         parsed["text"] = (
                             f"Cause: {cause}\n"
                             "Fix steps:\n"
@@ -3974,6 +4026,18 @@ Style tone: {tone}.
                             "2) Re-run the failing command once to confirm.\n"
                             "3) Capture the first traceback/error line if it still fails.\n"
                             "Next step: Share that first failing line for a targeted patch."
+                        )
+                    elif top_learning_fix:
+                        fix = "Apply validated failure-fix pattern and retry once."
+                        m_fix = re.search(r"fix=([^|]+)", top_learning_fix, flags=re.IGNORECASE)
+                        if m_fix and str(m_fix.group(1) or "").strip():
+                            fix = str(m_fix.group(1) or "").strip()
+                        parsed["text"] = (
+                            "Cause: recurring runtime failure pattern detected from learning memory.\n"
+                            "Fix steps:\n"
+                            f"1) {fix}\n"
+                            "2) Re-run the failing command once to verify recovery.\n"
+                            "3) If it fails again, share the first error line for precise patching."
                         )
             except Exception:
                 pass

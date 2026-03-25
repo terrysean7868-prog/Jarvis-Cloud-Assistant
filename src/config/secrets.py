@@ -23,8 +23,8 @@ class LLMSecrets:
 
 
 def llm_secrets() -> LLMSecrets:
-    primary = (env.get("PRIMARY_API_KEY") or env.get("OPENAI_API_KEY") or "").strip() or None
-    backup = (env.get("BACKUP_API_KEY") or env.get("GROQ_API_KEY") or "").strip() or None
+    primary = (env.get("OPENAI_API_KEY") or "").strip() or None
+    backup = (env.get("GROQ_API_KEY") or "").strip() or None
     return LLMSecrets(primary_api_key=primary, backup_api_key=backup)
 
 
@@ -37,9 +37,9 @@ class N8NSecrets:
 
 def n8n_secrets() -> N8NSecrets:
     return N8NSecrets(
-        base_url=(env.get("JARVIS_N8N_WEBHOOK_BASE") or "").strip().rstrip("/"),
-        token=(env.get("JARVIS_N8N_WEBHOOK_TOKEN") or "").strip(),
-        secret=(env.get("JARVIS_N8N_WEBHOOK_SECRET") or "").strip(),
+        base_url="",
+        token="",
+        secret="",
     )
 
 
@@ -51,7 +51,7 @@ class TelegramSecrets:
 
 def telegram_secrets() -> TelegramSecrets:
     token = (env.get("TELEGRAM_TOKEN") or "").strip() or None
-    chat_id = (env.get("TELEGRAM_CHAT_ID") or "").strip() or None
+    chat_id = None
     return TelegramSecrets(token=token, chat_id=chat_id)
 
 
@@ -62,6 +62,6 @@ class RenderSecrets:
 
 
 def render_secrets() -> RenderSecrets:
-    api_key = (env.get("RENDER_API_KEY") or "").strip() or None
-    service_id = (env.get("RENDER_SERVICE_ID") or "").strip() or None
+    api_key = None
+    service_id = None
     return RenderSecrets(api_key=api_key, service_id=service_id)

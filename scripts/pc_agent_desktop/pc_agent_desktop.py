@@ -58,8 +58,8 @@ def load_config() -> Dict[str, Any]:
         pass
 
     return {
-        "server_url": os.getenv("JARVIS_SERVER_URL", "https://jarvis-cloud-assistant.onrender.com"),
-        "device_id": os.getenv("JARVIS_DEVICE_ID", platform.node() or "primary"),
+            "server_url": "https://jarvis-cloud-assistant.onrender.com",
+            "device_id": "primary",
         "agent_token": "",
         "auto_start": False,
         "loop_mode": False,

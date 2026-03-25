@@ -68,7 +68,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="Print what would happen; do not change DB")
     ap.add_argument(
         "--uri",
-        default=os.getenv("MONGODB_URI") or os.getenv("MONGO_URI"),
+        default=os.getenv("MONGODB_URI"),
         help="MongoDB connection string (defaults from env: MONGODB_URI/MONGO_URI).",
     )
     ap.add_argument("--db", default=os.getenv("MONGODB_DB_NAME", "jarvis_db"), help="MongoDB database name")

@@ -20,7 +20,7 @@ MODULES_DIR = Path(__file__).parent
 def get_openai_client() -> OpenAI:
     global _client
     if _client is None:
-        api_key = llm_secrets().primary_api_key or (env.get("OPENAI_SECRET_KEY") or "").strip() or None
+        api_key = llm_secrets().primary_api_key
         if not api_key:
             raise RuntimeError("OpenAI API key not configured")
         _client = OpenAI(api_key=api_key)

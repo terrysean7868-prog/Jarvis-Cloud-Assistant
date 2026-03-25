@@ -9,9 +9,8 @@ import re
 import shlex
 import subprocess
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-from src.config import env
 
 # Process utilities - optional dependency
 try:
@@ -63,7 +62,7 @@ class AppManager:
                 "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                 "firefox": r"C:\Program Files\Mozilla Firefox\firefox.exe",
                 "edge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                "vscode": r"C:\Users\{}\AppData\Local\Programs\Microsoft VS Code\Code.exe".format(env.get_str("USERNAME", "")),
+                "vscode": str(Path.home() / "AppData" / "Local" / "Programs" / "Microsoft VS Code" / "Code.exe"),
                 "excel": r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
                 "word": r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
                 "powerpoint": r"C:\Program Files\Microsoft Office\root\Office16\POWERPNT.EXE",

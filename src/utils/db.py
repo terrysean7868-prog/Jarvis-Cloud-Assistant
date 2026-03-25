@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from dotenv import load_dotenv
 from src.config import env
+from src.config import runtime_defaults as rd
 import json
 from bson import ObjectId
 from urllib.parse import quote_plus, urlparse
@@ -84,7 +85,7 @@ class Database:
         if self.client is not None:
             return  # Already connected
 
-        uri = env.get('MONGODB_URI') or env.get('MONGO_URI')
+        uri = env.get('MONGODB_URI')
         if not uri:
             msg = (
                 "MONGODB_URI not set in environment. "
@@ -414,8 +415,8 @@ class Database:
             'status': status,
             'details': details or {},
             'metadata': {
-                'hostname': env.get_str('COMPUTERNAME', 'unknown'),
-                'environment': env.get_str('ENVIRONMENT', 'development')
+                'hostname': 'unknown',
+                'environment': 'development',
             }
         }
         result = collection.insert_one(doc)
@@ -429,7 +430,9 @@ class Database:
                 source = "task"
             elif "self_update" in event_type_s or "rollback" in event_type_s or "update" in event_type_s:
                 target_collection = "self_update_logs"
-            elif "training" in event_type_s or "learn" in event_type_s:
+            elif "learn" in event_type_s:
+                target_collection = "learning_memory"
+            elif "training" in event_type_s:
                 target_collection = "training_events"
             elif status_s == "error" or "error" in event_type_s:
                 target_collection = "error_logs"
@@ -442,7 +445,7 @@ class Database:
                     "session_id": "system",
                     "correlation_id": (details or {}).get("request_id") if isinstance(details, dict) else None,
                     "source": source,
-                    "mode": "cloud" if env.get_bool("JARVIS_CLOUD_MODE", False) else "local",
+                    "mode": "cloud" if bool(rd.CLOUD_MODE) else "local",
                     "lifecycle_state": status_s or "recorded",
                     "event_type": event_type,
                     "message": description,
@@ -475,7 +478,7 @@ class Database:
                         "session_id": ((task.get("meta") or {}).get("session_id") if isinstance(task.get("meta"), dict) else None) or "unknown",
                         "correlation_id": tid,
                         "source": "task",
-                        "mode": "cloud" if env.get_bool("JARVIS_CLOUD_MODE", False) else "local",
+                        "mode": "cloud" if bool(rd.CLOUD_MODE) else "local",
                         "lifecycle_state": task.get("status") or "recorded",
                         "type": "task_upsert",
                         "message": task.get("description") or tid,
@@ -858,8 +861,8 @@ class Database:
             'status': status,
             'details': details or {},
             'metadata': {
-                'branch': env.get_str('GIT_BRANCH', 'main'),
-                'repository': env.get_str('GITHUB_REPO', 'unknown')
+                'branch': 'main',
+                'repository': 'unknown',
             }
         }
         return collection.insert_one(doc)

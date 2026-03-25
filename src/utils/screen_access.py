@@ -9,8 +9,6 @@ import base64
 from typing import Dict, Tuple, Optional, TYPE_CHECKING
 from io import BytesIO
 
-from src.config import env
-
 # Screen capture
 PIL_AVAILABLE = False
 Image = None
@@ -47,22 +45,10 @@ pyautogui = None
 # On headless servers, skip import entirely to avoid KeyError
 _is_headless = False
 if platform.system() != "Windows":
-    # Check if DISPLAY is set (required for X11)
-    if not env.get("DISPLAY"):
-        _is_headless = True
-    # Also check for common server environment indicators
-    # Render sets PORT, RENDER_SERVICE_ID, or path contains /opt/render
-    if (env.get("RENDER") or env.get("DYNO") or env.get("DOCKER") or 
-        env.get("PORT") or "/opt/render" in os.getcwd() or 
-        "/opt/render" in str(__file__)):
-        _is_headless = True
+    _is_headless = True
 
 if not _is_headless:
     try:
-        # Set DISPLAY if not set (prevents KeyError in mouseinfo module)
-        if platform.system() != "Windows" and "DISPLAY" not in os.environ:
-            os.environ["DISPLAY"] = ":0"
-        
         import pyautogui
         PYAUTOGUI_AVAILABLE = True
         # Safety settings
@@ -73,7 +59,7 @@ if not _is_headless:
         PYAUTOGUI_AVAILABLE = False
         pyautogui = None
         # Only log in non-headless environments
-        if platform.system() == "Windows" or env.get("DISPLAY"):
+        if platform.system() == "Windows":
             print(f"pyautogui not available: {e}")
 else:
     # Headless environment - skip import entirely
@@ -115,7 +101,7 @@ class ScreenAccess:
             return None
         
         # Check if we're in a headless environment
-        if not env.get("DISPLAY") and platform.system() != "Windows":
+        if platform.system() != "Windows":
             print("Screen capture not available in headless environment")
             return None
         

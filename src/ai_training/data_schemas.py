@@ -14,6 +14,7 @@ REQUIRED_COLLECTIONS = (
     "requirement_logs",
     "self_update_logs",
     "training_events",
+    "learning_memory",
     "datasets_metadata",
 )
 

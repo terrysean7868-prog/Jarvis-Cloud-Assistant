@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from typing import Optional
 
 
@@ -13,20 +14,64 @@ Goal: avoid scattered direct `os.getenv(...)` usage across the codebase.
 - Prefer in-code defaults in `src/config/runtime_defaults.py` for non-secret behavior.
 """
 
+logger = logging.getLogger(__name__)
+
+# Strict application env whitelist.
+ALLOWED_ENV_KEYS: set[str] = {
+    "GEMINI_API_KEY",
+    "GROQ_API_KEY",
+    "JARVIS_ALLOWED_PATHS",
+    "JARVIS_JWT_ISSUER",
+    "JARVIS_JWT_SECRET",
+    "JARVIS_REDIS_URL",
+    "MONGODB_DB_NAME",
+    "MONGODB_URI",
+    "OPENAI_API_KEY",
+    "OPENWEATHER_KEY",
+    "TELEGRAM_TOKEN",
+    "VOICE_MAX_SAMPLES",
+    "VOICE_TEXT_SIMILARITY_THRESHOLD",
+}
+
+_blocked_env_once: set[str] = set()
+
+
+def _resolve_env_key(name: str) -> str:
+    return str(name or "").strip()
+
+
+def _is_allowed_env_key(name: str) -> bool:
+    k = str(name or "").strip()
+    return k in ALLOWED_ENV_KEYS
+
+
+def _warn_blocked_key(name: str) -> None:
+    k = str(name or "").strip()
+    if not k:
+        return
+    if k in _blocked_env_once:
+        return
+    _blocked_env_once.add(k)
+    logger.warning("[env] blocked non-whitelist env key: %s", k)
+
 
 def get(name: str, default: Optional[str] = None) -> Optional[str]:
-    return os.getenv(name, default)
+    key = _resolve_env_key(name)
+    if not _is_allowed_env_key(key):
+        _warn_blocked_key(key)
+        return default
+    return os.getenv(key, default)
 
 
 def get_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
+    v = get(name)
     if v is None:
         return default
     return str(v)
 
 
 def get_int(name: str, default: int) -> int:
-    v = os.getenv(name)
+    v = get(name)
     if v is None:
         return int(default)
     try:
@@ -36,7 +81,7 @@ def get_int(name: str, default: int) -> int:
 
 
 def get_float(name: str, default: float) -> float:
-    v = os.getenv(name)
+    v = get(name)
     if v is None:
         return float(default)
     try:
@@ -46,7 +91,7 @@ def get_float(name: str, default: float) -> float:
 
 
 def get_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
+    v = get(name)
     if v is None:
         return bool(default)
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}

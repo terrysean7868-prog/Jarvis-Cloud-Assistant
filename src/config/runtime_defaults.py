@@ -3,8 +3,6 @@ from __future__ import annotations
 import os
 import platform
 
-from src.config import env
-
 
 """Runtime defaults for Jarvis.
 
@@ -22,11 +20,6 @@ def is_cloud_runtime() -> bool:
     Uses platform-provided environment markers rather than Jarvis-specific flags.
     """
     try:
-        if env.get("RENDER") or env.get("DYNO") or env.get("DOCKER"):
-            return True
-        # Render commonly sets PORT; avoid treating local Windows dev as cloud.
-        if platform.system() != "Windows" and env.get("PORT"):
-            return True
         if "/opt/render" in os.getcwd():
             return True
     except Exception:

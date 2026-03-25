@@ -80,7 +80,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--uri",
-        default=os.getenv("MONGODB_URI") or os.getenv("MONGO_URI"),
+        default=os.getenv("MONGODB_URI"),
         help="MongoDB connection string (defaults from env: MONGODB_URI/MONGO_URI).",
     )
     parser.add_argument(

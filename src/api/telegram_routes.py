@@ -140,13 +140,13 @@ def build_telegram_router(
                 continued_actions = None
                 try:
                     tool_results = await executor.process_actions(immediate_actions, (username or "user"))
-                    if env.get_bool("JARVIS_RETURN_ACTION_RESULTS", False):
+                    if False:
                         response["action_results"] = tool_results
                     mode = response.get("mode") or "chat"
                     web_ctx = build_web_context_from_action_results(tool_results)
                     persist_web_context_items(topic=text, action_results=tool_results)
                     found = web_lookup_found(tool_results)
-                    if env.get_str("JARVIS_WEB_RESULTS_MODE", "answer").lower() in ("append", "both"):
+                    if "answer" in ("append", "both"):
                         response["text"] = response.get("text") or ""
                     else:
                         continued = await continue_user_using_web_context(text, web_ctx, mode=mode, found=found)

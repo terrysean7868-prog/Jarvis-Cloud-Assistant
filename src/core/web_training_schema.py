@@ -14,9 +14,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from src.config import env
-
-
 WEB_TRAINING_SCHEMA_VERSION = 1
 WEB_TRAINING_DOC_TYPE = "web_training_item"
 
@@ -43,15 +40,8 @@ def jarvis_identity() -> dict[str, str]:
     - instance_id: machine/app instance identifier (env override)
     """
 
-    assistant_id = (env.get("JARVIS_ASSISTANT_ID") or "jarvis").strip() or "jarvis"
-
-    instance_id = (
-        env.get("JARVIS_INSTANCE_ID")
-        or env.get("COMPUTERNAME")  # Windows
-        or env.get("HOSTNAME")  # Linux/macOS
-        or "local"
-    )
-    instance_id = (instance_id or "local").strip() or "local"
+    assistant_id = "jarvis"
+    instance_id = "local"
 
     return {"assistant_id": assistant_id, "instance_id": instance_id}
 

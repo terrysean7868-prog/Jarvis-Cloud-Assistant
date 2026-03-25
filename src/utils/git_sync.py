@@ -11,9 +11,6 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from src.config import env
-
-
 # ==============================================================
 # Utility Command Runner
 # ==============================================================
@@ -39,7 +36,7 @@ def setup_ssh_trust():
     Prevents 'Host key verification failed' or 'REMOTE HOST IDENTIFICATION HAS CHANGED'.
     Only runs if SSH_KEY is configured. Silent fail on Windows/systems without ssh-keyscan.
     """
-    ssh_key = env.get("SSH_KEY")
+    ssh_key = ""
     if not ssh_key:
         return  # Silent skip if no SSH_KEY configured
 
@@ -136,12 +133,12 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):
     print(f"[GIT SYNC] Starting sync in: {repo_path}")
 
     # --- Environment setup ---
-    ssh_key = env.get("SSH_KEY")
-    github_repo = env.get("GITHUB_REPO")
-    github_user = env.get("GITHUB_USERNAME")
-    github_password = env.get("GITHUB_PASSWORD")  # For HTTPS fallback
-    git_name = env.get_str("GIT_USER_NAME", "Jarvis Cloud Assistant")
-    git_email = env.get_str("GIT_USER_EMAIL", "jarvis@render.com")
+    ssh_key = ""
+    github_repo = ""
+    github_user = ""
+    github_password = ""  # For HTTPS fallback
+    git_name = "Jarvis Cloud Assistant"
+    git_email = "jarvis@render.com"
 
     # Try to get repo URL from env or construct it
     if not github_repo:

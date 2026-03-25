@@ -155,8 +155,8 @@ def _run_update_validation_gate(file_path: Path) -> Dict[str, Any]:
                 }
             out["checks"].append("py_compile")
 
-        run_tests = str(os.getenv("JARVIS_SELF_UPDATE_RUN_TESTS", "false")).strip().lower() in {"1", "true", "yes", "y"}
-        test_cmd = (os.getenv("JARVIS_SELF_UPDATE_TEST_CMD", "") or "").strip()
+        run_tests = False
+        test_cmd = ""
         if run_tests and test_cmd:
             proc = subprocess.run(test_cmd, shell=True, capture_output=True, text=True, timeout=600, cwd=str(ROOT_DIR))
             if proc.returncode != 0:
@@ -445,7 +445,7 @@ def self_update_file(
             if deps_missing:
                 allow_install = auto_install_deps
                 if allow_install is None:
-                    allow_install = str(os.getenv("JARVIS_SELF_UPDATE_AUTO_INSTALL_DEPS", "false")).strip().lower() in {"1", "true", "yes", "y"}
+                    allow_install = False
                 if allow_install:
                     ins = _install_python_dependencies(deps_missing)
                     if ins.get("status") == "success":

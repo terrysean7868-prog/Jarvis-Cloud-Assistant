@@ -10,20 +10,18 @@ from pathlib import Path
 import asyncio
 import subprocess
 
-from src.config import env
-
 logger = logging.getLogger(__name__)
 
 # MCP Server configuration
-MCP_SERVER_HOST = env.get_str("MCP_SERVER_HOST", "localhost")
-MCP_SERVER_PORT = env.get_int("MCP_SERVER_PORT", 9090)
+MCP_SERVER_HOST = "localhost"
+MCP_SERVER_PORT = 9090
 MCP_SERVER_URL = f"http://{MCP_SERVER_HOST}:{MCP_SERVER_PORT}"
 
 
 # Local file operations root (safety sandbox)
 # Defaults to repo root (two levels up from src/utils).
 LOCAL_FILE_OPS_ROOT = Path(
-    env.get_str("JARVIS_FILE_OPS_ROOT", str(Path(__file__).resolve().parents[2]))
+    str(Path(__file__).resolve().parents[2])
 ).resolve()
 
 

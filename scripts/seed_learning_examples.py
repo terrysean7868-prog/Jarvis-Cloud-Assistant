@@ -58,7 +58,7 @@ def main() -> int:
         load_dotenv()
 
     parser = argparse.ArgumentParser(description="Seed the learning_examples store with helpful voice-style examples.")
-    parser.add_argument("--user", default=os.getenv("JARVIS_SEED_USER", "default"), help="User id to seed (defaults to 'default').")
+    parser.add_argument("--user", default="default", help="User id to seed (defaults to 'default').")
     parser.add_argument("--yes", action="store_true", help="Actually perform inserts.")
     args = parser.parse_args()
 

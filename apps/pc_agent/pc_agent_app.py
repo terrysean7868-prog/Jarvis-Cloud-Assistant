@@ -22,7 +22,7 @@ IS_FROZEN = bool(getattr(sys, "frozen", False))
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", str(REPO_ROOT))).resolve()
 APP_DIR = (Path(sys.executable).resolve().parent if IS_FROZEN else REPO_ROOT)
 
-_APPDATA_BASE = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA") or str(APP_DIR)
+_APPDATA_BASE = str((Path.home() / "AppData" / "Local").resolve())
 APPDATA_DIR = (Path(_APPDATA_BASE) / "JarvisPCAgent").resolve()
 
 # All runtime-writable files go into %APPDATA%\JarvisPCAgent so the packaged exe
@@ -171,15 +171,11 @@ def _sanitize_agent_token(token: str) -> tuple[str, str | None]:
 def _find_webview2_runtime_exe() -> Optional[Path]:
     """Return a path to msedgewebview2.exe if WebView2 Runtime appears installed."""
 
-    base_dirs: list[Path] = []
-    for env_key in ("PROGRAMFILES(X86)", "PROGRAMFILES"):
-        root = os.environ.get(env_key)
-        if root:
-            base_dirs.append(Path(root))
-
-    local_root = os.environ.get("LOCALAPPDATA")
-    if local_root:
-        base_dirs.append(Path(local_root))
+    base_dirs: list[Path] = [
+        Path("C:/Program Files"),
+        Path("C:/Program Files (x86)"),
+        (Path.home() / "AppData" / "Local").resolve(),
+    ]
 
     candidates: list[Path] = []
     for base in base_dirs:
@@ -227,8 +223,8 @@ def load_config() -> dict:
     cfg = _load_json(CONFIG_FILE)
     if not cfg:
         cfg = {
-            "server_url": os.getenv("JARVIS_SERVER_URL", "https://jarvis-cloud-assistant.onrender.com"),
-            "device_id": os.getenv("JARVIS_DEVICE_ID", os.getenv("COMPUTERNAME", "primary") or "primary"),
+            "server_url": "https://jarvis-cloud-assistant.onrender.com",
+            "device_id": "primary",
             "agent_token": "",
             "shared_secret": "",
             "loop_mode": False,
@@ -254,7 +250,7 @@ def load_config() -> dict:
                 # In local shared-secret mode the server almost always targets device_id='primary'.
                 # Defaulting to COMPUTERNAME leads to "connected but no actions" confusion.
                 try:
-                    raw_default_device = os.getenv("JARVIS_DEVICE_ID", os.getenv("COMPUTERNAME", "primary") or "primary")
+                    raw_default_device = "primary"
                     default_device = _clean_cfg_str(raw_default_device)
                     current_device = _clean_cfg_str(cfg.get("device_id"))
                     if current_device and default_device and current_device.lower() == default_device.lower() and current_device.lower() != "primary":
@@ -1313,12 +1309,7 @@ def run_ui() -> int:
         try:
             import webview  # type: ignore
 
-            debug_webview = (os.getenv("JARVIS_PC_AGENT_WEBVIEW_DEBUG", "") or "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
+            debug_webview = False
 
             if debug_webview:
                 try:
@@ -1415,7 +1406,7 @@ def run_ui() -> int:
             # - "auto" (default): lets pywebview pick a working backend (opens reliably)
             # - "edgechromium": best UI, requires WebView2 Runtime
             # - "mshtml": legacy fallback
-            backend = (os.getenv("JARVIS_PC_AGENT_UI_BACKEND", "auto") or "auto").strip().lower()
+            backend = "auto"
 
             # NOTE: The HTML UI uses modern JS (async/await, const/let, arrow funcs).
             # The legacy MSHTML engine will load but the JS will fail silently, making buttons appear dead.
@@ -1655,10 +1646,10 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.fallback_ui:
-        os.environ["JARVIS_PC_AGENT_UI_BACKEND"] = "tk"
+        logging.info("--fallback-ui requested; using built-in fallback path when available")
 
     if args.webview_debug:
-        os.environ["JARVIS_PC_AGENT_WEBVIEW_DEBUG"] = "1"
+        logging.info("--webview-debug requested")
 
     if args.daemon and not args.ui:
         return int(run_daemon(token=args.token, server_url=args.server))

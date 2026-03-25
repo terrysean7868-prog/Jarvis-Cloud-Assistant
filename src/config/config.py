@@ -21,9 +21,10 @@ class Config:
     for dir_path in [DATA_DIR, MODELS_DIR]:
         dir_path.mkdir(exist_ok=True)
     
-    # Database settings (defaults to local if not configured)
+    # Database settings (whitelist env)
     MONGODB_URI = env.get_str('MONGODB_URI', 'mongodb://localhost:27017/jarvis')
     MONGODB_DB = env.get_str('MONGODB_DB_NAME', 'jarvis_db')
+    USE_DATABASE_FOR_TRAINING = True
     SQLITE_PATH = DATA_DIR / 'jarvis_memory.db'
     
     # LLM Configuration
@@ -33,59 +34,62 @@ class Config:
     _PRIMARY_API_KEY = llm_secrets().primary_api_key
     LLM_CONFIG = {
         'primary': {
-            'name': env.get_str('PRIMARY_MODEL', _PRIMARY_DEFAULT_MODEL),
+            'name': _PRIMARY_DEFAULT_MODEL,
             'api_key': _PRIMARY_API_KEY,
-            'endpoint': env.get_str('PRIMARY_ENDPOINT', _PRIMARY_DEFAULT_ENDPOINT)
+            'endpoint': _PRIMARY_DEFAULT_ENDPOINT,
         },
         'backup': {
-            'name': env.get_str('BACKUP_MODEL', 'llama-3.1-8b-instant'),
+            'name': 'llama-3.1-8b-instant',
             'api_key': llm_secrets().backup_api_key,
-            'endpoint': env.get_str('BACKUP_ENDPOINT', 'https://api.groq.com/openai/v1/chat/completions')
+            'endpoint': 'https://api.groq.com/openai/v1/chat/completions',
         }
     }
     
     # Voice Recognition Settings
     VOICE_CONFIG = {
-        'offline_model': env.get_str('VOSK_MODEL', 'vosk-model-small-en-us'),
-        'language': env.get_str('VOICE_LANGUAGE', 'en-US'),
+        'offline_model': 'vosk-model-small-en-us',
+        'language': 'en-US',
         'use_vad': True,
-        'vad_sensitivity': env.get_float('VAD_SENSITIVITY', 3.0),
-        'silence_duration': env.get_float('SILENCE_DURATION', 0.5)
+        'vad_sensitivity': 3.0,
+        'silence_duration': 0.5,
+        'voice_max_samples': env.get_int('VOICE_MAX_SAMPLES', 5),
+        'voice_text_similarity_threshold': env.get_float('VOICE_TEXT_SIMILARITY_THRESHOLD', 0.85),
     }
     
     # Git Configuration
     GIT_CONFIG = {
-        'repository': env.get('GITHUB_REPO'),
-        'username': env.get('GITHUB_USERNAME'),
-        'token': env.get('GITHUB_TOKEN'),
-        'ssh_key': env.get('SSH_KEY'),
-        'branch': env.get_str('GIT_BRANCH', 'main'),
-        'auto_sync': env.get_bool('GIT_AUTO_SYNC', True)
+        'repository': '',
+        'username': '',
+        'token': '',
+        'ssh_key': '',
+        'branch': 'main',
+        'auto_sync': True,
     }
     
     # System Settings
     SYSTEM_CONFIG = {
-        'debug_mode': env.get_bool('DEBUG', False),
-        'log_level': env.get_str('LOG_LEVEL', 'INFO'),
-        'auto_update': env.get_bool('AUTO_UPDATE', True),
-        'max_retries': env.get_int('MAX_RETRIES', 3),
-        'timeout': env.get_int('TIMEOUT', 30)
+        'debug_mode': False,
+        'log_level': 'INFO',
+        'auto_update': True,
+        'max_retries': 2,
+        'timeout': 10,
     }
     
     # Frontend Configuration
     FRONTEND_CONFIG = {
-        'port': env.get_int('PORT', 3000),
-        'host': env.get_str('HOST', 'localhost'),
-        'api_base_url': env.get_str('API_BASE_URL', '/api'),
-        'ws_base_url': env.get_str('WS_BASE_URL', '/ws')
+        'port': 3000,
+        'host': 'localhost',
+        'api_base_url': '/api',
+        'ws_base_url': '/ws',
     }
     
     # Security Configuration
     SECURITY_CONFIG = {
-        'allowed_origins': env.get_str('ALLOWED_ORIGINS', '*').split(','),
-        'jwt_secret': env.get_str('JWT_SECRET', 'your-secret-key'),
-        'jwt_algorithm': env.get_str('JWT_ALGORITHM', 'HS256'),
-        'token_expire_minutes': env.get_int('TOKEN_EXPIRE_MINUTES', 1440)
+        'allowed_origins': ['*'],
+        'jwt_secret': env.get_str('JARVIS_JWT_SECRET', ''),
+        'jwt_issuer': env.get_str('JARVIS_JWT_ISSUER', 'jarvis'),
+        'jwt_algorithm': 'HS256',
+        'token_expire_minutes': 1440,
     }
     
     # Module Configurations
@@ -105,7 +109,11 @@ class Config:
         'README.md'
     ]
     
-    ALLOWED_PATHS = [p.strip() for p in env.get_str('ALLOWED_PATHS', ','.join(DEFAULT_ALLOWED_PATHS)).split(',')]
+    ALLOWED_PATHS = [
+        p.strip()
+        for p in env.get_str('JARVIS_ALLOWED_PATHS', ','.join(DEFAULT_ALLOWED_PATHS)).split(',')
+        if p.strip()
+    ]
     
     @classmethod
     def validate(cls, strict=False) -> bool:
@@ -117,8 +125,7 @@ class Config:
         """
         required_settings = [
             ('MONGODB_URI', cls.MONGODB_URI),
-            ('LLM_API_KEY', cls.LLM_CONFIG['primary']['api_key']),
-            ('GITHUB_REPO', cls.GIT_CONFIG['repository'])
+            ('LLM_API_KEY', cls.LLM_CONFIG['primary']['api_key'] or cls.LLM_CONFIG['backup']['api_key']),
         ]
         
         missing = [key for key, value in required_settings if not value]

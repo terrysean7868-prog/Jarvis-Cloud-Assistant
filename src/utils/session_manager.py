@@ -187,7 +187,7 @@ def start_session_cleanup_task():
 
     # Desktop optimization: allow disabling this background scheduler.
     # Default is enabled for server deployments.
-    flag = (os.getenv("JARVIS_ENABLE_SESSION_CLEANUP", "true") or "true").strip().lower()
+    flag = "true"
     if flag in {"0", "false", "no", "off"}:
         return
     

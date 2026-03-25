@@ -1,4 +1,3 @@
-import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
@@ -27,8 +26,8 @@ class AuthTokens:
     def __init__(self):
         self.secret = env.get_str("JARVIS_JWT_SECRET", "")
         self.issuer = env.get_str("JARVIS_JWT_ISSUER", "jarvis")
-        self.ttl_seconds = env.get_int("JARVIS_JWT_TTL_SECONDS", 28800)
-        self.use_db_revocation = env.get_bool("AUTH_TOKEN_USE_DB_REVOCATION", True)
+        self.ttl_seconds = 28800
+        self.use_db_revocation = True
 
     def issue(self, username: str, role: str = "user") -> str:
         if not self.secret:

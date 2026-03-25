@@ -196,6 +196,12 @@ async def lifespan(_app: FastAPI):
         except Exception as e:
             print(f"[INFO] Scheduler failed to start: {e}")
 
+    try:
+        _start_stability_monitor()
+        print("[OK] Stability monitor started")
+    except Exception as e:
+        print(f"[INFO] Stability monitor start failed: {e}")
+
     print("[OK] Jarvis server started.")
 
     try:
@@ -235,6 +241,15 @@ async def lifespan(_app: FastAPI):
         except Exception:
             pass
 
+        global _STABILITY_MONITOR_TASK
+        if _STABILITY_MONITOR_TASK and not _STABILITY_MONITOR_TASK.done():
+            _STABILITY_MONITOR_TASK.cancel()
+            try:
+                await _STABILITY_MONITOR_TASK
+            except Exception:
+                pass
+            _STABILITY_MONITOR_TASK = None
+
 
 app = FastAPI(title="Jarvis Cloud Assistant", lifespan=lifespan)
 load_dotenv()
@@ -253,6 +268,111 @@ except Exception:
     _BROKER = None
 
 START_TS = time.time()
+
+# Production stability safeguards (process-local).
+GLOBAL_LLM_CALL_TIMEOUT_S = 20.0
+GLOBAL_AGENT_RESPONSE_TIMEOUT_S = 8.0
+GLOBAL_TASK_EXEC_TIMEOUT_S = 25.0
+DELEGATED_MAX_RETRIES = 2
+AGENT_UNAVAILABLE_COOLDOWN_S = 30.0
+DELEGATED_EXECUTION_STUCK_S = 120
+HEALTH_MONITOR_INTERVAL_S = 15.0
+
+_AGENT_UNAVAILABLE_UNTIL: dict[str, float] = {}
+_STABILITY_MONITOR_TASK: asyncio.Task | None = None
+
+
+def _trace_log(
+    *,
+    event: str,
+    request_id: str | None = None,
+    user_id: str | None = None,
+    task_id: str | None = None,
+    lifecycle_state: str | None = None,
+    execution_time_ms: float | None = None,
+    level: str = "info",
+    **extra: Any,
+) -> None:
+    try:
+        payload = {
+            "event": str(event or "trace"),
+            "request_id": (request_id or "").strip() or None,
+            "user_id": (user_id or "").strip().lower() or None,
+            "task_id": (task_id or "").strip() or None,
+            "lifecycle_state": (lifecycle_state or "").strip().lower() or None,
+            "execution_time_ms": round(float(execution_time_ms), 2) if execution_time_ms is not None else None,
+        }
+        for k, v in (extra or {}).items():
+            payload[k] = v
+        payload = {k: v for k, v in payload.items() if v is not None}
+        msg = "[trace] " + " ".join(f"{k}={v}" for k, v in payload.items())
+        if str(level).lower() == "warning":
+            logger.warning(msg)
+        elif str(level).lower() == "error":
+            logger.error(msg)
+        else:
+            logger.info(msg)
+    except Exception:
+        pass
+
+
+def _is_agent_temporarily_unavailable(device_id: str | None) -> bool:
+    did = _normalize_device_id(device_id)
+    if not did:
+        return False
+    until = float(_AGENT_UNAVAILABLE_UNTIL.get(did) or 0.0)
+    return time.time() < until
+
+
+def _mark_agent_unavailable(device_id: str | None, *, reason: str = "unresponsive") -> None:
+    did = _normalize_device_id(device_id)
+    if not did:
+        return
+    _AGENT_UNAVAILABLE_UNTIL[did] = time.time() + AGENT_UNAVAILABLE_COOLDOWN_S
+    _ops_inc("agent_unavailable_events")
+    logger.warning("[agent.circuit.open] device_id=%s reason=%s cooldown_s=%s", did, reason, AGENT_UNAVAILABLE_COOLDOWN_S)
+
+
+def _clear_agent_unavailable(device_id: str | None) -> None:
+    did = _normalize_device_id(device_id)
+    if not did:
+        return
+    _AGENT_UNAVAILABLE_UNTIL.pop(did, None)
+
+
+def _retry_or_fail_delegated_task(task_id: str | None, *, reason: str, fallback_status: str = "queued_for_agent") -> None:
+    try:
+        tid = str(task_id or "").strip()
+        if not tid:
+            return
+        col = _delegated_tasks_collection()
+        if col is None:
+            return
+        row = col.find_one({"task_id": tid}, {"_id": 0}) or {}
+        attempts = int(row.get("attempts") or 0)
+        next_attempts = attempts + 1
+        if next_attempts <= int(DELEGATED_MAX_RETRIES):
+            _mark_delegated_task(
+                task_id=tid,
+                status_value=fallback_status,
+                extra={
+                    "attempts": next_attempts,
+                    "last_error": str(reason or "retry")[:300],
+                    "last_retry_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        else:
+            _mark_delegated_task(
+                task_id=tid,
+                status_value="failed",
+                extra={
+                    "attempts": next_attempts,
+                    "error": str(reason or "max_retries_exceeded")[:300],
+                    "timed_out": "timeout" in str(reason or "").lower(),
+                },
+            )
+    except Exception:
+        return
 
 # ---------------------------------------------------------
 # Multi-instance / multi-worker note
@@ -282,7 +402,7 @@ if bool(jarvis_settings.cloud_mode) and (_BROKER is None):
 FRONTEND_BUILD_DIR = REPO_ROOT / "frontend" / "build"
 
 # Enable/disable background scheduler via env
-ENABLE_SCHEDULER = env.get_bool("JARVIS_ENABLE_SCHEDULER", True)
+ENABLE_SCHEDULER = True
 
 # =========================================================
 # Runtime Mode / Security
@@ -291,15 +411,15 @@ ENABLE_SCHEDULER = env.get_bool("JARVIS_ENABLE_SCHEDULER", True)
 # - Require an authenticated session for chat + internet endpoints (to prevent public abuse)
 # - Disable local/PC control and local filesystem endpoints (these are unsafe + meaningless in cloud)
 CLOUD_MODE = bool(jarvis_settings.cloud_mode)
-VOICE_ONLY_MODE = env.get_bool("JARVIS_VOICE_ONLY", False)
-PC_AGENT_ENABLED = env.get_bool("JARVIS_ENABLE_PC_AGENT", True)
-AGENT_SHARED_SECRET = env.get_str("JARVIS_AGENT_SHARED_SECRET", "")
-EXPOSE_AGENT_SHARED_SECRET = env.get_bool("JARVIS_EXPOSE_AGENT_SHARED_SECRET", False)
-DEFAULT_DEVICE_ID = env.get_str("JARVIS_DEFAULT_DEVICE_ID", "primary")
-DEVICE_OWNER_USERNAME = env.get_str("JARVIS_DEVICE_OWNER_USERNAME", "")
-LOCAL_DEFAULT_DEVICE_FALLBACK = env.get_bool("JARVIS_LOCAL_DEFAULT_DEVICE_FALLBACK", True)
-ADMIN_USERNAME = (env.get_str("JARVIS_ADMIN_USERNAME", "admin") or "admin").strip().lower()
-ADMIN_BOOTSTRAP_SECRET = env.get_str("JARVIS_ADMIN_BOOTSTRAP_SECRET", "")
+VOICE_ONLY_MODE = False
+PC_AGENT_ENABLED = True
+AGENT_SHARED_SECRET = ""
+EXPOSE_AGENT_SHARED_SECRET = False
+DEFAULT_DEVICE_ID = "primary"
+DEVICE_OWNER_USERNAME = ""
+LOCAL_DEFAULT_DEVICE_FALLBACK = True
+ADMIN_USERNAME = "admin"
+ADMIN_BOOTSTRAP_SECRET = ""
 VOICE_BIOMETRICS_STRICT_LOGIN = False
 
 # =========================================================
@@ -339,12 +459,15 @@ _REQUIREMENTS_AUDIT_INDEX_READY = False
 # Lightweight in-memory production telemetry (best-effort, process-local).
 _OPS_TELEMETRY = {
     "chat_total": 0,
+    "error_total": 0,
     "timeout_total": 0,
     "fallback_total": 0,
     "latency_ms_total": 0.0,
     "latency_samples": 0,
     "delegated_exec_success": 0,
     "delegated_exec_failure": 0,
+    "recovery_restarts": 0,
+    "agent_unavailable_events": 0,
     "updated_at": datetime.now(timezone.utc).isoformat(),
 }
 
@@ -409,6 +532,7 @@ def _collect_global_delegated_counts() -> dict[str, int]:
 
 def _ops_telemetry_snapshot() -> dict[str, Any]:
     chat_total = int(_OPS_TELEMETRY.get("chat_total") or 0)
+    error_total = int(_OPS_TELEMETRY.get("error_total") or 0)
     timeout_total = int(_OPS_TELEMETRY.get("timeout_total") or 0)
     fallback_total = int(_OPS_TELEMETRY.get("fallback_total") or 0)
     latency_samples = int(_OPS_TELEMETRY.get("latency_samples") or 0)
@@ -420,6 +544,8 @@ def _ops_telemetry_snapshot() -> dict[str, Any]:
 
     return {
         "chat_total": chat_total,
+        "error_total": error_total,
+        "error_rate": (float(error_total) / float(chat_total)) if chat_total else 0.0,
         "timeout_total": timeout_total,
         "timeout_rate": (float(timeout_total) / float(chat_total)) if chat_total else 0.0,
         "fallback_total": fallback_total,
@@ -433,8 +559,137 @@ def _ops_telemetry_snapshot() -> dict[str, Any]:
             "failure": delegated_failure,
             "success_rate": (float(delegated_success) / float(delegated_total)) if delegated_total else 0.0,
         },
+        "recovery_restarts": int(_OPS_TELEMETRY.get("recovery_restarts") or 0),
+        "agent_unavailable_events": int(_OPS_TELEMETRY.get("agent_unavailable_events") or 0),
         "updated_at": _OPS_TELEMETRY.get("updated_at") or datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _ops_alert_if_needed(snapshot: dict[str, Any]) -> None:
+    try:
+        fallback_rate = float(snapshot.get("fallback_rate") or 0.0)
+        error_rate = float(snapshot.get("error_rate") or 0.0)
+        queued = int(snapshot.get("queued_for_agent_count") or 0)
+        pending = int(snapshot.get("pending_permission_count") or 0)
+        queue_size = queued + pending
+        if fallback_rate > 0.40:
+            logger.warning("[stability.alert] metric=fallback_rate value=%.3f threshold=0.40", fallback_rate)
+        if error_rate > 0.20:
+            logger.warning("[stability.alert] metric=error_rate value=%.3f threshold=0.20", error_rate)
+        if queue_size > 100:
+            logger.warning("[stability.alert] metric=queue_size value=%s threshold=100", queue_size)
+    except Exception:
+        pass
+
+
+async def _collect_full_health_checks() -> dict[str, Any]:
+    checks = {
+        "database": False,
+        "redis": False,
+        "llm_provider": False,
+        "pc_agent_connected": False,
+    }
+
+    try:
+        database._ensure_connected()
+        checks["database"] = bool(getattr(database, "client", None) is not None and getattr(database, "db", None) is not None)
+    except Exception:
+        checks["database"] = False
+
+    try:
+        checks["redis"] = bool(_BROKER is not None)
+    except Exception:
+        checks["redis"] = False
+
+    try:
+        checks["llm_provider"] = bool(llm.primary_key or llm.backup_key) and (
+            llm._provider_available("openai") or llm._provider_available("groq")
+        )
+    except Exception:
+        checks["llm_provider"] = False
+
+    try:
+        agents = await device_hub.list_agents()
+        checks["pc_agent_connected"] = bool(agents)
+    except Exception:
+        checks["pc_agent_connected"] = False
+
+    ops = _ops_telemetry_snapshot()
+    _ops_alert_if_needed(ops)
+
+    status_value = "ok"
+    if not all(bool(v) for v in checks.values()):
+        status_value = "degraded" if any(bool(v) for v in checks.values()) else "failed"
+
+    return {
+        "status": status_value,
+        "checks": checks,
+        "uptime_seconds": int(max(0, time.time() - START_TS)),
+        "error_rate": float(ops.get("error_rate") or 0.0),
+        "fallback_rate": float(ops.get("fallback_rate") or 0.0),
+    }
+
+
+async def _stability_monitor_loop() -> None:
+    while True:
+        try:
+            # Auto-recovery: restart autonomy runtime loop if it is unexpectedly disabled.
+            ctrl = autonomy_runtime.control_state() if autonomy_runtime is not None else {}
+            if bool(ctrl) and bool(ctrl.get("enabled")) and bool(ctrl.get("paused")) is False:
+                # Runtime is enabled; no action needed.
+                pass
+            elif autonomy_runtime is not None:
+                try:
+                    await autonomy_runtime.start()
+                    _ops_inc("recovery_restarts")
+                    logger.warning("[stability.recovery] component=autonomy_runtime action=restart")
+                except Exception:
+                    pass
+
+            # Auto-recovery: scheduler restart (best-effort).
+            if ENABLE_SCHEDULER and SCHEDULER_AVAILABLE and initialize_scheduler:
+                try:
+                    initialize_scheduler()
+                except Exception:
+                    pass
+
+            # Reset stuck delegated lifecycle states: executing/delegated -> timeout -> failed.
+            col = _delegated_tasks_collection()
+            if col is not None:
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=DELEGATED_EXECUTION_STUCK_S)
+                stale = list(
+                    col.find(
+                        {
+                            "status": {"$in": ["executing", "delegated"]},
+                            "updated_at": {"$lt": cutoff},
+                        },
+                        {"_id": 0, "task_id": 1, "attempts": 1},
+                    ).limit(80)
+                )
+                for row in stale:
+                    _mark_delegated_task(
+                        task_id=row.get("task_id"),
+                        status_value="failed",
+                        extra={
+                            "error": "timeout",
+                            "timed_out": True,
+                            "timeout_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+
+            # Trigger health checks and alerts from monitor cadence.
+            await _collect_full_health_checks()
+        except Exception:
+            pass
+
+        await asyncio.sleep(HEALTH_MONITOR_INTERVAL_S)
+
+
+def _start_stability_monitor() -> None:
+    global _STABILITY_MONITOR_TASK
+    if _STABILITY_MONITOR_TASK and not _STABILITY_MONITOR_TASK.done():
+        return
+    _STABILITY_MONITOR_TASK = asyncio.create_task(_stability_monitor_loop(), name="jarvis-stability-monitor")
 
 
 def _remember_job_owner(job: dict) -> None:
@@ -597,6 +852,9 @@ async def _await_job_result(job_id: str, timeout_s: float = 2.5) -> dict[str, An
 
     try:
         await asyncio.wait_for(waiter.wait(), timeout=max(0.1, float(timeout_s or 0.1)))
+    except asyncio.TimeoutError:
+        _ops_inc("timeout_total")
+        pass
     except Exception:
         pass
     finally:
@@ -785,7 +1043,7 @@ async def _resume_queued_delegations_for_device(device_id: str) -> None:
                 },
             )
         except Exception as e:
-            _mark_delegated_task(task_id=row.get("task_id"), status_value="queued_for_agent", extra={"last_error": str(e)[:300]})
+            _retry_or_fail_delegated_task(row.get("task_id"), reason=str(e), fallback_status="queued_for_agent")
 
 
 async def _resume_pending_permission_delegations_for_device(device_id: str) -> None:
@@ -833,7 +1091,7 @@ async def _resume_pending_permission_delegations_for_device(device_id: str) -> N
                 },
             )
         except Exception as e:
-            _mark_delegated_task(task_id=row.get("task_id"), status_value="pending_permission", extra={"last_error": str(e)[:300]})
+            _retry_or_fail_delegated_task(row.get("task_id"), reason=str(e), fallback_status="pending_permission")
 
 
 async def _delegate_or_queue_cloud_action(
@@ -843,7 +1101,7 @@ async def _delegate_or_queue_cloud_action(
     actions: list[dict[str, Any]],
     source_text: str,
     require_admin: bool = False,
-    await_timeout_s: float = 2.5,
+    await_timeout_s: float = GLOBAL_AGENT_RESPONSE_TIMEOUT_S,
 ) -> dict[str, Any]:
     _require_pc_agent_enabled()
     executable_actions, blocked_actions = _split_agent_executable_actions(actions)
@@ -890,6 +1148,47 @@ async def _delegate_or_queue_cloud_action(
         out["task"] = task
         return out
 
+    if _is_agent_temporarily_unavailable(did):
+        task = _queue_delegated_task(
+            username=username,
+            role=role,
+            device_id=did,
+            feature=feature,
+            source_text=source_text,
+            actions=actions,
+            status_value="queued_for_agent",
+            reason="agent_circuit_open",
+        )
+        out = _cloud_envelope(
+            status="queued_for_agent",
+            execution={"feature": feature, "device_id": did, "task": task},
+            result=None,
+            message="PC agent temporarily unavailable. Task queued for retry after cooldown.",
+        )
+        out["feature"] = feature
+        out["device_id"] = did
+        out["task"] = task
+        return out
+
+    if _is_agent_temporarily_unavailable(did):
+        queued = _queue_delegated_task(
+            username=username,
+            role=role,
+            device_id=did,
+            feature="device_dispatch",
+            source_text=req.source_text or requested_action,
+            actions=[a for a in (req.actions or []) if isinstance(a, dict)],
+            status_value="queued_for_agent",
+            reason="agent_circuit_open",
+        )
+        return {
+            "status": "queued_for_agent",
+            "mode": "cloud",
+            "device_id": did,
+            "task": queued,
+            "message": "Agent temporarily unavailable. Task queued for automatic retry.",
+        }
+
     if not await device_hub.is_connected(did):
         task = _queue_delegated_task(
             username=username,
@@ -915,13 +1214,31 @@ async def _delegate_or_queue_cloud_action(
     job = await _dispatch_actions_to_device(did, username=username or "user", actions=actions, source_text=source_text)
     job_id = str((job or {}).get("job_id") or "").strip()
 
+    running_task = _queue_delegated_task(
+        username=username,
+        role=role,
+        device_id=did,
+        feature=feature,
+        source_text=source_text,
+        actions=actions,
+        status_value="executing",
+        reason="dispatched",
+    )
+    _mark_delegated_task(
+        task_id=running_task.get("task_id"),
+        status_value="executing",
+        extra={"last_job_id": job_id, "dispatched_at": datetime.now(timezone.utc).isoformat()},
+    )
+
     payload = await _await_job_result(job_id, timeout_s=await_timeout_s)
     if not payload:
+        _mark_agent_unavailable(did, reason="agent_response_timeout")
+        _retry_or_fail_delegated_task(running_task.get("task_id"), reason="agent_response_timeout", fallback_status="queued_for_agent")
         out = _cloud_envelope(
-            status="delegated",
+            status="queued_for_agent",
             execution={"feature": feature, "device_id": did, "job": job},
             result=None,
-            message="Delegated to PC agent and awaiting completion.",
+            message="PC agent response timeout. Task queued for automatic retry.",
         )
         out["feature"] = feature
         out["device_id"] = did
@@ -948,6 +1265,18 @@ async def _delegate_or_queue_cloud_action(
     out["device_id"] = did
     out["job"] = job
     out["agent_result"] = payload
+    if first_status == "failed":
+        _retry_or_fail_delegated_task(running_task.get("task_id"), reason=str((first or {}).get("error") or "agent_execution_failed"))
+    else:
+        _mark_delegated_task(
+            task_id=running_task.get("task_id"),
+            status_value="completed",
+            extra={
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "result_preview": _truncate_notification_payload((payload or {}).get("results") or []),
+            },
+        )
+        _clear_agent_unavailable(did)
     return out
 
 
@@ -1053,19 +1382,18 @@ device_hub = (
     if PC_AGENT_ENABLED
     else _DisabledDeviceHub()
 )
+auth_tokens = AuthTokens()
 # Local/dev convenience: agent token issuance requires JARVIS_JWT_SECRET.
 # In cloud mode this must be explicitly configured; in local mode we can
 # generate a per-run secret so PC agent pairing works out of the box.
-if (not CLOUD_MODE) and (not (os.getenv("JARVIS_JWT_SECRET") or "").strip()):
+if (not CLOUD_MODE) and (not (auth_tokens.secret or "").strip()):
     try:
-        os.environ["JARVIS_JWT_SECRET"] = secrets.token_urlsafe(48)
+        auth_tokens.secret = secrets.token_urlsafe(48)
     except Exception:
-        os.environ["JARVIS_JWT_SECRET"] = os.urandom(48).hex()
+        auth_tokens.secret = os.urandom(48).hex()
 
-auth_tokens = AuthTokens()
-
-PUBLIC_SERVER_URL = (env.get_str("JARVIS_PUBLIC_SERVER_URL", "") or "").strip().rstrip("/")
-AGENT_TOKEN_TTL_SECONDS = env.get_int("JARVIS_AGENT_TOKEN_TTL_SECONDS", 2592000)  # 30d
+PUBLIC_SERVER_URL = ""
+AGENT_TOKEN_TTL_SECONDS = 2592000  # 30d
 
 
 def _effective_server_url(request: Request | None) -> str:
@@ -2202,7 +2530,15 @@ async def _dispatch_actions_to_device(device_id: str, username: str, actions: li
         "actions": contract_actions,
     }
     _remember_job_owner(job)
-    await device_hub.send_job(device_id, job)
+    _trace_log(
+        event="delegated_dispatch",
+        user_id=username,
+        task_id=job_id,
+        lifecycle_state="executing",
+        device_id=device_id,
+        action_count=len(contract_actions),
+    )
+    await asyncio.wait_for(device_hub.send_job(device_id, job), timeout=GLOBAL_TASK_EXEC_TIMEOUT_S)
     return job
 
 
@@ -2352,7 +2688,12 @@ async def agent_ws(ws: WebSocket):
 
         await ws.send_json({"type": "ack", "device_id": device_id, "status": "connected"})
 
-        # Manual mode: do not auto-resume queued/pending delegated tasks on reconnect.
+        # Auto-resume queued tasks on reconnect using existing recovery paths.
+        try:
+            asyncio.create_task(_resume_queued_delegations_for_device(device_id))
+            asyncio.create_task(_resume_pending_permission_delegations_for_device(device_id))
+        except Exception:
+            pass
 
         # Main loop
         while True:
@@ -2397,16 +2738,41 @@ async def agent_ws(ws: WebSocket):
                             flow_status = _normalize_flow_status(raw_status, default="completed")
                         if flow_status == "completed":
                             _ops_inc("delegated_exec_success")
+                            _clear_agent_unavailable(device_id)
+                            _trace_log(
+                                event="delegated_result",
+                                task_id=jid,
+                                lifecycle_state="completed",
+                                device_id=device_id,
+                            )
                         elif flow_status == "failed":
                             _ops_inc("delegated_exec_failure")
-                        _mark_delegated_task(
-                            job_id=jid,
-                            status_value=flow_status,
-                            extra={
-                                "completed_at": datetime.now(timezone.utc).isoformat(),
-                                "result_preview": _truncate_notification_payload(results),
-                            },
-                        )
+                            _trace_log(
+                                event="delegated_result",
+                                task_id=jid,
+                                lifecycle_state="failed",
+                                device_id=device_id,
+                                level="warning",
+                            )
+                        if flow_status == "failed":
+                            reason = str((first or {}).get("error") or (first or {}).get("message") or "failed")
+                            if "timeout" in reason.lower():
+                                _mark_agent_unavailable(device_id, reason="agent_result_timeout")
+                            try:
+                                col = _delegated_tasks_collection()
+                                row = col.find_one({"last_job_id": jid}, {"_id": 0, "task_id": 1}) if col is not None else None
+                                _retry_or_fail_delegated_task((row or {}).get("task_id") if isinstance(row, dict) else None, reason=reason)
+                            except Exception:
+                                _mark_delegated_task(job_id=jid, status_value="failed", extra={"error": reason[:300]})
+                        else:
+                            _mark_delegated_task(
+                                job_id=jid,
+                                status_value=flow_status,
+                                extra={
+                                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                                    "result_preview": _truncate_notification_payload(results),
+                                },
+                            )
                 except Exception:
                     pass
 
@@ -2569,10 +2935,10 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
 # Speech-to-Text (Mobile fallback)
 # =========================================================
 
-GOOGLE_SPEECH_ENABLED = env.get_bool("GOOGLE_SPEECH_ENABLED", False)
-GOOGLE_SPEECH_LANGUAGE_DEFAULT = env.get_str("GOOGLE_SPEECH_LANGUAGE_DEFAULT", "en-US")
-GOOGLE_SPEECH_CREDENTIALS_JSON = env.get_str("GOOGLE_SPEECH_CREDENTIALS_JSON", "").strip()
-GOOGLE_SPEECH_CREDENTIALS_B64 = env.get_str("GOOGLE_SPEECH_CREDENTIALS_B64", "").strip()
+GOOGLE_SPEECH_ENABLED = False
+GOOGLE_SPEECH_LANGUAGE_DEFAULT = "en-US"
+GOOGLE_SPEECH_CREDENTIALS_JSON = ""
+GOOGLE_SPEECH_CREDENTIALS_B64 = ""
 
 
 def _get_google_speech_client_and_creds():
@@ -3166,6 +3532,17 @@ async def device_dispatch(req: DeviceDispatchRequest):
             }
 
     job = await _dispatch_actions_to_device(did, username=username or "user", actions=actions, source_text=req.source_text or "")
+    task = _queue_delegated_task(
+        username=username,
+        role=role,
+        device_id=did,
+        feature="device_dispatch",
+        source_text=req.source_text or requested_action,
+        actions=actions,
+        status_value="executing",
+        reason="dispatched",
+    )
+    _mark_delegated_task(task_id=task.get("task_id"), status_value="executing", extra={"last_job_id": job.get("job_id")})
     return {"status": "delegated", "job": job, "device_id": did, "request_id": f"disp_{uuid.uuid4().hex[:12]}"}
 
 
@@ -3201,9 +3578,9 @@ def _slugify_skill(name: str) -> str:
 
 async def _maybe_create_n8n_webhook_workflow(name: str, path: str) -> str | None:
     """Best-effort N8N workflow creation when credentials are configured."""
-    api_base = (env.get_str("N8N_API_URL", "") or "").strip().rstrip("/")
-    api_key = (env.get_str("N8N_API_KEY", "") or "").strip()
-    auto_create = env.get_bool("JARVIS_N8N_AUTO_CREATE_SKILL_WEBHOOK", False)
+    api_base = ""
+    api_key = ""
+    auto_create = False
     if not api_base or not api_key or not auto_create:
         return None
 
@@ -3254,7 +3631,7 @@ async def skills_list(req: dict):
 async def skills_add(req: SkillUpsertRequest):
     p = _require_authenticated_session(req.session_id)
     role = (p.get("role") or "user").strip().lower()
-    write_role = (env.get_str("JARVIS_SKILLS_WRITE_ROLE", "user") or "user").strip().lower()
+    write_role = "user"
     if write_role == "admin" and role != "admin":
         raise HTTPException(status_code=403, detail="Admin required to add skills")
 
@@ -3305,7 +3682,7 @@ async def skills_add(req: SkillUpsertRequest):
 async def skills_update(req: SkillUpdateRequest):
     p = _require_authenticated_session(req.session_id)
     role = (p.get("role") or "user").strip().lower()
-    write_role = (env.get_str("JARVIS_SKILLS_WRITE_ROLE", "user") or "user").strip().lower()
+    write_role = "user"
     if write_role == "admin" and role != "admin":
         raise HTTPException(status_code=403, detail="Admin required to update skills")
 
@@ -3536,8 +3913,16 @@ async def device_status(session_id: str):
     username = (p.get("username") or "").strip().lower()
     role = (p.get("role") or "user").strip().lower()
     agents_by_id = await device_hub.list_agents()
+    health = await _collect_full_health_checks()
     if role == "admin":
-        return {"status": "success", "agents": list(agents_by_id.values()), "default_device_id": DEFAULT_DEVICE_ID}
+        return {
+            "status": "success",
+            "agents": list(agents_by_id.values()),
+            "default_device_id": DEFAULT_DEVICE_ID,
+            "system_health": health,
+            "degraded": str(health.get("status") or "ok") != "ok",
+            "agent_offline": not bool(agents_by_id),
+        }
 
     did = _get_owner_device_id(username)
     if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
@@ -3548,9 +3933,23 @@ async def device_status(session_id: str):
     if not did and (not CLOUD_MODE) and LOCAL_DEFAULT_DEVICE_FALLBACK and DEFAULT_DEVICE_ID:
         did = DEFAULT_DEVICE_ID
     if not did:
-        return {"status": "success", "agents": [], "default_device_id": DEFAULT_DEVICE_ID}
+        return {
+            "status": "success",
+            "agents": [],
+            "default_device_id": DEFAULT_DEVICE_ID,
+            "system_health": health,
+            "degraded": str(health.get("status") or "ok") != "ok",
+            "agent_offline": True,
+        }
     agent = agents_by_id.get(did)
-    return {"status": "success", "agents": ([agent] if agent else []), "default_device_id": did}
+    return {
+        "status": "success",
+        "agents": ([agent] if agent else []),
+        "default_device_id": did,
+        "system_health": health,
+        "degraded": str(health.get("status") or "ok") != "ok",
+        "agent_offline": not bool(agent),
+    }
 
 
 class AdminUserUpdateRequest(BaseModel):
@@ -3852,7 +4251,7 @@ cors_origins = [
 
 # Allow extra origins via env (comma-separated), e.g. for custom domains.
 try:
-    extra = env.get_str("JARVIS_CORS_ORIGINS", "")
+    extra = ""
     if extra:
         for o in [x.strip() for x in extra.split(",")]:
             if o and o not in cors_origins:
@@ -5006,7 +5405,7 @@ async def health_check(check_db: int = 0):
     - Always returns 200 when the API process is alive.
     - `check_db=1` performs a best-effort DB ping with a short timeout.
     """
-    db_uri = env.get("MONGODB_URI") or env.get("MONGO_URI")
+    db_uri = env.get("MONGODB_URI")
     db_configured = bool(db_uri)
     # PyMongo Database objects do not support truthiness checks.
     db_connected = (getattr(database, "client", None) is not None) and (getattr(database, "db", None) is not None)
@@ -5054,6 +5453,12 @@ async def health_check(check_db: int = 0):
     }
 
     return JSONResponse(payload, status_code=200)
+
+
+@app.get("/api/health/full")
+async def health_full():
+    full = await _collect_full_health_checks()
+    return JSONResponse(full, status_code=200)
 
 
 @app.post("/api/validate-session")
@@ -5225,6 +5630,12 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         str(role),
         len((msg.text or "").strip()),
     )
+    _trace_log(
+        event="chat_request_start",
+        request_id=request_id,
+        user_id=(username or msg.user or principal.get("username") or "anonymous"),
+        lifecycle_state="received",
+    )
 
     # Admin-only module update cycle flow (start/continue/delete by title).
     # Uses explicit phrases so unrelated conversations continue normally.
@@ -5327,15 +5738,57 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                 return response
     
     # Bind learning/training memory to the authenticated principal when available.
-    response, actions = await chat_orchestrator.run_chat(
-        text=msg.text,
-        mode=(msg.mode or "chat"),
-        principal=principal,
-        role=role,
-        acting_user=(msg.user or username or "user"),
-        background_tasks=background_tasks,
-        user_id=((username or msg.user) if (username or msg.user) else None),
-    )
+    try:
+        response, actions = await asyncio.wait_for(
+            chat_orchestrator.run_chat(
+                text=msg.text,
+                mode=(msg.mode or "chat"),
+                principal=principal,
+                role=role,
+                acting_user=(msg.user or username or "user"),
+                background_tasks=background_tasks,
+                user_id=((username or msg.user) if (username or msg.user) else None),
+            ),
+            timeout=GLOBAL_LLM_CALL_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        _ops_inc("chat_total")
+        _ops_inc("timeout_total")
+        _ops_inc("error_total")
+        response = {
+            "status": "failed",
+            "source": "timeout_guard",
+            "text": "Request timed out while waiting for generation. Please retry.",
+            "actions": [],
+        }
+        actions = []
+        _trace_log(
+            event="chat_request_timeout",
+            request_id=request_id,
+            user_id=(username or msg.user or principal.get("username") or "anonymous"),
+            lifecycle_state="failed",
+            execution_time_ms=max(0.0, (time.perf_counter() - started_at) * 1000.0),
+            level="warning",
+        )
+    except Exception as e:
+        _ops_inc("chat_total")
+        _ops_inc("error_total")
+        response = {
+            "status": "failed",
+            "source": "error_guard",
+            "text": "Request failed due to a transient error. Please retry.",
+            "actions": [],
+        }
+        actions = []
+        _trace_log(
+            event="chat_request_error",
+            request_id=request_id,
+            user_id=(username or msg.user or principal.get("username") or "anonymous"),
+            lifecycle_state="failed",
+            execution_time_ms=max(0.0, (time.perf_counter() - started_at) * 1000.0),
+            level="error",
+            error=str(e)[:180],
+        )
     logger.info(
         "[chat.mode] request_id=%s mode=%s source=%s action_count=%s",
         request_id,
@@ -5360,6 +5813,9 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         txt = str((response or {}).get("text") or "").strip().lower()
         if ("timeout" in txt) or ("timed out" in txt):
             _ops_inc("timeout_total")
+        if str((response or {}).get("status") or "").strip().lower() in {"failed", "error"}:
+            _ops_inc("error_total")
+        _ops_alert_if_needed(_ops_telemetry_snapshot())
     except Exception:
         pass
 
@@ -5391,10 +5847,14 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                 actions=(actions if isinstance(actions, list) else []),
                 source=str((response or {}).get("source") or "chat"),
                 request_id=request_id,
+                response_status=str((response or {}).get("status") or ""),
+                fallback_used=bool(((response or {}).get("routing") or {}).get("fallback_used")) if isinstance((response or {}).get("routing"), dict) else False,
+                task_result_status=str((response or {}).get("task_result_status") or (response or {}).get("status") or ""),
             )
             response["learning_signal"] = {
                 "quality_score": learning_signal.get("quality_score"),
                 "weak": learning_signal.get("weak"),
+                "response_outcome": learning_signal.get("response_outcome"),
             }
             # Internally cooldown-gated to prevent loops/regressions.
             background_tasks.add_task(learning_engine.run_controlled_learning_cycle, lookback_hours=48)
@@ -5434,7 +5894,10 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
 
         if server_actions:
             try:
-                server_results = await executor.process_actions(server_actions, (username or "user"))
+                server_results = await asyncio.wait_for(
+                    executor.process_actions(server_actions, (username or "user")),
+                    timeout=GLOBAL_TASK_EXEC_TIMEOUT_S,
+                )
                 # Surface created task_id(s) for better cancellation UX.
                 try:
                     task_ids = []
@@ -5447,9 +5910,19 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                 except Exception:
                     pass
 
-                if env.get_bool("JARVIS_RETURN_ACTION_RESULTS", False):
+                if False:
                     response["action_results"] = server_results
             except Exception as e:
+                _ops_inc("error_total")
+                _trace_log(
+                    event="cloud_server_action_error",
+                    request_id=request_id,
+                    user_id=(username or msg.user or principal.get("username") or "anonymous"),
+                    lifecycle_state="failed",
+                    execution_time_ms=max(0.0, (time.perf_counter() - started_at) * 1000.0),
+                    level="warning",
+                    error=str(e)[:180],
+                )
                 response["text"] = (response.get("text") or "") + f"\n\n(Server action execution failed: {e})"
 
         # Strip server-only maintenance actions that the frontend can't execute.
@@ -5468,6 +5941,13 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
             str((response or {}).get("source") or "unknown"),
             len(remaining_actions),
         )
+        _trace_log(
+            event="chat_request_complete",
+            request_id=request_id,
+            user_id=(username or msg.user or principal.get("username") or "anonymous"),
+            lifecycle_state=str((response or {}).get("status") or "completed"),
+            execution_time_ms=max(0.0, (time.perf_counter() - started_at) * 1000.0),
+        )
         return response
 
     # Local mode
@@ -5480,6 +5960,13 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         request_id,
         str((response or {}).get("source") or "unknown"),
         len((response or {}).get("actions") or []),
+    )
+    _trace_log(
+        event="chat_request_complete",
+        request_id=request_id,
+        user_id=(username or msg.user or principal.get("username") or "anonymous"),
+        lifecycle_state=str((response or {}).get("status") or "completed"),
+        execution_time_ms=max(0.0, (time.perf_counter() - started_at) * 1000.0),
     )
     return response
 

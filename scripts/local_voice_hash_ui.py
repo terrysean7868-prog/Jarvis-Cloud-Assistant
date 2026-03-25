@@ -23,8 +23,8 @@ from src.utils.voice_auth import _hash_normalized_text, _norm_text
 if load_dotenv is not None:
     load_dotenv()
 
-DEFAULT_MONGO_URI = os.getenv("MONGODB_URI") or os.getenv("MONGO_URI") or "mongodb://localhost:27017"
-DEFAULT_DB_NAME = os.getenv("VOICE_HASH_UI_DB") or os.getenv("MONGODB_DB_NAME", "jarvis_db")
+DEFAULT_MONGO_URI = os.getenv("MONGODB_URI") or "mongodb://localhost:27017"
+DEFAULT_DB_NAME = os.getenv("MONGODB_DB_NAME", "jarvis_db")
 
 
 app = FastAPI(title="Jarvis Local Voice Hash UI")

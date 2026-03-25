@@ -27,7 +27,7 @@ LEGACY_TO_TARGET = {
     "voice_commands": "agent_logs",
     "module_changes": "agent_logs",
     "git_operations": "self_update_logs",
-    "learning_examples": "training_events",
+    "learning_examples": "learning_memory",
     "web_training_data": "training_events",
 }
 
@@ -73,7 +73,9 @@ def _target_for_legacy(source_collection: str, raw_doc: dict[str, Any]) -> str:
         event_type = str(raw_doc.get("event_type") or "").strip().lower()
         if status == "error" or "error" in event_type:
             return "error_logs"
-        if "training" in event_type or "learning" in event_type:
+        if "learning" in event_type:
+            return "learning_memory"
+        if "training" in event_type:
             return "training_events"
         if "update" in event_type or "rollback" in event_type:
             return "self_update_logs"

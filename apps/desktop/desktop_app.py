@@ -325,13 +325,8 @@ def _wait_for_backend(url: str, timeout_s: float = 15.0) -> bool:
 
 
 def _open_ui(url: str, title: str, width: int, height: int) -> None:
-    debug_webview = (os.getenv("JARVIS_DESKTOP_WEBVIEW_DEBUG", "") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-    backend_pref = (os.getenv("JARVIS_DESKTOP_UI_BACKEND", "auto") or "auto").strip().lower()
+    debug_webview = False
+    backend_pref = "auto"
     try:
         import webview
 
@@ -407,8 +402,8 @@ def _show_error_dialog(title: str, message: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Jarvis Desktop App")
-    parser.add_argument("--host", default=os.getenv("JARVIS_DESKTOP_HOST", DEFAULT_HOST))
-    parser.add_argument("--port", type=int, default=int(os.getenv("JARVIS_DESKTOP_PORT", str(DEFAULT_PORT))))
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--url", default="", help="Desktop URL (local-only)")
     parser.add_argument("--no-backend", action="store_true", help="Do not start local backend")
     parser.add_argument("--background", action="store_true", help="Run in background with system tray")
@@ -433,11 +428,6 @@ def main() -> int:
     if not _is_local_url(url):
         print("Desktop app is local-only. Use http://127.0.0.1:<port> or http://localhost:<port>.")
         return 2
-
-    os.environ["JARVIS_CLOUD_MODE"] = "false"
-    os.environ.setdefault("JARVIS_ENABLE_PC_AGENT", "true")
-    os.environ.setdefault("JARVIS_ENABLE_SCHEDULER", "true")
-    os.environ.setdefault("JARVIS_DESKTOP_API_URL", url)
 
     backend = BackendRunner(host=host, port=port)
     monitor = DesktopAutonomyMonitor(url)

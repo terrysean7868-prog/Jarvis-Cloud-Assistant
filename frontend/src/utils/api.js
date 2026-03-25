@@ -1,10 +1,16 @@
 // src/utils/api.js
 // Priority:
-// 1) Explicit build-time override: REACT_APP_API_URL
-// 2) Development: use CRA proxy by using relative URLs ("" base)
-// 3) Production: assume same-origin when served by backend; fallback to public Render URL
-const isDev = process.env.NODE_ENV === "development";
-const envBase = process.env.REACT_APP_API_URL;
+// 1) Query param override (?api_url=https://...)
+// 2) Development (localhost): use relative URLs via proxy
+// 3) Production: same-origin, with Render frontend fallback to backend service URL
+const isLocalhost = (() => {
+  try {
+    const h = (window.location && window.location.hostname) || "";
+    return h === "localhost" || h === "127.0.0.1";
+  } catch {
+    return false;
+  }
+})();
 
 let queryBase = "";
 try {
@@ -31,9 +37,9 @@ try {
   }
 } catch {}
 
-export const API_URL = envBase || queryApi || (isDev ? "" : prodBase);
+export const API_URL = queryApi || (isLocalhost ? "" : prodBase);
 
-const DEFAULT_TIMEOUT = parseInt(process.env.REACT_APP_API_TIMEOUT_MS || "20000", 10); // 20s
+const DEFAULT_TIMEOUT = 20000;
 
 function timeoutFetch(url, opts = {}, timeout = DEFAULT_TIMEOUT) {
   const controller = new AbortController();
