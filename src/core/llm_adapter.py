@@ -7,6 +7,7 @@ import re
 import random
 import time
 import logging
+from urllib.parse import quote_plus
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pathlib import Path
@@ -1010,8 +1011,34 @@ class LLMAdapter:
             return hints
         return hints
 
-    def _build_actionable_fallback_text(self, text: str) -> str:
+    def _has_local_fallback_capability(self, text: str) -> bool:
         t = str(text or "").strip().lower()
+        if not t:
+            return False
+        try:
+            d = self._preparse_deterministic_voice_actions(text)
+            if isinstance(d, dict):
+                return True
+        except Exception:
+            pass
+        if re.match(r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+jarvis)?([\s!?.]*)$", t):
+            return True
+        if re.match(r"^(what\s+is\s+)?(-?\d+)\s*([+\-*/])\s*(-?\d+)\??$", t):
+            return True
+        if "what can you do" in t or "capabilit" in t:
+            return True
+        if "open " in t or "search " in t or "youtube" in t or "play " in t:
+            return True
+        return False
+
+    def _build_actionable_fallback_text(self, text: str, *, include_provider_notice: bool = True) -> str:
+        t = str(text or "").strip().lower()
+        if not include_provider_notice:
+            if re.search(r"\b(task|plan|workflow|steps|delegate)\b", t):
+                return "I can continue with a deterministic step-by-step plan and safe local actions."
+            if re.search(r"\b(project|repo|codebase|architecture)\b", t):
+                return "I can continue with deterministic local analysis using indexed context and recent logs."
+            return "Continuing with deterministic local fallback while provider routing stabilizes."
         if re.search(r"\b(debug|error|traceback|exception|fail|timeout)\b", t):
             return (
                 "Provider is unavailable right now. Share the exact error line and I will return a likely cause and fix checklist, "
@@ -1189,6 +1216,21 @@ class LLMAdapter:
             txt = re.sub(r"\s{2,}", " ", txt).strip()
 
         primary_intent = self._classify_primary_intent(user_text)
+        profile = self._classify_intent_profile(user_text)
+        if str(profile.get("intent_type") or "") == "informational":
+            explicit_execute = bool(re.search(r"\b(open|run|execute|launch|start|go\s+to|visit)\b", str(user_text or "").lower()))
+            if not explicit_execute:
+                filtered_actions = []
+                for a in actions:
+                    if not isinstance(a, dict):
+                        continue
+                    at = str(a.get("type") or "").strip().lower()
+                    if at in {"open_app", "open_url", "execute_command", "device_action", "switch_app", "close_app"}:
+                        continue
+                    filtered_actions.append(a)
+                if filtered_actions != actions:
+                    actions = filtered_actions
+                    out["actions"] = filtered_actions
         if primary_intent != "informational_intent":
             txt = re.sub(r"(?im)^\s*I\s+found\s+this\s*:?\s*", "", txt).strip()
             txt = re.sub(r"(?im)^\s*Risks\s*/\s*assumptions\s*:?\s*", "", txt).strip()
@@ -1207,6 +1249,11 @@ class LLMAdapter:
                 )
         else:
             txt = self._naturalize_response_text(user_text, txt, actions=actions)
+
+        if str(profile.get("intent_type") or "") == "informational" and (not actions):
+            txt = self._first_sentences(txt, max_sentences=2)
+            if len(txt) > 320:
+                txt = txt[:320].rstrip(" ,.;:") + "."
 
         out["text"] = txt
         return out
@@ -1407,6 +1454,122 @@ class LLMAdapter:
         if informational_intent:
             return "informational_intent"
         return "clarification_intent"
+
+    @staticmethod
+    def _classify_intent_profile(user_text: str) -> dict:
+        tl = (user_text or "").strip().lower()
+        wc = len(re.findall(r"\w+", tl))
+        if not tl:
+            return {
+                "intent_type": "ambiguous",
+                "intent_depth": "low",
+                "response_strategy": "clarify",
+            }
+
+        direct_action = bool(
+            re.search(
+                r"\b(open|launch|start|run|execute|close|quit|switch\s+to|focus|go\s+to|"
+                r"set\s+|turn\s+on|turn\s+off|enable|disable|restart|shutdown|lock\s+screen|"
+                r"take\s+(a\s+)?screenshot|capture\s+screen)\b",
+                tl,
+            )
+        )
+        goal_oriented = bool(
+            re.search(
+                r"\b(i\s+want\s+to|help\s+me\s+to|learn|improve|fix|achieve|master|"
+                r"become|build\s+a\s+habit|get\s+better|plan\s+for|roadmap)\b",
+                tl,
+            )
+        )
+        informational = bool(
+            re.search(r"\b(what|why|how|when|where|which|who)\b", tl)
+            or re.search(r"\b(explain|define|meaning|overview)\b", tl)
+        )
+        ambiguous = bool(
+            re.fullmatch(r"(do it|do this|do that|same|continue|go ahead|it|that|this)\.?", tl)
+            or (wc <= 2 and not direct_action and not goal_oriented and not informational)
+        )
+
+        if direct_action:
+            intent_type = "direct_action"
+            strategy = "execute_immediately"
+        elif goal_oriented:
+            intent_type = "goal_oriented"
+            strategy = "explain_plus_plan_plus_optional_execution"
+        elif informational:
+            intent_type = "informational"
+            strategy = "concise_explanation_only"
+        elif ambiguous:
+            intent_type = "ambiguous"
+            strategy = "clarify"
+        else:
+            intent_type = "ambiguous"
+            strategy = "clarify"
+
+        depth = "low"
+        if wc >= 11 or re.search(r"\b(and|then|after|before|because|so\s+that)\b", tl):
+            depth = "medium"
+        if wc >= 22 or re.search(r"\b(plan|roadmap|step\s+by\s+step|long\s+term|deep)\b", tl):
+            depth = "high"
+
+        return {
+            "intent_type": intent_type,
+            "intent_depth": depth,
+            "response_strategy": strategy,
+        }
+
+    @staticmethod
+    def _build_goal_oriented_plan_response(user_text: str, user_prefs: dict | None = None) -> dict | None:
+        tl = (user_text or "").strip().lower()
+        if not tl:
+            return None
+
+        profile = LLMAdapter._classify_intent_profile(user_text)
+        if profile.get("intent_type") != "goal_oriented":
+            return None
+
+        topic = "your goal"
+        m = re.search(r"\b(?:learn|improve|fix|achieve|master|become)\s+(.+)$", str(user_text or ""), flags=re.IGNORECASE)
+        if m:
+            topic = str(m.group(1) or "").strip(" .,!?") or topic
+
+        query = topic
+        if re.search(r"\blearn\b", tl):
+            query = f"beginner {topic} tutorial"
+        elif re.search(r"\bimprove\b", tl):
+            query = f"how to improve {topic}"
+        elif re.search(r"\bfix\b", tl):
+            query = f"how to fix {topic}"
+
+        prefers_execution = bool(isinstance(user_prefs, dict) and user_prefs.get("prefers_execution") is True)
+
+        text = (
+            f"Great goal. Here is a practical plan to make progress on {topic}:\n"
+            "1. Open browser\n"
+            f"2. Search: {query}\n"
+            "3. Follow a curated short step list and track daily progress\n\n"
+            "Do you want me to execute step 1 and step 2 now?"
+        )
+
+        actions = []
+        if prefers_execution:
+            actions = [
+                {"type": "open_url", "url": f"https://www.google.com/search?q={quote_plus(query)}"},
+            ]
+            text = (
+                f"Great goal. I am starting with a focused resource search for {topic}.\n"
+                f"Search query: {query}\n\n"
+                "After this opens, I can suggest a curated day-by-day plan."
+            )
+
+        return {
+            "text": text,
+            "actions": actions,
+            "source": "deterministic-goal-plan",
+            "intent_type": profile.get("intent_type"),
+            "intent_depth": profile.get("intent_depth"),
+            "response_strategy": profile.get("response_strategy"),
+        }
 
     @staticmethod
     def _is_mixed_action_generation_intent(user_text: str) -> bool:
@@ -1632,6 +1795,27 @@ class LLMAdapter:
                     confirm = confirm[:-1] + " now."
                 if (not txt) or ("opening" not in txt.lower() and "switching" not in txt.lower() and "closing" not in txt.lower() and "applying" not in txt.lower()):
                     parsed["text"] = confirm
+            # Smart plan enrichment: add useful optional next action suggestions.
+            try:
+                low_text = str(parsed.get("text") or "").strip().lower()
+                if at == "open_url":
+                    url = str(first.get("url") or "").strip().lower()
+                    if "youtube.com" in url and "want me to search" not in low_text:
+                        parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nDo you want me to search something on YouTube for you?").strip()
+                elif at == "open_app":
+                    app = str(first.get("app_name") or "").strip().lower()
+                    if app in {"chrome", "edge", "firefox", "browser"} and "want me to search" not in low_text:
+                        parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nDo you want me to search anything for you now?").strip()
+            except Exception:
+                pass
+            try:
+                profile = self._classify_intent_profile(user_text)
+                parsed["intent_type"] = profile.get("intent_type")
+                parsed["intent_depth"] = profile.get("intent_depth")
+                parsed["response_strategy"] = profile.get("response_strategy")
+                parsed["intent"] = parsed.get("intent") or profile.get("intent_type") or "chat"
+            except Exception:
+                pass
             return parsed
 
         # No actions: add optional proactive suggestion for generation/helpful tasks.
@@ -1647,6 +1831,28 @@ class LLMAdapter:
 
         if suggestion and suggestion.lower() not in txt.lower():
             parsed["text"] = (txt + "\n\n" + suggestion).strip() if txt else suggestion
+
+        # Goal/informational intent proactive nudges.
+        try:
+            profile = self._classify_intent_profile(user_text)
+            it = str(profile.get("intent_type") or "")
+            low = str(parsed.get("text") or "").strip().lower()
+            if it == "goal_oriented" and "do you want me" not in low:
+                parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nDo you want me to execute the first step now?").strip()
+            elif it == "informational" and "want a quick example" not in low:
+                parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nWant a quick example?").strip()
+        except Exception:
+            pass
+
+        # Attach intent metadata for downstream decision layers.
+        try:
+            profile = self._classify_intent_profile(user_text)
+            parsed["intent_type"] = profile.get("intent_type")
+            parsed["intent_depth"] = profile.get("intent_depth")
+            parsed["response_strategy"] = profile.get("response_strategy")
+            parsed["intent"] = parsed.get("intent") or profile.get("intent_type") or "chat"
+        except Exception:
+            pass
 
         return parsed
 
@@ -3199,6 +3405,24 @@ class LLMAdapter:
             pass
 
         primary_intent = self._classify_primary_intent(text)
+        intent_profile = self._classify_intent_profile(text)
+
+        try:
+            if intent_profile.get("intent_type") == "goal_oriented":
+                goal_plan = self._build_goal_oriented_plan_response(text, user_prefs=user_prefs)
+                if isinstance(goal_plan, dict):
+                    goal_plan["routing"] = {
+                        "provider": "deterministic",
+                        "model": "local-fast-path",
+                        "fallback_used": True,
+                    }
+                    try:
+                        goal_plan["emotion"] = goal_plan.get("emotion") or self._infer_emotion(goal_plan.get("text") or text)
+                    except Exception:
+                        pass
+                    return goal_plan
+        except Exception:
+            pass
 
         try:
             repeated = self._get_cached_response(text, max_age_s=240)
@@ -3953,6 +4177,12 @@ Style tone: {tone}.
             except Exception:
                 pass
 
+            # Minimal multi-step chaining for Jarvis-like execution (open -> search/play).
+            try:
+                parsed = self._postprocess_multi_step_chain_actions(user_text=text, parsed=parsed)
+            except Exception:
+                pass
+
             # Auto web fallback: if the model is uncertain and the user asked an informational question,
             # trigger web_search so the 2-pass pipeline can answer with real sources.
             try:
@@ -4312,18 +4542,107 @@ Style tone: {tone}.
             # IMPORTANT: This is returned when the model call/parsing fails.
             # Avoid "thinking..." style filler that looks like a pending response.
             now = time.time()
+            include_provider_notice = not self._has_local_fallback_capability(text)
             if (now - float(self._last_provider_notice_at or 0.0)) < 90.0:
                 return {
-                    "text": self._build_actionable_fallback_text(text),
+                    "text": self._build_actionable_fallback_text(text, include_provider_notice=include_provider_notice),
                     "actions": [],
                     "source": "fallback",
                 }
             self._last_provider_notice_at = now
             return {
-                "text": self._build_actionable_fallback_text(text),
+                "text": self._build_actionable_fallback_text(text, include_provider_notice=include_provider_notice),
                 "actions": [],
                 "source": "fallback",
             }
+
+    def _postprocess_multi_step_chain_actions(self, user_text: str, parsed: dict) -> dict:
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list):
+            actions = []
+
+        # Reuse previously successful chained plans from local learning cache when available.
+        try:
+            cached = self._get_cached_response(user_text, max_age_s=86400)
+            cached_actions = (cached or {}).get("actions") if isinstance(cached, dict) else []
+            if (not actions) and isinstance(cached_actions, list) and cached_actions:
+                has_chain = any(isinstance(a, dict) and (a.get("depends_on") or a.get("step_id")) for a in cached_actions)
+                if has_chain:
+                    actions = [dict(a) for a in cached_actions if isinstance(a, dict)]
+        except Exception:
+            pass
+
+        t = str(user_text or "").strip().lower()
+        if not t:
+            parsed["actions"] = actions
+            return parsed
+
+        def _has_action(action_type: str) -> bool:
+            return any(
+                isinstance(a, dict) and str(a.get("type") or "").strip().lower() == action_type
+                for a in actions
+            )
+
+        def _extract_query(pattern: str) -> str:
+            m = re.search(pattern, str(user_text or ""), flags=re.IGNORECASE)
+            if not m:
+                return ""
+            return str(m.group(1) or "").strip(" .,!?")
+
+        # open chrome/browser and search ...
+        search_q = _extract_query(r"\b(?:search(?:\s+for)?|look\s+up|find)\s+(.+?)(?:\s*(?:and\s+then|then)\b|$)")
+        wants_browser_open = bool(re.search(r"\bopen\s+(?:chrome|browser|edge|firefox)\b", t))
+        if wants_browser_open and search_q:
+            if not _has_action("open_app"):
+                actions.insert(0, {"type": "open_app", "app_name": "chrome"})
+            if not any(
+                isinstance(a, dict)
+                and str(a.get("type") or "").strip().lower() == "open_url"
+                and "google.com/search" in str(a.get("url") or "").lower()
+                for a in actions
+            ):
+                actions.append({
+                    "type": "open_url",
+                    "url": f"https://www.google.com/search?q={quote_plus(search_q)}",
+                })
+
+        # open youtube and play music
+        if "youtube" in t and ("play" in t or "music" in t):
+            if not any(
+                isinstance(a, dict)
+                and str(a.get("type") or "").strip().lower() == "open_url"
+                and "youtube.com" in str(a.get("url") or "").lower()
+                for a in actions
+            ):
+                actions.append({"type": "open_url", "url": "https://www.youtube.com"})
+
+            play_q = _extract_query(r"\bplay\s+(.+?)(?:\s*(?:on\s+youtube|in\s+youtube)|$)")
+            if not play_q and "music" in t:
+                play_q = "music"
+            if play_q and not any(
+                isinstance(a, dict)
+                and str(a.get("type") or "").strip().lower() == "open_url"
+                and "youtube.com/results" in str(a.get("url") or "").lower()
+                for a in actions
+            ):
+                actions.append(
+                    {
+                        "type": "open_url",
+                        "url": f"https://www.youtube.com/results?search_query={quote_plus(play_q)}",
+                    }
+                )
+
+        # Annotate chain dependencies for sequential execution.
+        for idx, a in enumerate(actions):
+            if not isinstance(a, dict):
+                continue
+            if not a.get("step_id"):
+                a["step_id"] = f"step_{idx + 1}"
+            if idx > 0 and not a.get("depends_on"):
+                a["depends_on"] = f"step_{idx}"
+
+        parsed["actions"] = actions
+        return parsed
 
     @staticmethod
     def _postprocess_open_url_actions(user_text: str, parsed: dict) -> dict:

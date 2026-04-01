@@ -140,6 +140,7 @@ export default function App() {
   const [agentCfgError, setAgentCfgError] = useState(null);
   const [systemInfo, setSystemInfo] = useState(null);
   const [systemHealth, setSystemHealth] = useState(null);
+  const [deviceStatusConnected, setDeviceStatusConnected] = useState(false);
   const [agentOffline, setAgentOffline] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionId, setSessionId] = useState(null);
@@ -167,6 +168,8 @@ export default function App() {
       document.title = `${nm} - AI Assistant`;
     } catch {}
   }, [assistantName]);
+
+  const isDeviceConnected = deviceStatusConnected === true;
 
   const googleSttDisabledUntilRef = useRef(0);
   const lastWakeNoSpeechLogRef = useRef(0);
@@ -1200,6 +1203,8 @@ export default function App() {
   useEffect(() => {
     if (!isAuthenticated || !sessionId) {
       setSystemInfo(null);
+      setDeviceStatusConnected(false);
+      setAgentOffline(false);
       return;
     }
 
@@ -1222,7 +1227,9 @@ export default function App() {
         if (fullHealth && typeof fullHealth === "object") {
           setSystemHealth(fullHealth);
         }
-        setAgentOffline(!!status?.agent_offline);
+        const connected = !!status?.device_status?.connected;
+        setDeviceStatusConnected(connected);
+        setAgentOffline(!connected);
         const agents = Array.isArray(status?.agents) ? status.agents : [];
         const sys = agents[0]?.capabilities?.system_info || null;
         if (sys && typeof sys === "object") {
@@ -3203,6 +3210,23 @@ export default function App() {
               Assistant: {assistantName || "Jarvis"}
             </span>
 
+            {!isDeviceConnected && (
+              <button
+                onClick={connectPcAgent}
+                style={{
+                  background: "rgba(0,234,255,0.16)",
+                  border: "1px solid var(--jarvis-accent)",
+                  color: "var(--jarvis-accent)",
+                  borderRadius: 999,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                Connect PC Agent
+              </button>
+            )}
+
             <button onClick={async () => {
               const sid = sessionId;
 
@@ -3234,6 +3258,8 @@ export default function App() {
               try {
                 if (isMobile) setVoiceUnlocked(false);
               } catch {}
+              setDeviceStatusConnected(false);
+              setAgentOffline(false);
               setShowAuthModal(true);
               speak("Logged out successfully.");
             }} style={{ background: "transparent", border: "none", color: "#ff5050", cursor: "pointer" }}>Logout</button>
@@ -3259,6 +3285,7 @@ export default function App() {
           agentCfgLoaded={agentCfgLoaded}
           agentCfgError={agentCfgError}
           onConnectPcAgent={connectPcAgent}
+          showConnectPcAgentButton={false}
           systemInfo={systemInfo}
           themeColor={themeColor}
           onThemeColorChange={setThemeColor}

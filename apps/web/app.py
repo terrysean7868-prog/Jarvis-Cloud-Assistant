@@ -11,6 +11,7 @@ import base64
 import secrets
 from datetime import timedelta, timezone
 from contextlib import asynccontextmanager
+from urllib.parse import quote_plus
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
@@ -768,6 +769,631 @@ def _delegated_tasks_collection():
     return col
 
 
+def _plan_learning_collection():
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return None
+    col = database.db["learning_memory_plans"]
+    try:
+        col.create_index([("signature", 1), ("updated_at", -1)])
+    except Exception:
+        pass
+    return col
+
+
+def _plan_signature(text: str) -> str:
+    s = str(text or "").strip().lower()
+    if not s:
+        return ""
+    toks = re.findall(r"[a-z0-9]{3,}", s)
+    stop = {
+        "please", "jarvis", "open", "and", "then", "for", "with", "from", "into", "that", "this", "the", "your",
+        "search", "find", "look", "show", "run", "start", "launch",
+    }
+    kept = [t for t in toks if t not in stop]
+    if not kept:
+        kept = toks
+    return " ".join(sorted(set(kept[:12])))
+
+
+def _load_reusable_plan(source_text: str) -> list[dict[str, Any]]:
+    col = _plan_learning_collection()
+    if col is None:
+        return []
+    sig = _plan_signature(source_text)
+    if not sig:
+        return []
+    sig_set = set(sig.split())
+    best = None
+    best_score = 0.0
+    try:
+        rows = list(col.find({}, {"_id": 0, "signature": 1, "steps": 1, "success_rate": 1}).sort("updated_at", -1).limit(40))
+        for r in rows:
+            rs = str((r or {}).get("signature") or "")
+            rs_set = set(rs.split())
+            if not rs_set:
+                continue
+            overlap = len(sig_set.intersection(rs_set))
+            score = float(overlap) / float(max(1, len(sig_set.union(rs_set))))
+            score *= max(0.1, float((r or {}).get("success_rate") or 0.5))
+            if score > best_score:
+                best = r
+                best_score = score
+    except Exception:
+        return []
+    if best_score < 0.55 or not isinstance((best or {}).get("steps"), list):
+        return []
+    return [dict(x) for x in ((best or {}).get("steps") or []) if isinstance(x, dict)]
+
+
+def _plan_steps_key(steps: list[dict[str, Any]]) -> str:
+    if not isinstance(steps, list) or not steps:
+        return ""
+    chunks: list[str] = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        action = str((s or {}).get("action") or "").strip().lower()
+        params = (s or {}).get("params") if isinstance((s or {}).get("params"), dict) else {}
+        param_keys = ",".join(sorted([str(k).strip().lower() for k in params.keys()]))
+        chunks.append(f"{action}({param_keys})")
+    return "|".join(chunks)[:500]
+
+
+def _action_complexity_weight(action_name: str) -> float:
+    name = str(action_name or "").strip().lower()
+    if name in {"open_url", "wait", "focus_window", "close_app"}:
+        return 0.9
+    if name in {"search_web", "browser_click", "browser_type", "open_app"}:
+        return 1.2
+    if name in {"run_command", "run_code", "filesystem_write", "install_package"}:
+        return 1.8
+    return 1.3
+
+
+def _recent_device_error_rate(*, device_id: str | None, username: str | None = None) -> float:
+    did = _normalize_device_id(device_id)
+    try:
+        col = _delegated_tasks_collection()
+        if col is None:
+            return 0.0
+        query: dict[str, Any] = {"status": {"$in": ["failed", "completed", "queued_for_agent"]}}
+        if did:
+            query["device_id"] = did
+        elif username:
+            query["username"] = str(username or "").strip().lower()
+        rows = list(col.find(query, {"_id": 0, "status": 1, "error": 1, "last_error": 1, "updated_at": 1}).sort("updated_at", -1).limit(20))
+        if not rows:
+            return 0.0
+        failed = 0
+        for row in rows:
+            status = str((row or {}).get("status") or "").strip().lower()
+            if status == "failed":
+                failed += 1
+                continue
+            if status == "queued_for_agent" and str((row or {}).get("last_error") or "").strip():
+                failed += 1
+        return max(0.0, min(1.0, float(failed) / float(max(1, len(rows)))))
+    except Exception:
+        return 0.0
+
+
+def _plan_history_stats(source_text: str, steps: list[dict[str, Any]]) -> dict[str, float]:
+    sig = _plan_signature(source_text)
+    key = _plan_steps_key(steps)
+    sig_set = set(sig.split())
+    weighted = 0.0
+    weight_sum = 0.0
+    exact_plan_success_rate = -1.0
+    recent_failure_penalty = 0.0
+    try:
+        col = _plan_learning_collection()
+        if col is None or not sig:
+            return {
+                "similar_success_probability": 0.5,
+                "past_success_rate": 0.5,
+                "recent_failure_penalty": 0.0,
+            }
+        rows = list(col.find({}, {"_id": 0, "signature": 1, "success_rate": 1, "plan_stats": 1, "updated_at": 1}).sort("updated_at", -1).limit(80))
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            rs = str((row or {}).get("signature") or "")
+            rs_set = set(rs.split())
+            if not rs_set:
+                continue
+            overlap = len(sig_set.intersection(rs_set))
+            union = len(sig_set.union(rs_set))
+            sim = float(overlap) / float(max(1, union))
+            if sim <= 0.0:
+                continue
+            row_success = max(0.0, min(1.0, float((row or {}).get("success_rate") or 0.5)))
+            weighted += sim * row_success
+            weight_sum += sim
+
+            if rs == sig and isinstance((row or {}).get("plan_stats"), dict) and key:
+                stat = (row.get("plan_stats") or {}).get(key)
+                if isinstance(stat, dict):
+                    exact_plan_success_rate = max(0.0, min(1.0, float((stat or {}).get("success_rate") or row_success)))
+                    fails = (stat or {}).get("recent_failures") if isinstance((stat or {}).get("recent_failures"), list) else []
+                    recent_fail_count = 0
+                    for stamp in fails:
+                        try:
+                            ts = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=timezone.utc)
+                            age_h = (now - ts).total_seconds() / 3600.0
+                            if age_h <= 12.0:
+                                recent_fail_count += 1
+                        except Exception:
+                            continue
+                    recent_failure_penalty = min(0.35, float(recent_fail_count) * 0.12)
+    except Exception:
+        pass
+
+    similar_success_probability = weighted / weight_sum if weight_sum > 0 else 0.5
+    past_success_rate = exact_plan_success_rate if exact_plan_success_rate >= 0 else similar_success_probability
+    return {
+        "similar_success_probability": max(0.0, min(1.0, float(similar_success_probability))),
+        "past_success_rate": max(0.0, min(1.0, float(past_success_rate))),
+        "recent_failure_penalty": max(0.0, min(0.5, float(recent_failure_penalty))),
+    }
+
+
+def _score_plan(
+    *,
+    source_text: str,
+    steps: list[dict[str, Any]],
+    device_id: str | None,
+    agent_online: bool,
+    agent_temporarily_unavailable: bool,
+    recent_device_error_rate: float,
+) -> dict[str, float]:
+    valid_steps = [s for s in (steps or []) if isinstance(s, dict)]
+    step_count = len(valid_steps)
+    if step_count <= 0:
+        return {
+            "success_probability": 0.0,
+            "step_complexity": 1.0,
+            "dependency_risk": 1.0,
+            "past_success_rate": 0.0,
+            "overall": 0.0,
+        }
+
+    history = _plan_history_stats(source_text, valid_steps)
+    action_weight = sum(_action_complexity_weight(str((s or {}).get("action") or "")) for s in valid_steps)
+    avg_action_weight = action_weight / float(max(1, step_count))
+    step_complexity = max(0.0, min(1.0, (min(8, step_count) / 8.0) * 0.6 + (min(2.5, avg_action_weight) / 2.5) * 0.4))
+
+    dep_count = 0
+    chain_like = 0
+    for s in valid_steps:
+        dep = str((s or {}).get("depends_on") or "").strip()
+        if dep:
+            dep_count += 1
+            if dep.startswith("step_"):
+                chain_like += 1
+    dependency_risk = max(0.0, min(1.0, (float(dep_count) / float(max(1, step_count))) * 0.7 + (float(chain_like) / float(max(1, step_count))) * 0.3))
+
+    context_penalty = 0.0
+    if not agent_online and step_count > 1:
+        context_penalty += 0.18
+    if agent_temporarily_unavailable:
+        context_penalty += 0.14
+    context_penalty += min(0.2, max(0.0, float(recent_device_error_rate)) * 0.2)
+
+    past_success_rate = max(0.0, min(1.0, float(history.get("past_success_rate") or 0.5)))
+    success_probability = (
+        (float(history.get("similar_success_probability") or 0.5) * 0.58)
+        + (past_success_rate * 0.3)
+        + ((1.0 - dependency_risk) * 0.12)
+        - float(history.get("recent_failure_penalty") or 0.0)
+        - context_penalty
+    )
+    success_probability = max(0.0, min(1.0, success_probability))
+
+    overall = (
+        (success_probability * 0.45)
+        + (past_success_rate * 0.25)
+        + ((1.0 - step_complexity) * 0.2)
+        + ((1.0 - dependency_risk) * 0.1)
+    )
+    overall = max(0.0, min(1.0, overall))
+    return {
+        "success_probability": round(success_probability, 4),
+        "step_complexity": round(step_complexity, 4),
+        "dependency_risk": round(dependency_risk, 4),
+        "past_success_rate": round(past_success_rate, 4),
+        "overall": round(overall, 4),
+    }
+
+
+def _save_plan_learning(
+    source_text: str,
+    steps: list[dict[str, Any]],
+    *,
+    success: bool,
+    execution_time_ms: float | None = None,
+    retries_used: int = 0,
+    score: dict[str, Any] | None = None,
+) -> None:
+    try:
+        col = _plan_learning_collection()
+        if col is None:
+            return
+        sig = _plan_signature(source_text)
+        if not sig or not isinstance(steps, list) or not steps:
+            return
+        now = datetime.now(timezone.utc)
+        col.update_one(
+            {"signature": sig},
+            {
+                "$set": {
+                    "signature": sig,
+                    "source_example": str(source_text or "")[:240],
+                    "steps": [s for s in steps if isinstance(s, dict)],
+                    "updated_at": now,
+                    "last_outcome": "success" if bool(success) else "failed",
+                    "last_execution_time_ms": round(float(execution_time_ms), 2) if execution_time_ms is not None else None,
+                    "last_retries_used": max(0, int(retries_used or 0)),
+                    "last_plan_score": dict(score or {}),
+                },
+                "$setOnInsert": {"created_at": now},
+                "$inc": {"attempts": 1, "successes": 1 if success else 0},
+            },
+            upsert=True,
+        )
+        row = col.find_one({"signature": sig}, {"_id": 0, "attempts": 1, "successes": 1}) or {}
+        attempts = max(1, int(row.get("attempts") or 1))
+        successes = int(row.get("successes") or 0)
+        col.update_one({"signature": sig}, {"$set": {"success_rate": float(successes) / float(attempts)}})
+
+        # Per-plan learning lets the planner avoid repeating weak strategies for the same intent.
+        plan_key = _plan_steps_key(steps)
+        if plan_key:
+            row = col.find_one({"signature": sig}, {"_id": 0, "plan_stats": 1}) or {}
+            stats = row.get("plan_stats") if isinstance(row.get("plan_stats"), dict) else {}
+            cur = stats.get(plan_key) if isinstance(stats.get(plan_key), dict) else {}
+            pa = int(cur.get("attempts") or 0) + 1
+            ps = int(cur.get("successes") or 0) + (1 if success else 0)
+            prev_avg_ms = float(cur.get("avg_execution_time_ms") or 0.0)
+            prev_cnt = int(cur.get("timing_samples") or 0)
+            if execution_time_ms is None:
+                next_avg_ms = prev_avg_ms
+                next_cnt = prev_cnt
+            else:
+                next_cnt = prev_cnt + 1
+                next_avg_ms = ((prev_avg_ms * prev_cnt) + float(execution_time_ms)) / float(max(1, next_cnt))
+            recent_failures = cur.get("recent_failures") if isinstance(cur.get("recent_failures"), list) else []
+            if success:
+                recent_failures = recent_failures[-3:]
+            else:
+                recent_failures.append(now.isoformat())
+                recent_failures = recent_failures[-10:]
+
+            stats[plan_key] = {
+                "attempts": pa,
+                "successes": ps,
+                "success_rate": float(ps) / float(max(1, pa)),
+                "avg_execution_time_ms": round(float(next_avg_ms), 2),
+                "timing_samples": next_cnt,
+                "recent_failures": recent_failures,
+                "updated_at": now,
+            }
+            col.update_one({"signature": sig}, {"$set": {"plan_stats": stats, "last_plan_key": plan_key}})
+    except Exception:
+        return
+
+
+def _normalize_plan_action(action: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if isinstance(action.get("action"), str):
+        an = str(action.get("action") or "").strip()
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        return an, dict(params)
+    an = str(action.get("type") or "").strip()
+    params = {k: v for k, v in (action or {}).items() if k not in {"type", "task_id", "step_id", "depends_on"} and v is not None}
+    return an, params
+
+
+def _derive_dynamic_plan(source_text: str, actions: list[dict[str, Any]], *, prefer_reuse: bool = True) -> list[dict[str, Any]]:
+    if prefer_reuse:
+        reusable = _load_reusable_plan(source_text)
+        if reusable:
+            logger.info("[PLAN] Reused learned plan: signature=%s steps=%s", _plan_signature(source_text), len(reusable))
+            return reusable
+
+    steps: list[dict[str, Any]] = []
+    incoming = [a for a in (actions or []) if isinstance(a, dict)]
+    text = str(source_text or "").strip()
+    tl = text.lower()
+
+    if incoming:
+        for idx, a in enumerate(incoming):
+            action_name, params = _normalize_plan_action(a)
+            if not action_name:
+                continue
+            steps.append(
+                {
+                    "step": idx + 1,
+                    "step_id": str(a.get("step_id") or f"step_{idx + 1}"),
+                    "depends_on": str(a.get("depends_on") or "").strip() or (f"step_{idx}" if idx > 0 else None),
+                    "action": action_name,
+                    "params": params,
+                    "retry_once": True,
+                }
+            )
+
+    # Dynamic intent/entity extraction fallback when model actions are sparse.
+    if not steps:
+        url_match = re.search(r"https?://\S+", text, flags=re.IGNORECASE)
+        if url_match:
+            steps.append({"step": 1, "step_id": "step_1", "depends_on": None, "action": "open_url", "params": {"url": url_match.group(0)}, "retry_once": True})
+
+        app_match = re.search(r"\b(?:open|launch|start)\s+([a-z0-9_ .-]{2,40})", text, flags=re.IGNORECASE)
+        if app_match:
+            app = str(app_match.group(1) or "").strip(" .,!?")
+            if app:
+                steps.append(
+                    {
+                        "step": len(steps) + 1,
+                        "step_id": f"step_{len(steps) + 1}",
+                        "depends_on": f"step_{len(steps)}" if steps else None,
+                        "action": "open_app",
+                        "params": {"app_name": app},
+                        "retry_once": True,
+                    }
+                )
+
+        q_match = re.search(r"\b(?:search(?:\s+for)?|look\s+up|find)\s+(.+?)(?:$|\s+and\b)", text, flags=re.IGNORECASE)
+        if q_match:
+            q = str(q_match.group(1) or "").strip(" .,!?")
+            if q:
+                steps.append(
+                    {
+                        "step": len(steps) + 1,
+                        "step_id": f"step_{len(steps) + 1}",
+                        "depends_on": f"step_{len(steps)}" if steps else None,
+                        "action": "open_url",
+                        "params": {"url": f"https://www.google.com/search?q={quote_plus(q)}"},
+                        "retry_once": True,
+                    }
+                )
+
+    # Adaptive fallback suggestions by action type.
+    for s in steps:
+        act = str((s or {}).get("action") or "").strip().lower()
+        if act == "open_app":
+            s["fallback"] = {"action": "open_url", "params": {"url": "https://www.google.com"}}
+
+    logger.info("[PLAN] Generated steps: %s", [f"{i + 1}:{str((x or {}).get('action') or '').strip()}" for i, x in enumerate(steps)])
+    return steps
+
+
+def _build_direct_plan_variant(source_text: str, base_steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    text = str(source_text or "").strip()
+    # Prefer one-hop execution when a clear URL exists.
+    url_match = re.search(r"https?://\S+", text, flags=re.IGNORECASE)
+    if url_match:
+        return [{"step": 1, "step_id": "step_1", "depends_on": None, "action": "open_url", "params": {"url": url_match.group(0)}, "retry_once": True}]
+
+    for step in base_steps:
+        if not isinstance(step, dict):
+            continue
+        if str((step or {}).get("action") or "").strip().lower() == "open_url":
+            params = (step or {}).get("params") if isinstance((step or {}).get("params"), dict) else {}
+            url = str(params.get("url") or "").strip()
+            if url:
+                return [{"step": 1, "step_id": "step_1", "depends_on": None, "action": "open_url", "params": {"url": url}, "retry_once": True}]
+
+    q_match = re.search(r"\b(?:search(?:\s+for)?|look\s+up|find)\s+(.+?)(?:$|\s+and\b)", text, flags=re.IGNORECASE)
+    if q_match:
+        q = str(q_match.group(1) or "").strip(" .,!?")
+        if q:
+            return [{"step": 1, "step_id": "step_1", "depends_on": None, "action": "open_url", "params": {"url": f"https://www.google.com/search?q={quote_plus(q)}"}, "retry_once": True}]
+    return []
+
+
+def _collect_plan_options(source_text: str, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+
+    primary = _derive_dynamic_plan(source_text, actions, prefer_reuse=True)
+    generated = _derive_dynamic_plan(source_text, actions, prefer_reuse=False)
+    reusable = _load_reusable_plan(source_text)
+    direct = _build_direct_plan_variant(source_text, generated or primary)
+
+    seeds = [
+        ("A", "primary", primary),
+        ("B", "direct", direct),
+        ("C", "learned", reusable),
+        ("D", "generated", generated),
+    ]
+    seen: set[str] = set()
+    for label, source, steps in seeds:
+        valid = [s for s in (steps or []) if isinstance(s, dict)]
+        if not valid:
+            continue
+        key = _plan_steps_key(valid)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        options.append({"id": label, "source": source, "steps": valid, "metadata": {}})
+        if len(options) >= 3:
+            break
+
+    if len(options) < 2 and options:
+        one_step = [dict(options[0]["steps"][0])] if options[0].get("steps") else []
+        if one_step:
+            key = _plan_steps_key(one_step)
+            if key and key not in seen:
+                options.append({"id": "F", "source": "fallback_single_step", "steps": one_step, "metadata": {}})
+
+    return options
+
+
+def _select_best_plan_option(
+    *,
+    source_text: str,
+    options: list[dict[str, Any]],
+    device_id: str | None,
+    username: str | None,
+    agent_online: bool,
+    agent_temporarily_unavailable: bool,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    if not options:
+        return None, []
+
+    error_rate = _recent_device_error_rate(device_id=device_id, username=username)
+    scored: list[dict[str, Any]] = []
+    for item in options:
+        steps = item.get("steps") if isinstance(item.get("steps"), list) else []
+        score = _score_plan(
+            source_text=source_text,
+            steps=[s for s in steps if isinstance(s, dict)],
+            device_id=device_id,
+            agent_online=bool(agent_online),
+            agent_temporarily_unavailable=bool(agent_temporarily_unavailable),
+            recent_device_error_rate=error_rate,
+        )
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        meta["score"] = score
+        item["metadata"] = meta
+        scored.append(item)
+
+    scored.sort(key=lambda x: float(((x.get("metadata") or {}).get("score") or {}).get("overall") or 0.0), reverse=True)
+
+    logger.info("[PLAN OPTIONS] count=%s signature=%s", len(scored), _plan_signature(source_text))
+    for item in scored:
+        sid = str(item.get("id") or "?")
+        score = (item.get("metadata") or {}).get("score") if isinstance((item.get("metadata") or {}).get("score"), dict) else {}
+        logger.info(
+            "[PLAN SCORE] Plan %s source=%s overall=%.4f success_probability=%.4f step_complexity=%.4f dependency_risk=%.4f past_success_rate=%.4f",
+            sid,
+            str(item.get("source") or "dynamic"),
+            float(score.get("overall") or 0.0),
+            float(score.get("success_probability") or 0.0),
+            float(score.get("step_complexity") or 0.0),
+            float(score.get("dependency_risk") or 0.0),
+            float(score.get("past_success_rate") or 0.0),
+        )
+
+    selected = scored[0] if scored else None
+    if selected is not None:
+        logger.info("[SELECTED PLAN] %s source=%s overall=%.4f", str(selected.get("id") or "A"), str(selected.get("source") or "dynamic"), float((((selected.get("metadata") or {}).get("score") or {}).get("overall") or 0.0)))
+    return selected, scored
+
+
+async def _execute_dynamic_plan(
+    *,
+    device_id: str,
+    username: str,
+    source_text: str,
+    task_id: str,
+    plan_steps: list[dict[str, Any]],
+    await_timeout_s: float,
+) -> tuple[dict[str, Any] | None, str | None]:
+    started_at = time.perf_counter()
+    retries_used = 0
+    results: list[dict[str, Any]] = []
+    if not plan_steps:
+        return None, "empty_plan"
+
+    for idx, step in enumerate(plan_steps):
+        action_name = str((step or {}).get("action") or "").strip()
+        params = (step or {}).get("params") if isinstance((step or {}).get("params"), dict) else {}
+        if not action_name:
+            return None, "invalid_plan_step"
+
+        _mark_delegated_task(task_id=task_id, status_value="executing", extra={"current_step": idx, "active_step": action_name})
+        logger.info("[STEP %s] %s", idx + 1, action_name)
+
+        async def _run_step(run_action: str, run_params: dict[str, Any], attempt: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            payload = {
+                "action": run_action,
+                "params": run_params,
+                "task_id": f"{task_id}:{str((step or {}).get('step_id') or f'step_{idx + 1}')}",
+                "step_id": str((step or {}).get("step_id") or f"step_{idx + 1}"),
+                "depends_on": str((step or {}).get("depends_on") or "").strip() or (f"step_{idx}" if idx > 0 else None),
+            }
+            job = await _dispatch_actions_to_device(device_id, username=username, actions=[payload], source_text=source_text)
+            _mark_delegated_task(task_id=task_id, status_value="delegated", extra={"last_job_id": job.get("job_id"), "current_step": idx, "attempts": int(attempt)})
+            res = await _await_job_result(str((job or {}).get("job_id") or ""), timeout_s=await_timeout_s)
+            return job, res
+
+        success = False
+        final_entry: dict[str, Any] = {}
+        for attempt in (1, 2):
+            job, payload = await _run_step(action_name, params, attempt)
+            if attempt > 1:
+                retries_used += 1
+            if not payload:
+                final_entry = {
+                    "status": "failed",
+                    "error": "agent_response_timeout",
+                    "task_id": f"{task_id}:{idx + 1}",
+                    "action": action_name,
+                }
+            else:
+                first = _extract_agent_contract_entry(payload)
+                s = str((first or {}).get("status") or "").strip().lower()
+                mapped = "completed" if s in {"success", "ok", "completed"} else "failed"
+                final_entry = dict(first or {})
+                final_entry["status"] = mapped
+
+            if str(final_entry.get("status") or "").lower() == "completed":
+                success = True
+                break
+            if attempt == 1 and not bool((step or {}).get("retry_once", True)):
+                break
+
+        if not success:
+            fb = (step or {}).get("fallback") if isinstance((step or {}).get("fallback"), dict) else None
+            if fb:
+                fb_action = str((fb or {}).get("action") or "").strip()
+                fb_params = (fb or {}).get("params") if isinstance((fb or {}).get("params"), dict) else {}
+                try:
+                    job, payload = await _run_step(fb_action, fb_params, 1)
+                    retries_used += 1
+                    first = _extract_agent_contract_entry(payload) if isinstance(payload, dict) else {}
+                    s = str((first or {}).get("status") or "").strip().lower()
+                    if s in {"success", "ok", "completed"}:
+                        success = True
+                        final_entry = dict(first or {})
+                        final_entry["status"] = "completed"
+                        final_entry["fallback_used"] = True
+                except Exception:
+                    pass
+
+        results.append(final_entry)
+        if not success:
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+            return {
+                "type": "result",
+                "job_id": f"plan_{task_id}",
+                "results": results,
+                "plan_metrics": {
+                    "execution_time_ms": elapsed_ms,
+                    "retries_used": retries_used,
+                    "steps_total": len(plan_steps),
+                    "success": False,
+                },
+            }, str(final_entry.get("error") or "step_failed")
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+    return {
+        "type": "result",
+        "job_id": f"plan_{task_id}",
+        "results": results,
+        "plan_metrics": {
+            "execution_time_ms": elapsed_ms,
+            "retries_used": retries_used,
+            "steps_total": len(plan_steps),
+            "success": True,
+        },
+    }, None
+
+
 def _normalize_flow_status(value: str | None, *, default: str = "awaiting_agent") -> str:
     s = str(value or "").strip().lower()
     allowed = {
@@ -879,6 +1505,9 @@ def _queue_delegated_task(
     actions: list[dict[str, Any]],
     status_value: str,
     reason: str,
+    plan_steps: list[dict[str, Any]] | None = None,
+    plan_source: str | None = None,
+    current_step: int = 0,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     normalized_status = _normalize_flow_status(status_value)
@@ -890,6 +1519,9 @@ def _queue_delegated_task(
         "feature": str(feature or "device_action").strip() or "device_action",
         "source_text": str(source_text or "").strip(),
         "actions": [a for a in (actions or []) if isinstance(a, dict)],
+        "steps": [s for s in (plan_steps or []) if isinstance(s, dict)],
+        "current_step": max(0, int(current_step or 0)),
+        "plan_source": str(plan_source or "dynamic").strip() or "dynamic",
         "status": normalized_status,
         "reason": str(reason or "").strip() or None,
         "attempts": 0,
@@ -1117,6 +1749,17 @@ async def _delegate_or_queue_cloud_action(
         return out
 
     actions = executable_actions
+    plan_options = _collect_plan_options(source_text, actions)
+    if not plan_options and actions:
+        fallback_steps = _derive_dynamic_plan("", actions, prefer_reuse=False)
+        if fallback_steps:
+            plan_options = [{"id": "A", "source": "generated", "steps": fallback_steps, "metadata": {}}]
+
+    selected_option = plan_options[0] if plan_options else None
+    scored_options = list(plan_options)
+    plan_steps = [s for s in ((selected_option or {}).get("steps") or []) if isinstance(s, dict)]
+    selected_score = ((selected_option or {}).get("metadata") or {}).get("score") if isinstance(((selected_option or {}).get("metadata") or {}).get("score"), dict) else {}
+
     principal = _require_admin_session(session_id) if require_admin else _require_authenticated_session(session_id)
     username = str((principal or {}).get("username") or "").strip().lower()
     role = str((principal or {}).get("role") or "user").strip().lower()
@@ -1126,6 +1769,20 @@ async def _delegate_or_queue_cloud_action(
         did = DEFAULT_DEVICE_ID
     if (not did) and role == "admin":
         did = DEFAULT_DEVICE_ID
+
+    if did:
+        agent_online_now = await device_hub.is_connected(did)
+        selected_option, scored_options = _select_best_plan_option(
+            source_text=source_text,
+            options=plan_options,
+            device_id=did,
+            username=username,
+            agent_online=bool(agent_online_now),
+            agent_temporarily_unavailable=_is_agent_temporarily_unavailable(did),
+        )
+        if selected_option is not None:
+            plan_steps = [s for s in ((selected_option or {}).get("steps") or []) if isinstance(s, dict)]
+            selected_score = ((selected_option or {}).get("metadata") or {}).get("score") if isinstance(((selected_option or {}).get("metadata") or {}).get("score"), dict) else {}
 
     if not did:
         task = _queue_delegated_task(
@@ -1137,6 +1794,8 @@ async def _delegate_or_queue_cloud_action(
             actions=actions,
             status_value="awaiting_agent",
             reason="missing_device_assignment",
+            plan_steps=plan_steps,
+            plan_source=str((selected_option or {}).get("source") or "dynamic"),
         )
         out = _cloud_envelope(
             status="awaiting_agent",
@@ -1146,9 +1805,12 @@ async def _delegate_or_queue_cloud_action(
         )
         out["feature"] = feature
         out["task"] = task
+        out["plan"] = plan_steps
+        out["plan_score"] = selected_score
         return out
 
     if _is_agent_temporarily_unavailable(did):
+        queued_steps = plan_steps[:1] if len(plan_steps) > 1 else plan_steps
         task = _queue_delegated_task(
             username=username,
             role=role,
@@ -1158,38 +1820,24 @@ async def _delegate_or_queue_cloud_action(
             actions=actions,
             status_value="queued_for_agent",
             reason="agent_circuit_open",
+            plan_steps=queued_steps,
+            plan_source=str((selected_option or {}).get("source") or "dynamic"),
         )
         out = _cloud_envelope(
             status="queued_for_agent",
             execution={"feature": feature, "device_id": did, "task": task},
             result=None,
-            message="PC agent temporarily unavailable. Task queued for retry after cooldown.",
+            message="PC agent temporarily unavailable. Using fallback single-step strategy and queueing for retry after cooldown.",
         )
         out["feature"] = feature
         out["device_id"] = did
         out["task"] = task
+        out["plan"] = queued_steps
+        out["plan_score"] = selected_score
         return out
 
-    if _is_agent_temporarily_unavailable(did):
-        queued = _queue_delegated_task(
-            username=username,
-            role=role,
-            device_id=did,
-            feature="device_dispatch",
-            source_text=req.source_text or requested_action,
-            actions=[a for a in (req.actions or []) if isinstance(a, dict)],
-            status_value="queued_for_agent",
-            reason="agent_circuit_open",
-        )
-        return {
-            "status": "queued_for_agent",
-            "mode": "cloud",
-            "device_id": did,
-            "task": queued,
-            "message": "Agent temporarily unavailable. Task queued for automatic retry.",
-        }
-
     if not await device_hub.is_connected(did):
+        queued_steps = plan_steps[:1] if len(plan_steps) > 1 else plan_steps
         task = _queue_delegated_task(
             username=username,
             role=role,
@@ -1199,20 +1847,21 @@ async def _delegate_or_queue_cloud_action(
             actions=actions,
             status_value="queued_for_agent",
             reason="agent_offline",
+            plan_steps=queued_steps,
+            plan_source=str((selected_option or {}).get("source") or "dynamic"),
         )
         out = _cloud_envelope(
             status="queued_for_agent",
             execution={"feature": feature, "device_id": did, "task": task},
             result=None,
-            message="PC agent is offline. Task queued for manual resume after reconnect.",
+            message="PC agent is offline. Multi-step execution avoided; fallback strategy queued for resume after reconnect.",
         )
         out["feature"] = feature
         out["device_id"] = did
         out["task"] = task
+        out["plan"] = queued_steps
+        out["plan_score"] = selected_score
         return out
-
-    job = await _dispatch_actions_to_device(did, username=username or "user", actions=actions, source_text=source_text)
-    job_id = str((job or {}).get("job_id") or "").strip()
 
     running_task = _queue_delegated_task(
         username=username,
@@ -1221,52 +1870,119 @@ async def _delegate_or_queue_cloud_action(
         feature=feature,
         source_text=source_text,
         actions=actions,
+        plan_steps=plan_steps,
+        plan_source=str((selected_option or {}).get("source") or "dynamic"),
+        current_step=0,
         status_value="executing",
-        reason="dispatched",
+        reason="plan_generated",
     )
-    _mark_delegated_task(
-        task_id=running_task.get("task_id"),
-        status_value="executing",
-        extra={"last_job_id": job_id, "dispatched_at": datetime.now(timezone.utc).isoformat()},
+    payload, plan_error = await _execute_dynamic_plan(
+        device_id=did,
+        username=username or "user",
+        source_text=source_text,
+        task_id=str(running_task.get("task_id") or ""),
+        plan_steps=plan_steps,
+        await_timeout_s=await_timeout_s,
     )
-
-    payload = await _await_job_result(job_id, timeout_s=await_timeout_s)
     if not payload:
         _mark_agent_unavailable(did, reason="agent_response_timeout")
-        _retry_or_fail_delegated_task(running_task.get("task_id"), reason="agent_response_timeout", fallback_status="queued_for_agent")
+        _retry_or_fail_delegated_task(running_task.get("task_id"), reason=str(plan_error or "agent_response_timeout"), fallback_status="queued_for_agent")
         out = _cloud_envelope(
             status="queued_for_agent",
-            execution={"feature": feature, "device_id": did, "job": job},
+            execution={"feature": feature, "device_id": did, "plan": plan_steps},
             result=None,
             message="PC agent response timeout. Task queued for automatic retry.",
         )
         out["feature"] = feature
         out["device_id"] = did
-        out["job"] = job
+        out["plan"] = plan_steps
+        out["plan_score"] = selected_score
         return out
 
-    first = _extract_agent_contract_entry(payload)
-    raw_first_status = str((first or {}).get("status") or "").strip().lower()
-    if raw_first_status in {"success", "ok"}:
-        first_status = "completed"
-    elif raw_first_status in {"error", "forbidden", "failed"}:
-        first_status = "failed"
-    else:
-        first_status = _normalize_flow_status(raw_first_status, default="completed")
+    step_results = (payload or {}).get("results") if isinstance((payload or {}).get("results"), list) else []
+    failed_entry = None
+    for r in step_results:
+        if not isinstance(r, dict):
+            continue
+        st = str((r or {}).get("status") or "").strip().lower()
+        if st in {"failed", "error", "forbidden"}:
+            failed_entry = r
+            break
 
-    result_body = _extract_agent_contract_result(payload)
+    # Intelligent fallback: if selected plan failed, try next best options before final failure.
+    if failed_entry and scored_options:
+        selected_key = _plan_steps_key(plan_steps)
+        for option in scored_options:
+            candidate_steps = [s for s in ((option or {}).get("steps") or []) if isinstance(s, dict)]
+            if not candidate_steps or _plan_steps_key(candidate_steps) == selected_key:
+                continue
+            logger.warning("[PLAN FALLBACK] trying alternative=%s source=%s", str(option.get("id") or "?"), str(option.get("source") or "dynamic"))
+            alt_payload, alt_error = await _execute_dynamic_plan(
+                device_id=did,
+                username=username or "user",
+                source_text=source_text,
+                task_id=str(running_task.get("task_id") or ""),
+                plan_steps=candidate_steps,
+                await_timeout_s=await_timeout_s,
+            )
+            alt_results = (alt_payload or {}).get("results") if isinstance((alt_payload or {}).get("results"), list) else []
+            alt_failed = None
+            for rr in alt_results:
+                if not isinstance(rr, dict):
+                    continue
+                s2 = str((rr or {}).get("status") or "").strip().lower()
+                if s2 in {"failed", "error", "forbidden"}:
+                    alt_failed = rr
+                    break
+            if alt_payload and not alt_failed and not alt_error:
+                payload = alt_payload
+                plan_error = None
+                plan_steps = candidate_steps
+                selected_option = option
+                selected_score = ((option or {}).get("metadata") or {}).get("score") if isinstance(((option or {}).get("metadata") or {}).get("score"), dict) else {}
+                failed_entry = None
+                step_results = alt_results
+                break
+
+    first_status = "failed" if failed_entry else "completed"
+    result_body = {}
+    if step_results:
+        last = step_results[-1] if isinstance(step_results[-1], dict) else {}
+        if isinstance(last.get("result"), dict):
+            result_body = _to_json_safe(last.get("result"))
+        else:
+            result_body = _to_json_safe(last)
+
     out = _cloud_envelope(
         status=first_status,
-        execution={"feature": feature, "device_id": did, "job": job, "agent_result": payload},
+        execution={"feature": feature, "device_id": did, "plan": plan_steps, "agent_result": payload},
         result=result_body,
         message="PC agent execution completed." if first_status == "completed" else "PC agent execution finished with errors.",
     )
     out["feature"] = feature
     out["device_id"] = did
-    out["job"] = job
+    out["plan"] = plan_steps
+    out["plan_score"] = selected_score
     out["agent_result"] = payload
+    if scored_options:
+        out["plan_options"] = [
+            {
+                "id": str(o.get("id") or "?"),
+                "source": str(o.get("source") or "dynamic"),
+                "score": dict(((o.get("metadata") or {}).get("score") or {})),
+            }
+            for o in scored_options
+        ]
+
+    plan_metrics = (payload or {}).get("plan_metrics") if isinstance((payload or {}).get("plan_metrics"), dict) else {}
+    exec_time_ms = float(plan_metrics.get("execution_time_ms") or 0.0)
+    retries_used = int(plan_metrics.get("retries_used") or 0)
+
     if first_status == "failed":
-        _retry_or_fail_delegated_task(running_task.get("task_id"), reason=str((first or {}).get("error") or "agent_execution_failed"))
+        failure_reason = str((failed_entry or {}).get("error") or plan_error or "agent_execution_failed")
+        _retry_or_fail_delegated_task(running_task.get("task_id"), reason=failure_reason)
+        _save_plan_learning(source_text, plan_steps, success=False, execution_time_ms=exec_time_ms, retries_used=retries_used, score=selected_score)
+        out["suggestion"] = "Plan step failed. Try re-running or allow fallback action permissions."
     else:
         _mark_delegated_task(
             task_id=running_task.get("task_id"),
@@ -1274,9 +1990,11 @@ async def _delegate_or_queue_cloud_action(
             extra={
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "result_preview": _truncate_notification_payload((payload or {}).get("results") or []),
+                "current_step": len(plan_steps),
             },
         )
         _clear_agent_unavailable(did)
+        _save_plan_learning(source_text, plan_steps, success=True, execution_time_ms=exec_time_ms, retries_used=retries_used, score=selected_score)
     return out
 
 
@@ -2299,6 +3017,76 @@ def _normalize_user_id(user_id: str | None) -> str:
     return (user_id or "").strip().lower()
 
 
+def _learn_user_behavior_preferences(*, user_id: str | None, user_text: str, response_text: str, actions: list[dict[str, Any]] | None) -> None:
+    uid = _normalize_user_id(user_id)
+    if not uid:
+        return
+    try:
+        col = _user_prefs_collection()
+    except Exception:
+        return
+
+    try:
+        doc = col.find_one({"user_id": uid}, {"_id": 0, "preferences": 1}) or {}
+        prefs = doc.get("preferences") if isinstance(doc.get("preferences"), dict) else {}
+        behavior = prefs.get("behavior") if isinstance(prefs.get("behavior"), dict) else {}
+
+        execute_requests = int(behavior.get("execution_requests") or 0)
+        explanation_requests = int(behavior.get("explanation_requests") or 0)
+        short_pref_signals = int(behavior.get("short_pref_signals") or 0)
+        detailed_pref_signals = int(behavior.get("detailed_pref_signals") or 0)
+
+        t = str(user_text or "").strip().lower()
+        has_actions = bool(isinstance(actions, list) and actions)
+        asks_execution = bool(re.search(r"\b(open|run|execute|launch|start|do\s+it|perform)\b", t))
+        asks_explanation = bool(re.search(r"\b(what|why|how|explain|overview|define)\b", t))
+        asks_short = bool(re.search(r"\b(short|brief|concise|one\s+line)\b", t))
+        asks_detailed = bool(re.search(r"\b(detailed|step\s+by\s+step|deep\s+dive|more\s+detail)\b", t))
+
+        if asks_execution or has_actions:
+            execute_requests += 1
+        if asks_explanation and not has_actions:
+            explanation_requests += 1
+        if asks_short:
+            short_pref_signals += 1
+        if asks_detailed:
+            detailed_pref_signals += 1
+
+        behavior.update(
+            {
+                "execution_requests": execute_requests,
+                "explanation_requests": explanation_requests,
+                "short_pref_signals": short_pref_signals,
+                "detailed_pref_signals": detailed_pref_signals,
+                "last_seen_at": datetime.utcnow(),
+            }
+        )
+
+        prefs["behavior"] = behavior
+        prefs["prefers_execution"] = bool(execute_requests >= (explanation_requests + 2))
+        if detailed_pref_signals > short_pref_signals:
+            prefs["verbosity"] = "high"
+        elif short_pref_signals > detailed_pref_signals:
+            prefs["verbosity"] = "low"
+
+        col.update_one(
+            {"user_id": uid},
+            {
+                "$set": {
+                    "preferences": prefs,
+                    "updated_at": datetime.utcnow(),
+                },
+                "$setOnInsert": {
+                    "user_id": uid,
+                    "created_at": datetime.utcnow(),
+                },
+            },
+            upsert=True,
+        )
+    except Exception:
+        return
+
+
 @app.post("/api/user/assistant-name")
 async def user_set_assistant_name(req: UserAssistantNameRequest):
     """Set the per-user assistant name (used for wake-word + UI display).
@@ -2449,7 +3237,8 @@ def _is_remote_device_action(a: dict) -> bool:
     return t in {
         "device_action",
         "open_app", "close_app", "switch_app",
-        "execute_command",
+        "execute_command", "run_command",
+        "open_url",
         "set_brightness", "adjust_brightness",
         "set_power_plan", "set_energy_saver",
         "set_volume", "adjust_volume",
@@ -2487,10 +3276,92 @@ def _split_agent_executable_actions(actions: list[dict[str, Any]]) -> tuple[list
         executable.append(a)
     return executable, blocked
 
+
+def _extract_chain_search_query(source_text: str) -> str:
+    t = str(source_text or "").strip()
+    if not t:
+        return ""
+    m = re.search(r"\b(?:search(?:\s+for)?|look\s+up|find)\s+(.+?)(?:\s*(?:and\s+then|then)\b|$)", t, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    q = str(m.group(1) or "").strip(" .,!?")
+    return q
+
+
+def _expand_multi_step_chain_actions(source_text: str, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add minimal chained actions for common multi-step intents without changing flow architecture."""
+    out = [a for a in (actions or []) if isinstance(a, dict)]
+    t = str(source_text or "").strip().lower()
+    if not t:
+        return out
+
+    has_open_app = any(str((a or {}).get("type") or "").strip().lower() == "open_app" for a in out)
+    has_open_url = any(str((a or {}).get("type") or "").strip().lower() == "open_url" for a in out)
+    search_q = _extract_chain_search_query(source_text)
+
+    # Rule: open -> search -> action
+    if search_q and has_open_app and not has_open_url:
+        out.append({
+            "type": "open_url",
+            "url": f"https://www.google.com/search?q={quote_plus(search_q)}",
+            "chain_reason": "open_then_search",
+        })
+
+    # Rule: open youtube -> play/search
+    if "youtube" in t and ("play" in t or "music" in t):
+        if not has_open_url:
+            out.append({"type": "open_url", "url": "https://www.youtube.com", "chain_reason": "open_then_action"})
+        play_q = ""
+        m = re.search(r"\bplay\s+(.+?)(?:\s*(?:on\s+youtube|in\s+youtube)|$)", str(source_text or ""), flags=re.IGNORECASE)
+        if m:
+            play_q = str(m.group(1) or "").strip(" .,!?")
+        if not play_q and "music" in t:
+            play_q = "music"
+        has_youtube_search_url = any(
+            "youtube.com/results" in str((a or {}).get("url") or "").lower()
+            for a in out
+            if str((a or {}).get("type") or "").strip().lower() == "open_url"
+        )
+        if play_q and not has_youtube_search_url:
+            out.append(
+                {
+                    "type": "open_url",
+                    "url": f"https://www.youtube.com/results?search_query={quote_plus(play_q)}",
+                    "chain_reason": "open_then_search_then_action",
+                }
+            )
+
+    return out
+
+
+def _validate_action_params(action_name: str, params: dict[str, Any]) -> None:
+    name = str(action_name or "").strip().lower()
+    req = {
+        "open_url": ["url"],
+        "open_app": ["app_name", "app"],
+        "execute_command": ["command", "cmd"],
+        "run_command": ["command", "cmd"],
+    }
+    required_keys = req.get(name) or []
+    if not required_keys:
+        return
+    for k in required_keys:
+        v = (params or {}).get(k)
+        if isinstance(v, str) and v.strip():
+            return
+        if v not in (None, ""):
+            return
+    raise ValueError(f"missing_required_params_for_action:{name}")
+
 async def _dispatch_actions_to_device(device_id: str, username: str, actions: list[dict], source_text: str):
     """Forward actions to a connected local agent."""
     _require_pc_agent_enabled()
-    executable_actions, blocked_actions = _split_agent_executable_actions(actions)
+    has_explicit_plan_step = any(
+        isinstance(a, dict) and (a.get("step_id") is not None or a.get("depends_on") is not None)
+        for a in (actions or [])
+    )
+    expanded_actions = actions if has_explicit_plan_step else _expand_multi_step_chain_actions(source_text, actions)
+    executable_actions, blocked_actions = _split_agent_executable_actions(expanded_actions)
     if blocked_actions:
         blocked_types = [str((a or {}).get("type") or "") for a in blocked_actions]
         raise ValueError(f"non_executable_actions_for_agent: {blocked_types}")
@@ -2503,22 +3374,31 @@ async def _dispatch_actions_to_device(device_id: str, username: str, actions: li
         if not isinstance(a, dict):
             continue
         if isinstance(a.get("action"), str):
+            action_name = str(a.get("action") or "").strip()
+            params = a.get("params") if isinstance(a.get("params"), dict) else {}
+            params = {k: v for k, v in params.items() if v is not None}
+            _validate_action_params(action_name, params)
             contract_actions.append(
                 {
-                    "action": str(a.get("action") or "").strip(),
-                    "params": a.get("params") if isinstance(a.get("params"), dict) else {},
+                    "action": action_name,
+                    "params": params,
                     "task_id": str(a.get("task_id") or f"{job_id}:{idx}").strip(),
+                    "step_id": str(a.get("step_id") or f"step_{idx + 1}").strip(),
+                    "depends_on": str(a.get("depends_on") or "").strip() or (f"step_{idx}" if idx > 0 else None),
                 }
             )
             continue
 
         action_name = str(a.get("type") or "").strip()
-        params = {k: v for k, v in a.items() if k not in {"type", "task_id"}}
+        params = {k: v for k, v in a.items() if k not in {"type", "task_id", "step_id", "depends_on"} and v is not None}
+        _validate_action_params(action_name, params)
         contract_actions.append(
             {
                 "action": action_name,
                 "params": params,
                 "task_id": str(a.get("task_id") or f"{job_id}:{idx}").strip(),
+                "step_id": str(a.get("step_id") or f"step_{idx + 1}").strip(),
+                "depends_on": str(a.get("depends_on") or "").strip() or (f"step_{idx}" if idx > 0 else None),
             }
         )
 
@@ -2685,6 +3565,9 @@ async def agent_ws(ws: WebSocket):
             except PermissionError:
                 await _auth_fail("invalid_shared_secret")
                 return
+
+        logger = __import__('logging').getLogger(__name__)
+        logger.info("[AGENT] Connected: device_id=%s", device_id)
 
         await ws.send_json({"type": "ack", "device_id": device_id, "status": "connected"})
 
@@ -3915,13 +4798,18 @@ async def device_status(session_id: str):
     agents_by_id = await device_hub.list_agents()
     health = await _collect_full_health_checks()
     if role == "admin":
+        connected = bool(agents_by_id)
         return {
             "status": "success",
             "agents": list(agents_by_id.values()),
             "default_device_id": DEFAULT_DEVICE_ID,
             "system_health": health,
             "degraded": str(health.get("status") or "ok") != "ok",
-            "agent_offline": not bool(agents_by_id),
+            "agent_offline": not connected,
+            "device_status": {
+                "connected": connected,
+                "device_id": DEFAULT_DEVICE_ID,
+            },
         }
 
     did = _get_owner_device_id(username)
@@ -3940,15 +4828,24 @@ async def device_status(session_id: str):
             "system_health": health,
             "degraded": str(health.get("status") or "ok") != "ok",
             "agent_offline": True,
+            "device_status": {
+                "connected": False,
+                "device_id": None,
+            },
         }
     agent = agents_by_id.get(did)
+    connected = bool(agent)
     return {
         "status": "success",
         "agents": ([agent] if agent else []),
         "default_device_id": did,
         "system_health": health,
         "degraded": str(health.get("status") or "ok") != "ok",
-        "agent_offline": not bool(agent),
+        "agent_offline": not connected,
+        "device_status": {
+            "connected": connected,
+            "device_id": did,
+        },
     }
 
 
@@ -5858,6 +6755,17 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
             }
             # Internally cooldown-gated to prevent loops/regressions.
             background_tasks.add_task(learning_engine.run_controlled_learning_cycle, lookback_hours=48)
+    except Exception:
+        pass
+
+    # Learn user behavior preferences (execution vs explanation and verbosity) into user_preferences.
+    try:
+        _learn_user_behavior_preferences(
+            user_id=(username or msg.user),
+            user_text=str(msg.text or ""),
+            response_text=str((response or {}).get("text") or ""),
+            actions=(actions if isinstance(actions, list) else []),
+        )
     except Exception:
         pass
 

@@ -78,6 +78,7 @@ export default function JarvisDashboard({
   agentCfgLoaded = false,
   agentCfgError = null,
   onConnectPcAgent,
+  showConnectPcAgentButton = true,
   systemInfo,
   themeColor = "#00eaff",
   onThemeColorChange,
@@ -264,9 +265,11 @@ export default function JarvisDashboard({
               </div>
             )}
 
-            <button className="jd-btn jd-connectBtn" onClick={onConnectPcAgent} disabled={typeof onConnectPcAgent !== "function"}>
-              Connect PC Agent
-            </button>
+            {showConnectPcAgentButton && (
+              <button className="jd-btn jd-connectBtn" onClick={onConnectPcAgent} disabled={typeof onConnectPcAgent !== "function"}>
+                Connect PC Agent
+              </button>
+            )}
 
             <div className="jd-metricsGrid" aria-label="System metrics">
               <div className="jd-metric">

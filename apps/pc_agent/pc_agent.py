@@ -75,7 +75,7 @@ def _env_int(name: str, default: int) -> int:
 
 SERVER_BASE_URL = _env_str("JARVIS_SERVER_URL", "https://jarvis-cloud-assistant.onrender.com").rstrip("/")
 # Device IDs are treated case-insensitively by the server.
-DEVICE_ID = (_env_str("JARVIS_DEVICE_ID", platform.node() or "primary") or "primary").strip().lower()
+DEVICE_ID = (_env_str("JARVIS_DEVICE_ID", "") or "").strip().lower()
 SHARED_SECRET = _env_str("JARVIS_AGENT_SHARED_SECRET", "")
 
 ALLOW_EXECUTE_COMMAND = _env_bool("JARVIS_AGENT_ALLOW_EXECUTE_COMMAND", "false")
@@ -218,6 +218,7 @@ def _supported_actions_catalog() -> list[str]:
         "close_app",
         "switch_app",
         "execute_command",
+        "run_command",
         "capture_screen",
         "screen_navigation",
         "type_text",
@@ -272,6 +273,7 @@ async def _execute_action_contract(action_payload: dict | None, *, job_id: str, 
         job_id=job_id,
         action_index=action_index,
     )
+    print(f"[AGENT] Received action: {action_name}", flush=True)
 
     started = time.perf_counter()
     try:
@@ -288,6 +290,9 @@ async def _execute_action_contract(action_payload: dict | None, *, job_id: str, 
     error = None
     if status == "failed":
         error = str((raw_result or {}).get("message") or (raw_result or {}).get("error") or "execution_failed")
+        print(f"[AGENT] Execution failed: {action_name} error={error}", flush=True)
+    else:
+        print(f"[AGENT] Executed successfully: {action_name}", flush=True)
 
     return {
         "status": status,
@@ -311,6 +316,19 @@ def _current_capabilities() -> dict:
         "actions": _supported_actions_catalog(),
         "system_info": _inspect_system_state(),
     }
+
+
+def _resolve_device_id(override_device_id: str | None = None) -> str:
+    explicit = str(override_device_id or "").strip().lower()
+    if explicit:
+        return explicit
+    env_did = str(DEVICE_ID or "").strip().lower()
+    if env_did:
+        return env_did
+    host_did = str(platform.node() or "").strip().lower()
+    if host_did:
+        return host_did
+    return "primary"
 
 
 def _inspect_system_state() -> dict:
@@ -1140,7 +1158,7 @@ async def _execute_action(action: dict) -> dict:
         except Exception as e:
             return {"status": "error", "action_type": t, "message": str(e)}
 
-    if t == "execute_command":
+    if t in ("execute_command", "run_command"):
         if not ALLOW_EXECUTE_COMMAND:
             return {"status": "forbidden", "action_type": t, "message": "Command execution disabled on agent"}
         mgr = _get_app_manager()
@@ -1909,17 +1927,18 @@ async def _execute_action(action: dict) -> dict:
     return {"status": "ignored", "action_type": t}
 
 
-async def run_agent(agent_token: str | None = None, server_base_url: str | None = None):
+async def run_agent(agent_token: str | None = None, server_base_url: str | None = None, device_id: str | None = None):
     # Apply any previously approved permissions before connecting.
     _load_saved_permissions()
 
     base = (server_base_url or SERVER_BASE_URL).rstrip("/")
     ws_url = _ws_url_from_base(base)
+    selected_device_id = _resolve_device_id(device_id)
 
     if not agent_token and not SHARED_SECRET:
         raise SystemExit("Missing agent auth. Provide --token (recommended) or set JARVIS_AGENT_SHARED_SECRET.")
 
-    print(f"[AGENT] Connecting to {ws_url} as device_id={DEVICE_ID}", flush=True)
+    print(f"[AGENT] Connecting to {ws_url} as device_id={selected_device_id}", flush=True)
 
     stop_event = asyncio.Event()
     globals()["_STOP_EVENT"] = stop_event
@@ -1947,9 +1966,9 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                     if agent_token:
                         auth_msg["token"] = agent_token
                         # device_id is optional in token mode; server derives it from token.
-                        auth_msg["device_id"] = DEVICE_ID
+                        auth_msg["device_id"] = selected_device_id
                     else:
-                        auth_msg["device_id"] = DEVICE_ID
+                        auth_msg["device_id"] = selected_device_id
                         auth_msg["secret"] = SHARED_SECRET
 
                     await ws.send_str(json.dumps(auth_msg))
@@ -1983,12 +2002,13 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                     else:
                         raise RuntimeError(f"No ack from server (msg_type={ack.type})")
 
-                    effective_device_id = DEVICE_ID
+                    effective_device_id = selected_device_id
                     try:
                         if isinstance(ack_obj, dict) and ack_obj.get("device_id"):
                             effective_device_id = str(ack_obj.get("device_id")).strip().lower() or effective_device_id
                     except Exception:
                         pass
+                    print(f"[AGENT] Connected: device_id={effective_device_id}", flush=True)
 
                     # Flush any buffered results from prior disconnected sends.
                     if pending_results:
@@ -2099,6 +2119,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Jarvis PC Agent")
     parser.add_argument("--token", dest="token", default=None, help="Agent token from /api/agent/config (recommended)")
     parser.add_argument("--server", dest="server", default=None, help="Server base URL (defaults to JARVIS_SERVER_URL)")
+    parser.add_argument("--device-id", dest="device_id", default=None, help="Explicit device id (overrides env and hostname)")
     args = parser.parse_args()
 
-    asyncio.run(run_agent(agent_token=args.token, server_base_url=args.server))
+    asyncio.run(run_agent(agent_token=args.token, server_base_url=args.server, device_id=args.device_id))

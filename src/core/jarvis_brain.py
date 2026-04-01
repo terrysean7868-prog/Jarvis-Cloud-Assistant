@@ -1187,12 +1187,30 @@ class JarvisBrain:
             except Exception:
                 pass
 
+            # Ensure intent-aware metadata is present for downstream policy and UI.
+            try:
+                if hasattr(self.llm, "_classify_intent_profile"):
+                    profile = self.llm._classify_intent_profile(text)  # type: ignore[attr-defined]
+                else:
+                    profile = {}
+                if isinstance(profile, dict):
+                    response["intent_type"] = response.get("intent_type") or profile.get("intent_type")
+                    response["intent_depth"] = response.get("intent_depth") or profile.get("intent_depth")
+                    response["response_strategy"] = response.get("response_strategy") or profile.get("response_strategy")
+                    response["intent"] = response.get("intent") or response.get("intent_type") or "chat"
+            except Exception:
+                pass
+
             return {
                 "text": final_text,
                 "actions": actions,
                 "tool_results": tool_results,
                 "mode": mode,
-                "source": response.get("source", "openai")
+                "source": response.get("source", "openai"),
+                "intent": response.get("intent", "chat"),
+                "intent_type": response.get("intent_type"),
+                "intent_depth": response.get("intent_depth"),
+                "response_strategy": response.get("response_strategy"),
             }
 
         except Exception as e:
