@@ -403,7 +403,13 @@
 @media (min-width: 1025px) {
   /* Keep right-side content from sitting under the fixed user/logout header */
   .jd-right .jd-panel:first-child {
-    margin-top: 62px;
+    margin-top: 128px;
+  }
+}
+
+@media (min-width: 768px) and (max-width: 1024px) {
+  .jd-right .jd-panel:first-child {
+    margin-top: 110px;
   }
 }
 

@@ -3168,7 +3168,7 @@ export default function App() {
                 Agent offline
               </div>
             )}
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", justifyContent: "flex-end", maxWidth: "min(92vw, 780px)" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 8 }}>
               {activeDisplay === "autonomy" ? (
                 <button
@@ -3209,23 +3209,6 @@ export default function App() {
             <span style={{ color: "var(--jarvis-accent)", fontSize: 14, opacity: 0.9 }}>
               Assistant: {assistantName || "Jarvis"}
             </span>
-
-            {!isDeviceConnected && (
-              <button
-                onClick={connectPcAgent}
-                style={{
-                  background: "rgba(0,234,255,0.16)",
-                  border: "1px solid var(--jarvis-accent)",
-                  color: "var(--jarvis-accent)",
-                  borderRadius: 999,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                }}
-              >
-                Connect PC Agent
-              </button>
-            )}
 
             <button onClick={async () => {
               const sid = sessionId;
@@ -3285,7 +3268,7 @@ export default function App() {
           agentCfgLoaded={agentCfgLoaded}
           agentCfgError={agentCfgError}
           onConnectPcAgent={connectPcAgent}
-          showConnectPcAgentButton={false}
+          showConnectPcAgentButton={!isDeviceConnected}
           systemInfo={systemInfo}
           themeColor={themeColor}
           onThemeColorChange={setThemeColor}
