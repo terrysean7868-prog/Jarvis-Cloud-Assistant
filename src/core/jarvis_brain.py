@@ -1211,6 +1211,8 @@ class JarvisBrain:
                 "intent_type": response.get("intent_type"),
                 "intent_depth": response.get("intent_depth"),
                 "response_strategy": response.get("response_strategy"),
+                "proactive_followup_added": bool(response.get("proactive_followup_added")),
+                "user_preference_influenced": bool(response.get("user_preference_influenced")),
             }
 
         except Exception as e:

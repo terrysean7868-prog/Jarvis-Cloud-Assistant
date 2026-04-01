@@ -583,6 +583,174 @@ def _ops_alert_if_needed(snapshot: dict[str, Any]) -> None:
         pass
 
 
+def _intent_telemetry_collection():
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return None
+    col = database.db["intent_decision_telemetry"]
+    try:
+        col.create_index([("created_at", -1)])
+    except Exception:
+        pass
+    try:
+        col.create_index([("request_id", 1)], unique=False)
+    except Exception:
+        pass
+    try:
+        col.create_index([("user_id", 1), ("created_at", -1)])
+    except Exception:
+        pass
+    try:
+        col.create_index([("intent_type", 1), ("created_at", -1)])
+    except Exception:
+        pass
+    return col
+
+
+def _intent_mismatch_reason(*, intent_type: str, response_strategy: str, has_actions: bool, proactive_followup_added: bool) -> str | None:
+    it = str(intent_type or "").strip().lower()
+    rs = str(response_strategy or "").strip().lower()
+    if it == "informational" and has_actions:
+        return "unexpected_execution_for_informational"
+    if it == "direct_action" and not has_actions:
+        return "missing_execution_for_direct_action"
+    if it == "ambiguous" and has_actions:
+        return "execution_on_ambiguous"
+    if it == "goal_oriented" and rs.startswith("explain_plus") and (not proactive_followup_added):
+        return "goal_plan_without_proactive_prompt"
+    return None
+
+
+def _record_intent_telemetry(
+    *,
+    request_id: str,
+    user_id: str | None,
+    intent_type: str,
+    intent_depth: str,
+    response_strategy: str,
+    has_execution_actions: bool,
+    proactive_followup_added: bool,
+    user_preference_influenced: bool,
+    weak_outcome: bool,
+    response_status: str,
+    source: str,
+    fallback_used: bool,
+) -> None:
+    now = datetime.now(timezone.utc)
+    mismatch = _intent_mismatch_reason(
+        intent_type=intent_type,
+        response_strategy=response_strategy,
+        has_actions=bool(has_execution_actions),
+        proactive_followup_added=bool(proactive_followup_added),
+    )
+    row = {
+        "request_id": str(request_id or "").strip() or None,
+        "user_id": _normalize_user_id(user_id),
+        "intent_type": str(intent_type or "ambiguous").strip().lower() or "ambiguous",
+        "intent_depth": str(intent_depth or "low").strip().lower() or "low",
+        "response_strategy": str(response_strategy or "unknown").strip().lower() or "unknown",
+        "has_execution_actions": bool(has_execution_actions),
+        "decision_mode": "execution" if bool(has_execution_actions) else "explanation",
+        "proactive_followup_added": bool(proactive_followup_added),
+        "user_preference_influenced": bool(user_preference_influenced),
+        "weak_outcome": bool(weak_outcome),
+        "response_status": str(response_status or "unknown").strip().lower() or "unknown",
+        "source": str(source or "unknown").strip().lower() or "unknown",
+        "fallback_used": bool(fallback_used),
+        "mismatch_reason": mismatch,
+        "created_at": now,
+        "created_at_iso": now.isoformat(),
+    }
+
+    try:
+        _trace_log(
+            event="intent_decision",
+            request_id=str(request_id or ""),
+            user_id=(user_id or ""),
+            lifecycle_state="decided",
+            intent_type=row["intent_type"],
+            intent_depth=row["intent_depth"],
+            response_strategy=row["response_strategy"],
+            has_execution_actions=row["has_execution_actions"],
+            proactive_followup_added=row["proactive_followup_added"],
+            user_preference_influenced=row["user_preference_influenced"],
+            weak_outcome=row["weak_outcome"],
+            mismatch_reason=(mismatch or "none"),
+        )
+    except Exception:
+        pass
+
+    try:
+        col = _intent_telemetry_collection()
+        if col is not None:
+            col.insert_one(row)
+    except Exception:
+        pass
+
+
+def _aggregate_intent_telemetry(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(rows)
+    intent_counts: dict[str, int] = {}
+    strategy_counts: dict[str, int] = {}
+    weak_by_intent: dict[str, int] = {}
+    mismatch_by_intent: dict[str, int] = {}
+    exec_count = 0
+    explanation_count = 0
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        it = str((r or {}).get("intent_type") or "ambiguous").strip().lower() or "ambiguous"
+        st = str((r or {}).get("response_strategy") or "unknown").strip().lower() or "unknown"
+        dm = str((r or {}).get("decision_mode") or "").strip().lower()
+        weak = bool((r or {}).get("weak_outcome"))
+        mismatch = str((r or {}).get("mismatch_reason") or "").strip().lower()
+
+        intent_counts[it] = int(intent_counts.get(it) or 0) + 1
+        strategy_counts[st] = int(strategy_counts.get(st) or 0) + 1
+        if dm == "execution":
+            exec_count += 1
+        else:
+            explanation_count += 1
+        if weak:
+            weak_by_intent[it] = int(weak_by_intent.get(it) or 0) + 1
+        if mismatch:
+            mismatch_by_intent[it] = int(mismatch_by_intent.get(it) or 0) + 1
+
+    def _pct(v: int) -> float:
+        return round((float(v) / float(max(1, total))) * 100.0, 2)
+
+    weak_ranked = sorted(
+        [
+            {
+                "intent_type": k,
+                "weak_count": int(v),
+                "mismatch_count": int(mismatch_by_intent.get(k) or 0),
+            }
+            for k, v in weak_by_intent.items()
+        ],
+        key=lambda x: (int(x.get("weak_count") or 0), int(x.get("mismatch_count") or 0)),
+        reverse=True,
+    )[:5]
+
+    return {
+        "total": total,
+        "intent_type_distribution": intent_counts,
+        "strategy_distribution": strategy_counts,
+        "percentages": {
+            "direct_action": _pct(int(intent_counts.get("direct_action") or 0)),
+            "goal_oriented": _pct(int(intent_counts.get("goal_oriented") or 0)),
+            "ambiguous": _pct(int(intent_counts.get("ambiguous") or 0)),
+            "execution_decisions": _pct(exec_count),
+            "explanation_decisions": _pct(explanation_count),
+        },
+        "top_weak_or_mismatch_by_intent_type": weak_ranked,
+    }
+
+
 async def _collect_full_health_checks() -> dict[str, Any]:
     checks = {
         "database": False,
@@ -5767,6 +5935,54 @@ async def ops_telemetry(session_id: str | None = None):
     }
 
 
+@app.get("/api/admin/intent-telemetry")
+async def admin_intent_telemetry(session_id: str | None = None, limit: int = 120, lookback: int = 500):
+    """Admin/debug endpoint for recent intent decisions and compact distribution report."""
+    _require_admin_session(session_id)
+    lim = max(10, min(int(limit or 120), 300))
+    lb = max(50, min(int(lookback or 500), 2000))
+
+    recent: list[dict[str, Any]] = []
+    sample: list[dict[str, Any]] = []
+    try:
+        col = _intent_telemetry_collection()
+        if col is not None:
+            recent = list(col.find({}, {"_id": 0}).sort("created_at", -1).limit(lim))
+            sample = list(col.find({}, {"_id": 0}).sort("created_at", -1).limit(lb))
+    except Exception:
+        recent = []
+        sample = []
+
+    compact_recent = []
+    for r in recent:
+        if not isinstance(r, dict):
+            continue
+        compact_recent.append(
+            {
+                "created_at": r.get("created_at_iso") or r.get("created_at"),
+                "request_id": r.get("request_id"),
+                "user_id": r.get("user_id"),
+                "intent_type": r.get("intent_type"),
+                "intent_depth": r.get("intent_depth"),
+                "response_strategy": r.get("response_strategy"),
+                "decision_mode": r.get("decision_mode"),
+                "proactive_followup_added": bool(r.get("proactive_followup_added")),
+                "user_preference_influenced": bool(r.get("user_preference_influenced")),
+                "weak_outcome": bool(r.get("weak_outcome")),
+                "mismatch_reason": r.get("mismatch_reason"),
+            }
+        )
+
+    report = _aggregate_intent_telemetry(sample)
+    return {
+        "status": "ok",
+        "lookback": lb,
+        "recent_count": len(compact_recent),
+        "report": report,
+        "recent": compact_recent,
+    }
+
+
 def _extract_graph_from_goal(goal: dict | None) -> dict:
     reports = (goal or {}).get("reports") if isinstance(goal, dict) else None
     if not isinstance(reports, list):
@@ -6765,6 +6981,38 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
             user_text=str(msg.text or ""),
             response_text=str((response or {}).get("text") or ""),
             actions=(actions if isinstance(actions, list) else []),
+        )
+    except Exception:
+        pass
+
+    # Intent-aware telemetry: lightweight per-request observability.
+    try:
+        rdict = response if isinstance(response, dict) else {}
+        intent_type = str(rdict.get("intent_type") or "ambiguous").strip().lower() or "ambiguous"
+        intent_depth = str(rdict.get("intent_depth") or "low").strip().lower() or "low"
+        response_strategy = str(rdict.get("response_strategy") or "unknown").strip().lower() or "unknown"
+        has_execution_actions = bool(isinstance(actions, list) and any(isinstance(a, dict) for a in actions))
+        proactive_followup_added = bool(rdict.get("proactive_followup_added"))
+        user_preference_influenced = bool(rdict.get("user_preference_influenced"))
+        weak_outcome = bool(((rdict.get("learning_signal") or {}).get("weak")) if isinstance(rdict.get("learning_signal"), dict) else False)
+        source = str(rdict.get("source") or "unknown")
+        status_value = str(rdict.get("status") or "completed")
+        routing = rdict.get("routing") if isinstance(rdict.get("routing"), dict) else {}
+        fallback_used = bool(routing.get("fallback_used")) or source.startswith("fallback")
+
+        _record_intent_telemetry(
+            request_id=request_id,
+            user_id=(username or msg.user),
+            intent_type=intent_type,
+            intent_depth=intent_depth,
+            response_strategy=response_strategy,
+            has_execution_actions=has_execution_actions,
+            proactive_followup_added=proactive_followup_added,
+            user_preference_influenced=user_preference_influenced,
+            weak_outcome=weak_outcome,
+            response_status=status_value,
+            source=source,
+            fallback_used=fallback_used,
         )
     except Exception:
         pass

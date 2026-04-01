@@ -1041,19 +1041,19 @@ class LLMAdapter:
             return "Continuing with deterministic local fallback while provider routing stabilizes."
         if re.search(r"\b(debug|error|traceback|exception|fail|timeout)\b", t):
             return (
-                "Provider is unavailable right now. Share the exact error line and I will return a likely cause and fix checklist, "
+                "Share the exact error line and I will return a likely cause and fix checklist, "
                 "or ask me to run a minimal retry plan."
             )
         if re.search(r"\b(task|plan|workflow|steps|delegate)\b", t):
             return (
-                "Provider is unavailable right now. I can still generate a deterministic step-by-step task plan and safe execution actions."
+                "I can generate a deterministic step-by-step task plan and safe execution actions."
             )
         if re.search(r"\b(project|repo|codebase|architecture)\b", t):
             return (
-                "Provider is unavailable right now. I can still do a deterministic project analysis pass using indexed context and recent logs."
+                "I can do a deterministic project analysis pass using indexed context and recent logs."
             )
         return (
-            "Provider is unavailable right now. I can still handle deterministic local actions and concise fallback answers."
+            "I can handle deterministic local actions and concise fallback answers right now."
         )
 
     def _fetch_recent_runtime_context(self, text: str, *, limit: int = 3, include_rag: bool = True) -> dict:
@@ -1569,6 +1569,8 @@ class LLMAdapter:
             "intent_type": profile.get("intent_type"),
             "intent_depth": profile.get("intent_depth"),
             "response_strategy": profile.get("response_strategy"),
+            "proactive_followup_added": True,
+            "user_preference_influenced": bool(prefers_execution),
         }
 
     @staticmethod
@@ -1784,6 +1786,7 @@ class LLMAdapter:
             actions = []
         txt = str(parsed.get("text") or "").strip()
         intent = self._classify_primary_intent(user_text)
+        followup_added = False
 
         if actions:
             first = actions[0] if actions and isinstance(actions[0], dict) else {}
@@ -1802,10 +1805,12 @@ class LLMAdapter:
                     url = str(first.get("url") or "").strip().lower()
                     if "youtube.com" in url and "want me to search" not in low_text:
                         parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nDo you want me to search something on YouTube for you?").strip()
+                        followup_added = True
                 elif at == "open_app":
                     app = str(first.get("app_name") or "").strip().lower()
                     if app in {"chrome", "edge", "firefox", "browser"} and "want me to search" not in low_text:
                         parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nDo you want me to search anything for you now?").strip()
+                        followup_added = True
             except Exception:
                 pass
             try:
@@ -1814,6 +1819,8 @@ class LLMAdapter:
                 parsed["intent_depth"] = profile.get("intent_depth")
                 parsed["response_strategy"] = profile.get("response_strategy")
                 parsed["intent"] = parsed.get("intent") or profile.get("intent_type") or "chat"
+                parsed["proactive_followup_added"] = bool(parsed.get("proactive_followup_added") or followup_added)
+                parsed["user_preference_influenced"] = bool(parsed.get("user_preference_influenced"))
             except Exception:
                 pass
             return parsed
@@ -1831,6 +1838,7 @@ class LLMAdapter:
 
         if suggestion and suggestion.lower() not in txt.lower():
             parsed["text"] = (txt + "\n\n" + suggestion).strip() if txt else suggestion
+            followup_added = True
 
         # Goal/informational intent proactive nudges.
         try:
@@ -1839,8 +1847,10 @@ class LLMAdapter:
             low = str(parsed.get("text") or "").strip().lower()
             if it == "goal_oriented" and "do you want me" not in low:
                 parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nDo you want me to execute the first step now?").strip()
+                followup_added = True
             elif it == "informational" and "want a quick example" not in low:
                 parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nWant a quick example?").strip()
+                followup_added = True
         except Exception:
             pass
 
@@ -1851,6 +1861,8 @@ class LLMAdapter:
             parsed["intent_depth"] = profile.get("intent_depth")
             parsed["response_strategy"] = profile.get("response_strategy")
             parsed["intent"] = parsed.get("intent") or profile.get("intent_type") or "chat"
+            parsed["proactive_followup_added"] = bool(parsed.get("proactive_followup_added") or followup_added)
+            parsed["user_preference_influenced"] = bool(parsed.get("user_preference_influenced"))
         except Exception:
             pass
 

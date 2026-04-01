@@ -41,3 +41,9 @@ def test_open_youtube_adds_proactive_followup():
     }
     out = llm._postprocess_proactive_followup("open youtube", parsed)
     assert "want me to search something" in str(out.get("text") or "").lower()
+
+
+def test_fallback_text_hides_provider_unavailable_phrase():
+    llm = LLMAdapter()
+    text = llm._build_actionable_fallback_text("help me with my task", include_provider_notice=True)
+    assert "provider is unavailable" not in str(text).lower()
