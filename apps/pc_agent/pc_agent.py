@@ -34,27 +34,15 @@ except Exception:
     system_ops = None
     SYSTEM_OPS_AVAILABLE = False
 
-# Centralized env access (fallback to os.getenv if src package isn't available).
-try:
-    from src.config import env
-except Exception:
-    env = None
-
 def _env_bool(name: str, default: str = "false") -> bool:
-    if env is not None:
-        return env.get_bool(name, default.lower() in ("1", "true", "yes", "y"))
     return os.getenv(name, default).lower() in ("1", "true", "yes", "y")
 
 
 def _env_str(name: str, default: str = "") -> str:
-    if env is not None:
-        return env.get_str(name, default)
     return os.getenv(name, default)
 
 
 def _env_int(name: str, default: int) -> int:
-    if env is not None:
-        return env.get_int(name, default)
     try:
         return int((os.getenv(name, str(default)) or str(default)).strip())
     except Exception:

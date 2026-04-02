@@ -158,6 +158,16 @@ def _load_agent_shared_secret_from_db() -> str:
         return ""
 
     try:
+        secret_col = database.db["agent_secrets"]
+        secret_doc = secret_col.find_one({"key": "shared_secret"})
+        if isinstance(secret_doc, dict):
+            raw_secret = secret_doc.get("value") or ""
+            secret = str(raw_secret).strip()
+            if len(secret) >= 2 and secret[0] == secret[-1] and secret[0] in ('"', "'"):
+                secret = secret[1:-1].strip()
+            if secret:
+                return secret
+
         col = database.db["agent_configs"]
         doc = col.find_one(
             {
@@ -177,6 +187,33 @@ def _load_agent_shared_secret_from_db() -> str:
         return secret
     except Exception:
         return ""
+
+
+def _persist_agent_shared_secret_to_db(secret: str) -> None:
+    s = str(secret or "").strip()
+    if not s:
+        return
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return
+    try:
+        database.db["agent_secrets"].update_one(
+            {"key": "shared_secret"},
+            {
+                "$set": {
+                    "key": "shared_secret",
+                    "value": s,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+            },
+            upsert=True,
+        )
+    except Exception:
+        return
 
 # =========================================================
 # FastAPI Initialization
@@ -220,6 +257,7 @@ async def lifespan(_app: FastAPI):
     try:
         database._ensure_connected()
         print("[DB] Connection check complete")
+        _persist_agent_shared_secret_to_db(AGENT_SHARED_SECRET)
     except Exception as e:
         print(f"[INFO] DB error during startup (will retry): {e}")
 
@@ -2301,7 +2339,7 @@ class _DisabledDeviceHub:
 # Prefer the persisted DB shared secret when available.
 # If no DB value exists, keep the local/dev fallback so the UI can still bootstrap.
 AGENT_SHARED_SECRET = _load_agent_shared_secret_from_db()
-if PC_AGENT_ENABLED and (not CLOUD_MODE) and (not AGENT_SHARED_SECRET):
+if PC_AGENT_ENABLED and (not AGENT_SHARED_SECRET):
     try:
         AGENT_SHARED_SECRET = secrets.token_urlsafe(32)
     except Exception:

@@ -445,15 +445,15 @@
 }
 
 @media (min-width: 1025px) {
-  /* Keep a tiny offset only; large offsets create a visible blank gap. */
+  /* Keep enough top offset so the fixed header does not overlap right-panel rows. */
   .jd-right .jd-panel:first-child {
-    margin-top: 10px;
+    margin-top: 58px;
   }
 }
 
 @media (min-width: 768px) and (max-width: 1024px) {
   .jd-right .jd-panel:first-child {
-    margin-top: 8px;
+    margin-top: 48px;
   }
 }
 
