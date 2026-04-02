@@ -1430,6 +1430,37 @@ def _derive_dynamic_plan(source_text: str, actions: list[dict[str, Any]], *, pre
                     }
                 )
 
+        has_conv = any(
+            w in tl
+            for w in ("communicate", "comminucate", "talk", "chat", "ask", "question", "query", "discuss")
+        )
+        has_asst = any(
+            p in tl
+            for p in ("assistant", "digital assistant", "google assistant", "assistant.google.com", "chatgpt", "copilot", "gemini")
+        )
+        if has_conv and has_asst:
+            target = "google_assistant"
+            if "chatgpt" in tl:
+                target = "chatgpt"
+            elif "copilot" in tl:
+                target = "copilot"
+            elif "gemini" in tl:
+                target = "gemini"
+
+            steps.append(
+                {
+                    "step": len(steps) + 1,
+                    "step_id": f"step_{len(steps) + 1}",
+                    "depends_on": f"step_{len(steps)}" if steps else None,
+                    "action": "communicate_with_assistant",
+                    "params": {
+                        "assistant_target": target,
+                        "prompt": text or "What can you do to help improve this digital assistant system?",
+                    },
+                    "retry_once": True,
+                }
+            )
+
     # Adaptive fallback suggestions by action type.
     for s in steps:
         act = str((s or {}).get("action") or "").strip().lower()
@@ -3509,6 +3540,11 @@ def _is_remote_device_action(a: dict) -> bool:
         "open_app", "close_app", "switch_app",
         "execute_command", "run_command",
         "open_url",
+        "communicate_with_assistant",
+        "communicate_with_google_assistant",
+        # UI input actions are executed only on the user's PC agent and still
+        # require allow_screen capability checks before dispatch.
+        "type_text", "press_key", "hotkey",
         "set_brightness", "adjust_brightness",
         "set_power_plan", "set_energy_saver",
         "set_volume", "adjust_volume",
@@ -3598,6 +3634,66 @@ def _expand_multi_step_chain_actions(source_text: str, actions: list[dict[str, A
                     "type": "open_url",
                     "url": f"https://www.youtube.com/results?search_query={quote_plus(play_q)}",
                     "chain_reason": "open_then_search_then_action",
+                }
+            )
+
+    # Rule: communicate with assistant using universal action.
+    has_conversation_verb = any(
+        w in t
+        for w in (
+            "communicate",
+            "comminucate",
+            "talk",
+            "chat",
+            "ask",
+            "question",
+            "query",
+            "discuss",
+        )
+    )
+    has_assistant_reference = any(
+        p in t
+        for p in (
+            "assistant",
+            "digital assistant",
+            "google assistant",
+            "assistant.google.com",
+            "chatgpt",
+            "copilot",
+            "gemini",
+        )
+    )
+    if has_assistant_reference and has_conversation_verb:
+        has_universal_assistant_action = any(
+            str((a or {}).get("type") or "").strip().lower() in {"communicate_with_assistant", "communicate_with_google_assistant"}
+            for a in out
+        )
+        if not has_universal_assistant_action:
+            prompt = "What can you do to help improve this digital assistant system?"
+            ask_m = re.search(
+                r"\b(?:ask|question|query|about|for)\s+(.+)$",
+                str(source_text or ""),
+                flags=re.IGNORECASE,
+            )
+            if ask_m:
+                extracted = str(ask_m.group(1) or "").strip(" .,!?")
+                if extracted:
+                    prompt = extracted
+
+            target = "google_assistant"
+            if "chatgpt" in t:
+                target = "chatgpt"
+            elif "copilot" in t:
+                target = "copilot"
+            elif "gemini" in t:
+                target = "gemini"
+
+            out.append(
+                {
+                    "type": "communicate_with_assistant",
+                    "assistant_target": target,
+                    "prompt": prompt,
+                    "chain_reason": "assistant_conversation",
                 }
             )
 
@@ -3955,6 +4051,42 @@ async def agent_ws(ws: WebSocket):
                                 "received_at": datetime.now(timezone.utc).isoformat(),
                             },
                         )
+
+                        # Feed device-side assistant conversation outputs into the
+                        # learning engine so future planning quality improves.
+                        try:
+                            if learning_engine is not None and isinstance(execution_results, list):
+                                assistant_preview = ""
+                                task_status = ""
+                                for entry in execution_results:
+                                    if not isinstance(entry, dict):
+                                        continue
+                                    result_obj = entry.get("result") if isinstance(entry.get("result"), dict) else entry
+                                    action_type = str((result_obj or {}).get("action_type") or "").strip().lower()
+                                    if action_type not in {"communicate_with_assistant", "communicate_with_google_assistant"}:
+                                        continue
+                                    assistant_preview = str(
+                                        (result_obj or {}).get("response_summary")
+                                        or (result_obj or {}).get("observed_text_preview")
+                                        or (result_obj or {}).get("message")
+                                        or ""
+                                    ).strip()
+                                    task_status = str((entry or {}).get("status") or "").strip().lower()
+                                    if assistant_preview:
+                                        break
+
+                                if assistant_preview:
+                                    learning_engine.log_response_quality(
+                                        user_id=str(user or "").strip().lower(),
+                                        query=str(source_text or "").strip(),
+                                        response_text=assistant_preview,
+                                        actions=[{"type": "communicate_with_assistant"}],
+                                        source="device_assistant",
+                                        request_id=str(jid or "").strip() or None,
+                                        task_result_status=task_status or None,
+                                    )
+                        except Exception:
+                            pass
                         
                         # CONTINUOUS IMPROVEMENT: Run cycle evaluation & improvement in background.
                         # This enables automatic refinement for each device action across all scenarios.
@@ -4611,6 +4743,8 @@ async def device_dispatch(req: DeviceDispatchRequest):
             return ("allow_app_control", "JARVIS_AGENT_ALLOW_APP_CONTROL")
         if t in (
             "execute_command",
+            "communicate_with_assistant",
+            "communicate_with_google_assistant",
             "set_brightness", "adjust_brightness",
             "set_power_plan", "set_energy_saver",
             "set_volume", "adjust_volume",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
+from pathlib import Path
 from typing import Optional
 
 
@@ -15,6 +16,27 @@ Goal: avoid scattered direct `os.getenv(...)` usage across the codebase.
 """
 
 logger = logging.getLogger(__name__)
+
+
+def _load_dotenv_once() -> None:
+    """Best-effort .env loading for entrypoints that don't call load_dotenv()."""
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        return
+
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        env_file = repo_root / ".env"
+        if env_file.exists():
+            load_dotenv(dotenv_path=env_file, override=False)
+        else:
+            load_dotenv(override=False)
+    except Exception:
+        return
+
+
+_load_dotenv_once()
 
 # Strict application env whitelist.
 ALLOWED_ENV_KEYS: set[str] = {

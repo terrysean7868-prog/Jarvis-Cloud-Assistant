@@ -158,6 +158,8 @@ def _supported_actions_catalog() -> list[str]:
         "restart",
         "logoff",
         "open_url",
+        "communicate_with_assistant",
+        "communicate_with_google_assistant",
         "open_path",
         "get_clipboard",
         "set_clipboard",
@@ -1199,6 +1201,105 @@ async def _execute_action(action: dict) -> dict:
             return {"status": "success", "action_type": t, "url": url}
         except Exception as e:
             return {"status": "error", "action_type": t, "message": str(e)}
+
+    if t in ("communicate_with_assistant", "communicate_with_google_assistant"):
+        if not ALLOW_EXECUTE_COMMAND:
+            return {"status": "forbidden", "action_type": t, "message": "System control disabled on agent (enable execute_command permission)."}
+        if not ALLOW_SCREEN:
+            return {"status": "forbidden", "action_type": t, "message": "Screen features disabled on agent"}
+
+        sa = _get_screen_access()
+        if not sa:
+            return {"status": "error", "action_type": t, "message": "Screen features not available on this agent"}
+
+        target = str((action or {}).get("assistant_target") or "").strip().lower()
+        if t == "communicate_with_google_assistant" and not target:
+            target = "google_assistant"
+
+        target_url_map = {
+            "google_assistant": "https://assistant.google.com/",
+            "chatgpt": "https://chat.openai.com/",
+            "copilot": "https://copilot.microsoft.com/",
+            "gemini": "https://gemini.google.com/",
+        }
+        default_url = target_url_map.get(target or "google_assistant", "https://assistant.google.com/")
+        url = str((action or {}).get("url") or default_url).strip() or default_url
+        prompt = str((action or {}).get("prompt") or (action or {}).get("text") or "").strip()
+        if not prompt:
+            prompt = "What can you do to help improve this digital assistant system?"
+
+        try:
+            open_wait_ms = int((action or {}).get("open_wait_ms", 1800) or 1800)
+        except Exception:
+            open_wait_ms = 1800
+        try:
+            response_wait_ms = int((action or {}).get("response_wait_ms", 2800) or 2800)
+        except Exception:
+            response_wait_ms = 2800
+
+        open_wait_s = max(0.4, min(8.0, open_wait_ms / 1000.0))
+        response_wait_s = max(0.8, min(10.0, response_wait_ms / 1000.0))
+
+        try:
+            subprocess.Popen(["cmd.exe", "/d", "/s", "/c", "start", "", url])
+        except Exception as e:
+            return {"status": "error", "action_type": t, "message": f"Failed to open Assistant URL: {e}"}
+
+        await asyncio.sleep(open_wait_s)
+
+        # Focus browser URL box then navigate directly to target assistant page.
+        try:
+            _ = bool(sa.hotkey("ctrl+l"))
+            await asyncio.sleep(0.15)
+            ok_url, err_url = await _type_text_with_timeout(sa, url, interval=0.03, timeout_s=10.0)
+            if not ok_url:
+                return {
+                    "status": "error",
+                    "action_type": t,
+                    "message": err_url or "Failed to type assistant URL",
+                }
+            _ = bool(sa.press_key("enter", presses=1))
+        except Exception as e:
+            return {"status": "error", "action_type": t, "message": f"Failed to focus Assistant tab: {e}"}
+
+        await asyncio.sleep(1.1)
+
+        # Best-effort: type prompt and submit.
+        try:
+            ok_prompt, err_prompt = await _type_text_with_timeout(sa, prompt, interval=0.04, timeout_s=30.0)
+            if not ok_prompt:
+                return {
+                    "status": "error",
+                    "action_type": t,
+                    "message": err_prompt or "Failed to type prompt",
+                    "prompt": prompt,
+                    "assistant_url": url,
+                }
+            submitted = bool(sa.press_key("enter", presses=1))
+        except Exception as e:
+            return {"status": "error", "action_type": t, "message": f"Failed to submit prompt: {e}", "prompt": prompt}
+
+        await asyncio.sleep(response_wait_s)
+
+        observed_text = ""
+        try:
+            observed_text = str(sa.read_screen_text(None) or "").strip()
+        except Exception:
+            observed_text = ""
+
+        preview = observed_text[:900] if observed_text else ""
+        return {
+            "status": "success" if submitted else "partial",
+            "action_type": t,
+            "assistant_target": target or "google_assistant",
+            "assistant_url": url,
+            "prompt": prompt,
+            "submitted": bool(submitted),
+            "observed_text_preview": preview,
+            "observed_text_chars": len(observed_text),
+            "response_summary": preview[:280] if preview else "",
+            "message": "Prompt submitted to assistant with best-effort screen text capture.",
+        }
 
     if t == "open_path":
         if not ALLOW_EXECUTE_COMMAND:
