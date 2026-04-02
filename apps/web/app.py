@@ -3734,6 +3734,15 @@ async def agent_ws(ws: WebSocket):
                 await _auth_fail("invalid_shared_secret")
                 return
 
+        # Re-apply any saved runtime permissions so the hub state matches what
+        # the agent will enforce immediately after reconnect.
+        try:
+            saved_caps = _get_saved_device_permissions(device_id) or {}
+            if isinstance(saved_caps, dict) and saved_caps:
+                await device_hub.update_capabilities(device_id, saved_caps)
+        except Exception:
+            pass
+
         logger = __import__('logging').getLogger(__name__)
         logger.info("[AGENT] Connected: device_id=%s", device_id)
 
@@ -4908,6 +4917,22 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
             raise HTTPException(status_code=400, detail=f"Unsupported permission key: {k}")
         normalized[k] = bool(v)
 
+    current_saved = _get_saved_device_permissions(did) or {}
+    try:
+        agent = await device_hub.get_agent(did)
+    except Exception:
+        agent = None
+    current_caps = (agent or {}).get("capabilities") or {}
+
+    if current_saved == normalized and all(bool(current_caps.get(k)) == bool(v) for k, v in normalized.items()):
+        return {
+            "status": "saved",
+            "device_id": did,
+            "permissions": normalized,
+            "online": bool(await device_hub.is_connected(did)),
+            "already_applied": True,
+        }
+
     # Persist approvals so they apply automatically next time, even if the agent is offline.
     try:
         owner = _get_device_owner(did)
@@ -4932,12 +4957,23 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
         )
         return {"status": "saved", "offline": True, "device_id": did, "permissions": normalized}
 
-    job = await _dispatch_actions_to_device(
-        did,
-        username=username or "user",
-        actions=[{"type": "agent_set_permissions", "permissions": normalized}],
-        source_text="permission_grant",
-    )
+    try:
+        job = await _dispatch_actions_to_device(
+            did,
+            username=username or "user",
+            actions=[{"type": "agent_set_permissions", "permissions": normalized}],
+            source_text="permission_grant",
+        )
+    except Exception as exc:
+        logger = __import__('logging').getLogger(__name__)
+        logger.warning("[DEVICE PERMISSIONS] Live grant dispatch failed for %s: %s", did, exc)
+        return {"status": "saved", "device_id": did, "permissions": normalized, "online": True, "queued": False}
+
+    try:
+        await device_hub.update_capabilities(did, normalized)
+    except Exception:
+        pass
+
     for key, enabled in normalized.items():
         _log_requirement_event(
             user_id=username,

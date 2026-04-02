@@ -258,7 +258,9 @@ class DeviceHub:
         async with self._lock:
             conn = self._agents.get(device_id)
             if conn:
-                conn.capabilities = capabilities or {}
+                merged = dict(conn.capabilities or {})
+                merged.update(capabilities or {})
+                conn.capabilities = merged
 
         try:
             async with self._lock:

@@ -2021,9 +2021,19 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                         pending_results = still_pending
 
                     async def pinger():
-                        while True:
-                            await asyncio.sleep(PING_INTERVAL_S)
-                            await ws.send_str(json.dumps({"type": "ping", "device_id": effective_device_id, "ts": _now_utc_iso()}))
+                        try:
+                            while True:
+                                await asyncio.sleep(PING_INTERVAL_S)
+                                await ws.send_str(json.dumps({"type": "ping", "device_id": effective_device_id, "ts": _now_utc_iso()}))
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            print(f"[AGENT] Ping failed: {exc}", flush=True)
+                            try:
+                                await ws.close()
+                            except Exception:
+                                pass
+                            raise
 
                     ping_task = asyncio.create_task(pinger())
 
@@ -2090,6 +2100,10 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                                 break
                     finally:
                         ping_task.cancel()
+                        try:
+                            await ping_task
+                        except Exception:
+                            pass
 
             except Exception as e:
                 msg = str(e or "")

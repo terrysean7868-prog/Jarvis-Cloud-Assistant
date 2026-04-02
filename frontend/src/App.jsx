@@ -3141,111 +3141,120 @@ export default function App() {
 
       {isAuthenticated && username && (
         <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
-            {(String(systemHealth?.status || "ok").toLowerCase() !== "ok") && (
-              <div style={{
-                background: "rgba(255, 193, 7, 0.18)",
-                border: "1px solid rgba(255, 193, 7, 0.65)",
-                color: "#ffd86a",
-                borderRadius: 10,
-                padding: "6px 10px",
-                fontSize: 12,
-                fontWeight: 600,
-              }}>
-                System degraded
-              </div>
-            )}
-            {agentOffline && (
-              <div style={{
-                background: "rgba(255, 77, 79, 0.18)",
-                border: "1px solid rgba(255, 77, 79, 0.65)",
-                color: "#ff9a9b",
-                borderRadius: 10,
-                padding: "6px 10px",
-                fontSize: 12,
-                fontWeight: 600,
-              }}>
-                Agent offline
-              </div>
-            )}
-            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", justifyContent: "flex-end", maxWidth: "min(92vw, 780px)" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 8 }}>
-              {activeDisplay === "autonomy" ? (
-                <button
-                  onClick={() => setActiveDisplay("dashboard")}
-                  style={{
-                    background: "rgba(0,234,255,0.16)",
-                    border: "1px solid var(--jarvis-accent)",
-                    color: "var(--jarvis-accent)",
-                    borderRadius: 999,
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, maxWidth: "min(92vw, 780px)" }}>
+            {(String(systemHealth?.status || "ok").toLowerCase() !== "ok" || agentOffline) && (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
+                {(String(systemHealth?.status || "ok").toLowerCase() !== "ok") && (
+                  <div style={{
+                    background: "rgba(255, 193, 7, 0.18)",
+                    border: "1px solid rgba(255, 193, 7, 0.65)",
+                    color: "#ffd86a",
+                    borderRadius: 10,
                     padding: "6px 10px",
                     fontSize: 12,
-                    cursor: "pointer",
-                  }}
-                >
-                  Main View
-                </button>
-              ) : (
-                <button
-                  onClick={() => setActiveDisplay("autonomy")}
-                  style={{
-                    background: "rgba(0,234,255,0.16)",
-                    border: "1px solid var(--jarvis-accent)",
-                    color: "var(--jarvis-accent)",
-                    borderRadius: 999,
+                    fontWeight: 600,
+                  }}>
+                    System degraded
+                  </div>
+                )}
+                {agentOffline && (
+                  <div style={{
+                    background: "rgba(255, 77, 79, 0.18)",
+                    border: "1px solid rgba(255, 77, 79, 0.65)",
+                    color: "#ff9a9b",
+                    borderRadius: 10,
                     padding: "6px 10px",
                     fontSize: 12,
-                    cursor: "pointer",
-                  }}
-                >
-                  Autonomy View
-                </button>
-              )}
+                    fontWeight: 600,
+                  }}>
+                    Agent offline
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 10, flexWrap: "wrap", width: "100%" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                {activeDisplay === "autonomy" ? (
+                  <button
+                    onClick={() => setActiveDisplay("dashboard")}
+                    style={{
+                      background: "rgba(0,234,255,0.16)",
+                      border: "1px solid var(--jarvis-accent)",
+                      color: "var(--jarvis-accent)",
+                      borderRadius: 999,
+                      padding: "6px 10px",
+                      fontSize: 12,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Main View
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => setActiveDisplay("autonomy")}
+                    style={{
+                      background: "rgba(0,234,255,0.16)",
+                      border: "1px solid var(--jarvis-accent)",
+                      color: "var(--jarvis-accent)",
+                      borderRadius: 999,
+                      padding: "6px 10px",
+                      fontSize: 12,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Autonomy View
+                  </button>
+                )}
+              </div>
+              <div style={{ width: 8, height: 8, borderRadius: 8, background: "var(--jarvis-accent)", boxShadow: "0 0 10px var(--jarvis-accent-glow)" }} />
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", minWidth: 0 }}>
+                <span style={{ color: "var(--jarvis-accent)", fontSize: 14, textAlign: "right" }}>
+                  {username}{role ? ` (${role})` : ""}
+                </span>
+                <span style={{ color: "var(--jarvis-accent)", fontSize: 14, opacity: 0.9, textAlign: "right" }}>
+                  Assistant: {assistantName || "Jarvis"}
+                </span>
+              </div>
+
+              <button onClick={async () => {
+                const sid = sessionId;
+
+                // Ask server to logout AND request agent stop (server-side).
+                try {
+                  if (sid) {
+                    await fetch(`${API_URL}/api/logout`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ session_id: sid })
+                    });
+                  }
+                } catch {}
+
+                localStorage.removeItem("jarvis_session");
+                localStorage.removeItem("jarvis_username");
+                localStorage.removeItem("jarvis_role");
+                localStorage.removeItem("jarvis_permissions");
+                localStorage.removeItem("jarvis_assistant_name");
+                localStorage.removeItem("jarvis_voice_biometrics_enrolled");
+                setIsAuthenticated(false);
+                setSessionId(null);
+                setUsername(null);
+                setAssistantName("Jarvis");
+                setVoiceBiometricsEnrolled(false);
+                setRole(null);
+                setPermissions(null);
+                setPermissionPrompt(null);
+                try {
+                  if (isMobile) setVoiceUnlocked(false);
+                } catch {}
+                setDeviceStatusConnected(false);
+                setAgentOffline(false);
+                setShowAuthModal(true);
+                speak("Logged out successfully.");
+              }} style={{ background: "transparent", border: "none", color: "#ff5050", cursor: "pointer", padding: 0, whiteSpace: "nowrap" }}>Logout</button>
             </div>
-            <div style={{ width: 8, height: 8, borderRadius: 8, background: "var(--jarvis-accent)", boxShadow: "0 0 10px var(--jarvis-accent-glow)" }} />
-            <span style={{ color: "var(--jarvis-accent)", fontSize: 14 }}>
-              {username}{role ? ` (${role})` : ""}
-            </span>
-            <span style={{ color: "var(--jarvis-accent)", fontSize: 14, opacity: 0.9 }}>
-              Assistant: {assistantName || "Jarvis"}
-            </span>
-
-            <button onClick={async () => {
-              const sid = sessionId;
-
-              // Ask server to logout AND request agent stop (server-side).
-              try {
-                if (sid) {
-                  await fetch(`${API_URL}/api/logout`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ session_id: sid })
-                  });
-                }
-              } catch {}
-
-              localStorage.removeItem("jarvis_session");
-              localStorage.removeItem("jarvis_username");
-              localStorage.removeItem("jarvis_role");
-              localStorage.removeItem("jarvis_permissions");
-              localStorage.removeItem("jarvis_assistant_name");
-              localStorage.removeItem("jarvis_voice_biometrics_enrolled");
-              setIsAuthenticated(false);
-              setSessionId(null);
-              setUsername(null);
-              setAssistantName("Jarvis");
-              setVoiceBiometricsEnrolled(false);
-              setRole(null);
-              setPermissions(null);
-              setPermissionPrompt(null);
-              try {
-                if (isMobile) setVoiceUnlocked(false);
-              } catch {}
-              setDeviceStatusConnected(false);
-              setAgentOffline(false);
-              setShowAuthModal(true);
-              speak("Logged out successfully.");
-            }} style={{ background: "transparent", border: "none", color: "#ff5050", cursor: "pointer" }}>Logout</button>
+          </div>
             </div>
           </div>
         </div>
