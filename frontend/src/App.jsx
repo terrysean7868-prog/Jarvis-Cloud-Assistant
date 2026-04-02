@@ -379,6 +379,18 @@ export default function App() {
 
     if (req?.actionMode === "grant_permission" && req?.neededPermissions) {
       const grantRes = await grantDevicePermissions(sessionId, req.neededPermissions);
+      try {
+        const status = await getDeviceStatus(sessionId, 2500);
+        const connected = !!status?.device_status?.connected;
+        setDeviceStatusConnected(connected);
+        setAgentOffline(!connected);
+        if (Array.isArray(status?.agents) && status.agents.length) {
+          const sys = status.agents[0]?.capabilities?.system_info || null;
+          if (sys && typeof sys === "object") {
+            setSystemInfo({ status: "success", ...sys });
+          }
+        }
+      } catch {}
       if (grantRes?.offline) {
         addLog("system", "Permission saved. Start JarvisPCAgent.exe (or python pc_agent.py) and keep it connected. Continue manually after reconnect.");
         setPendingResume({
@@ -3253,8 +3265,6 @@ export default function App() {
                 setShowAuthModal(true);
                 speak("Logged out successfully.");
               }} style={{ background: "transparent", border: "none", color: "#ff5050", cursor: "pointer", padding: 0, whiteSpace: "nowrap" }}>Logout</button>
-            </div>
-          </div>
             </div>
           </div>
         </div>
