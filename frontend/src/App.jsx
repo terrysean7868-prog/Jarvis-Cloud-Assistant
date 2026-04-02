@@ -139,9 +139,9 @@ export default function App() {
   const [agentCfgLoaded, setAgentCfgLoaded] = useState(false);
   const [agentCfgError, setAgentCfgError] = useState(null);
   const [systemInfo, setSystemInfo] = useState(null);
-  const [systemHealth, setSystemHealth] = useState(null);
+  const [, setSystemHealth] = useState(null);
   const [deviceStatusConnected, setDeviceStatusConnected] = useState(false);
-  const [agentOffline, setAgentOffline] = useState(false);
+  const [, setAgentOffline] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [sessionId, setSessionId] = useState(null);
   const [username, setUsername] = useState(null);
