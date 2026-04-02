@@ -2083,6 +2083,8 @@ async def run_agent(
                         ping_task.cancel()
                         try:
                             await ping_task
+                        except asyncio.CancelledError:
+                            pass
                         except Exception:
                             pass
 

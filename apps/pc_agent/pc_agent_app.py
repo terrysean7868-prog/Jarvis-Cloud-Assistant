@@ -320,6 +320,8 @@ def run_daemon(token: Optional[str], server_url: Optional[str], shared_secret: O
 
         asyncio.run(run_agent(agent_token=token, server_base_url=server_url, shared_secret=shared_secret))
         return 0
+    except asyncio.CancelledError:
+        return 0
     except KeyboardInterrupt:
         return 0
 
