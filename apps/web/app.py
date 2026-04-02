@@ -147,6 +147,33 @@ except (ImportError, KeyError, Exception) as e:
     logger = __import__('logging').getLogger(__name__)
     logger.warning(f"System operations not available: {e}")
 
+
+def _load_agent_shared_secret_from_db() -> str:
+    """Return the persisted agent shared secret from MongoDB when available."""
+    try:
+        database._ensure_connected()
+    except Exception:
+        pass
+    if database.db is None:
+        return ""
+
+    try:
+        col = database.db["agent_configs"]
+        doc = col.find_one(
+            {
+                "$or": [
+                    {"shared_secret": {"$exists": True, "$ne": ""}},
+                    {"agent_shared_secret": {"$exists": True, "$ne": ""}},
+                ]
+            },
+            sort=[("updated_at", -1), ("created_at", -1)],
+        )
+        if not doc:
+            return ""
+        return _clean_cfg_str(doc.get("shared_secret") or doc.get("agent_shared_secret"))
+    except Exception:
+        return ""
+
 # =========================================================
 # FastAPI Initialization
 # =========================================================
@@ -156,6 +183,19 @@ except (ImportError, KeyError, Exception) as e:
 async def lifespan(_app: FastAPI):
     # Startup
     print("[OK] Jarvis server startup (lifespan)")
+
+    try:
+        db_secret = _load_agent_shared_secret_from_db()
+        if db_secret:
+            global AGENT_SHARED_SECRET
+            AGENT_SHARED_SECRET = db_secret
+            try:
+                if hasattr(device_hub, "_shared_secret"):
+                    device_hub._shared_secret = db_secret
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # Multi-instance support: when a broker is configured, subscribe to
     # cross-instance notifications and agent job routing.
@@ -2254,9 +2294,9 @@ class _DisabledDeviceHub:
         return False
 
 
-# Local/dev convenience: if no shared secret is configured, generate one so the UI
-# can display it and legacy agent auth can still work. (Token auth is preferred.)
-# Note: in the desktop app we disable PC-agent features by default.
+# Prefer the persisted DB shared secret when available.
+# If no DB value exists, keep the local/dev fallback so the UI can still bootstrap.
+AGENT_SHARED_SECRET = _load_agent_shared_secret_from_db()
 if PC_AGENT_ENABLED and (not CLOUD_MODE) and (not AGENT_SHARED_SECRET):
     try:
         AGENT_SHARED_SECRET = secrets.token_urlsafe(32)
@@ -3928,19 +3968,38 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
         cache_key = (req.session_id, _normalize_device_id(did))
         cached = _AGENT_CONFIG_CACHE.get(cache_key)
         if cached and (time.time() - cached[0]) < _AGENT_CONFIG_CACHE_TTL_S:
-            return cached[1]
+            payload = dict(cached[1])
+            owner_device = _get_owner_device_id(username)
+            allow_secret = bool(AGENT_SHARED_SECRET) and (
+                (not CLOUD_MODE)
+                or EXPOSE_AGENT_SHARED_SECRET
+                or _is_local_request(request)
+                or role == "admin"
+                or (_normalize_device_id(owner_device or "") == _normalize_device_id(did))
+            )
+            if allow_secret:
+                payload["agent_shared_secret"] = AGENT_SHARED_SECRET
+            else:
+                payload.pop("agent_shared_secret", None)
+            return payload
     except Exception:
         pass
 
     server_url = _effective_server_url(request)
 
-    # Record config in MongoDB (no secrets stored).
+    # Record config in MongoDB, including the resolved shared secret when available.
     # Do this in a background task so the UI gets the token immediately.
     def _persist_agent_cfg():
         try:
             col = _agent_config_collection()
             if col is None:
                 return
+            secret_fields = {}
+            if AGENT_SHARED_SECRET:
+                secret_fields = {
+                    "shared_secret": AGENT_SHARED_SECRET,
+                    "agent_shared_secret": AGENT_SHARED_SECRET,
+                }
             col.update_one(
                 {"device_id": did},
                 {
@@ -3950,6 +4009,7 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
                         "server_url": server_url,
                         "updated_at": datetime.utcnow(),
                         "updated_by": username,
+                        **secret_fields,
                     },
                     "$setOnInsert": {"created_at": datetime.utcnow()},
                 },
@@ -3987,9 +4047,12 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
     if allow_secret:
         payload["agent_shared_secret"] = AGENT_SHARED_SECRET
 
+    cached_payload = dict(payload)
+    cached_payload.pop("agent_shared_secret", None)
+
     # Cache briefly to make refresh/login feel instant.
     try:
-        _AGENT_CONFIG_CACHE[(req.session_id, _normalize_device_id(did))] = (time.time(), payload)
+        _AGENT_CONFIG_CACHE[(req.session_id, _normalize_device_id(did))] = (time.time(), cached_payload)
     except Exception:
         pass
 

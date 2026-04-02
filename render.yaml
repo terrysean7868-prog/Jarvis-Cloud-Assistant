@@ -14,8 +14,6 @@ services:
         value: "primary"
       - key: JARVIS_DEVICE_OWNER_USERNAME
         value: ""
-      - key: JARVIS_AGENT_SHARED_SECRET
-        generateValue: true
       - key: JARVIS_JWT_SECRET
         generateValue: true
       - key: REQUIRE_MANUAL_APPROVAL

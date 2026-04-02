@@ -23,18 +23,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Load environment from .env if present (avoids manual env setup).
-try:
-    from dotenv import load_dotenv
-    for _p in (REPO_ROOT / ".env",):
-        try:
-            if _p.exists():
-                load_dotenv(_p, override=False)
-        except Exception:
-            pass
-except Exception:
-    pass
-
 # NOTE: This agent is intentionally defensive and execution-only.
 # It receives cloud actions, executes them, and returns structured results.
 
@@ -76,7 +64,6 @@ def _env_int(name: str, default: int) -> int:
 SERVER_BASE_URL = _env_str("JARVIS_SERVER_URL", "https://jarvis-cloud-assistant.onrender.com").rstrip("/")
 # Device IDs are treated case-insensitively by the server.
 DEVICE_ID = (_env_str("JARVIS_DEVICE_ID", "") or "").strip().lower()
-SHARED_SECRET = _env_str("JARVIS_AGENT_SHARED_SECRET", "")
 
 ALLOW_EXECUTE_COMMAND = _env_bool("JARVIS_AGENT_ALLOW_EXECUTE_COMMAND", "false")
 ALLOW_APP_CONTROL = _env_bool("JARVIS_AGENT_ALLOW_APP_CONTROL", "false")
@@ -1927,7 +1914,12 @@ async def _execute_action(action: dict) -> dict:
     return {"status": "ignored", "action_type": t}
 
 
-async def run_agent(agent_token: str | None = None, server_base_url: str | None = None, device_id: str | None = None):
+async def run_agent(
+    agent_token: str | None = None,
+    server_base_url: str | None = None,
+    device_id: str | None = None,
+    shared_secret: str | None = None,
+):
     # Apply any previously approved permissions before connecting.
     _load_saved_permissions()
 
@@ -1935,8 +1927,9 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
     ws_url = _ws_url_from_base(base)
     selected_device_id = _resolve_device_id(device_id)
 
-    if not agent_token and not SHARED_SECRET:
-        raise SystemExit("Missing agent auth. Provide --token (recommended) or set JARVIS_AGENT_SHARED_SECRET.")
+    selected_shared_secret = str(shared_secret or "").strip()
+    if not agent_token and not selected_shared_secret:
+        raise SystemExit("Missing agent auth. Provide --token (recommended) or --shared-secret.")
 
     print(f"[AGENT] Connecting to {ws_url} as device_id={selected_device_id}", flush=True)
 
@@ -1969,7 +1962,7 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
                         auth_msg["device_id"] = selected_device_id
                     else:
                         auth_msg["device_id"] = selected_device_id
-                        auth_msg["secret"] = SHARED_SECRET
+                        auth_msg["secret"] = selected_shared_secret
 
                     await ws.send_str(json.dumps(auth_msg))
                     try:
@@ -2132,8 +2125,16 @@ async def run_agent(agent_token: str | None = None, server_base_url: str | None 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Jarvis PC Agent")
     parser.add_argument("--token", dest="token", default=None, help="Agent token from /api/agent/config (recommended)")
+    parser.add_argument("--shared-secret", dest="shared_secret", default=None, help="Legacy shared secret from /api/agent/config")
     parser.add_argument("--server", dest="server", default=None, help="Server base URL (defaults to JARVIS_SERVER_URL)")
     parser.add_argument("--device-id", dest="device_id", default=None, help="Explicit device id (overrides env and hostname)")
     args = parser.parse_args()
 
-    asyncio.run(run_agent(agent_token=args.token, server_base_url=args.server, device_id=args.device_id))
+    asyncio.run(
+        run_agent(
+            agent_token=args.token,
+            server_base_url=args.server,
+            device_id=args.device_id,
+            shared_secret=args.shared_secret,
+        )
+    )

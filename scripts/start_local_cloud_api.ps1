@@ -23,7 +23,6 @@ if ($CloudMode) {
 	$env:JARVIS_CLOUD_MODE = 'false'
 }
 if (-not $env:JARVIS_JWT_SECRET) { $env:JARVIS_JWT_SECRET = 'devsecret' }
-if (-not $env:JARVIS_AGENT_SHARED_SECRET) { $env:JARVIS_AGENT_SHARED_SECRET = 'localsecret' }
 if (-not $env:JARVIS_DEFAULT_DEVICE_ID) { $env:JARVIS_DEFAULT_DEVICE_ID = 'safe' }
 
 Write-Host "Starting API on http://127.0.0.1:$Port (cloud_mode=$($env:JARVIS_CLOUD_MODE))" -ForegroundColor Cyan

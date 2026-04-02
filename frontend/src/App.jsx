@@ -3154,37 +3154,6 @@ export default function App() {
       {isAuthenticated && username && (
         <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, maxWidth: "min(92vw, 780px)" }}>
-            {(String(systemHealth?.status || "ok").toLowerCase() !== "ok" || agentOffline) && (
-              <div style={{ display: "flex", flexDirection: "row", alignItems: "flex-end", gap: 6 }}>
-                {(String(systemHealth?.status || "ok").toLowerCase() !== "ok") && (
-                  <div style={{
-                    background: "rgba(255, 193, 7, 0.18)",
-                    border: "1px solid rgba(255, 193, 7, 0.65)",
-                    color: "#ffd86a",
-                    borderRadius: 10,
-                    padding: "6px 10px",
-                    fontSize: 12,
-                    fontWeight: 600,
-                  }}>
-                    System degraded
-                  </div>
-                )}
-                {agentOffline && (
-                  <div style={{
-                    background: "rgba(255, 77, 79, 0.18)",
-                    border: "1px solid rgba(255, 77, 79, 0.65)",
-                    color: "#ff9a9b",
-                    borderRadius: 10,
-                    padding: "6px 10px",
-                    fontSize: 12,
-                    fontWeight: 600,
-                  }}>
-                    Agent offline
-                  </div>
-                )}
-              </div>
-            )}
-
             <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 10, flexWrap: "wrap", width: "100%" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 {activeDisplay === "autonomy" ? (

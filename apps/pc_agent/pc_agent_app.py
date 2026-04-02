@@ -363,6 +363,8 @@ class AgentSupervisor:
                 cmd = [sys.executable, "--daemon"]
                 if cfg.token.strip():
                     cmd += ["--token", cfg.token.strip()]
+                if (not cfg.token.strip()) and cfg.shared_secret.strip():
+                    cmd += ["--shared-secret", cfg.shared_secret.strip()]
                 if cfg.server_url.strip():
                     cmd += ["--server", cfg.server_url.strip()]
 
@@ -372,8 +374,6 @@ class AgentSupervisor:
                     env["JARVIS_SERVER_URL"] = cfg.server_url.strip()
                 if cfg.device_id.strip():
                     env["JARVIS_DEVICE_ID"] = cfg.device_id.strip()
-                if (not cfg.token.strip()) and cfg.shared_secret.strip():
-                    env["JARVIS_AGENT_SHARED_SECRET"] = cfg.shared_secret.strip()
 
                 # Packaged exe runs from a read-only install location; ensure agent
                 # uses a stable, writable project root and permission file.
