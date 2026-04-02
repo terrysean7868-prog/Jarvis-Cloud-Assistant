@@ -3155,7 +3155,7 @@ export default function App() {
         <div style={{ position: "fixed", top: 20, right: 20, zIndex: 15 }}>
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, maxWidth: "min(92vw, 780px)" }}>
             {(String(systemHealth?.status || "ok").toLowerCase() !== "ok" || agentOffline) && (
-              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
+              <div style={{ display: "flex", flexDirection: "row", alignItems: "flex-end", gap: 6 }}>
                 {(String(systemHealth?.status || "ok").toLowerCase() !== "ok") && (
                   <div style={{
                     background: "rgba(255, 193, 7, 0.18)",

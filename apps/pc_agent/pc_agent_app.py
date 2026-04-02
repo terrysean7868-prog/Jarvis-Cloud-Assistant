@@ -168,6 +168,11 @@ def _sanitize_agent_token(token: str) -> tuple[str, str | None]:
     return cleaned, None
 
 
+def _token_device_id(token: str) -> str:
+    payload = _decode_jwt_payload_unverified(token)
+    return _clean_cfg_str(payload.get("device_id") or payload.get("sub")).lower()
+
+
 def _find_webview2_runtime_exe() -> Optional[Path]:
     """Return a path to msedgewebview2.exe if WebView2 Runtime appears installed."""
 
@@ -1188,6 +1193,18 @@ def run_ui() -> int:
                     except Exception:
                         pass
 
+                requested_device = _clean_cfg_str(cfg_dict.get("device_id")).lower()
+                token_device = _token_device_id(safe_token) if safe_token else ""
+                if safe_token and requested_device and token_device and token_device != requested_device:
+                    try:
+                        log_q.put_nowait(
+                            f"[{_now_hms()}] WARNING: agent_token is bound to device_id='{token_device}', but the selected device_id is '{requested_device}'. Clear the token and reconfigure the PC agent config for this device."
+                        )
+                    except Exception:
+                        pass
+                    cfg_dict["agent_token"] = ""
+                    safe_token = ""
+
                 if not safe_token and not _clean_cfg_str(cfg_dict.get("shared_secret")):
                     return {"ok": False, "error": "missing_agent_auth", "message": "Provide agent_token (recommended) or shared_secret."}
 
@@ -1564,6 +1581,20 @@ def run_ui() -> int:
                     except Exception:
                         pass
                     token_var.set("")
+
+                requested_device = _clean_cfg_str(device_var.get()).lower()
+                token_device = _token_device_id(safe_token) if safe_token else ""
+                if safe_token and requested_device and token_device and token_device != requested_device:
+                    msg = (
+                        f"[{_now_hms()}] WARNING: agent_token is bound to device_id='{token_device}', "
+                        f"but the selected device_id is '{requested_device}'. Clear the token and reconfigure the PC agent config for this device."
+                    )
+                    try:
+                        log_q.put_nowait(msg)
+                    except Exception:
+                        pass
+                    token_var.set("")
+                    safe_token = ""
 
                 if (not safe_token) and (not _clean_cfg_str(secret_var.get())):
                     _toast("Provide Agent token or Shared secret")
