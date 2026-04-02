@@ -311,14 +311,14 @@ def load_permissions() -> dict:
     return perms
 
 
-def run_daemon(token: Optional[str], server_url: Optional[str]) -> int:
+def run_daemon(token: Optional[str], server_url: Optional[str], shared_secret: Optional[str] = None) -> int:
     # Import only in daemon mode so UI startup stays fast.
     from apps.pc_agent.pc_agent import run_agent  # type: ignore
 
     try:
         import asyncio
 
-        asyncio.run(run_agent(agent_token=token, server_base_url=server_url))
+        asyncio.run(run_agent(agent_token=token, server_base_url=server_url, shared_secret=shared_secret))
         return 0
     except KeyboardInterrupt:
         return 0
@@ -1704,6 +1704,7 @@ def main() -> int:
         help="Force fallback Tk UI (recommended if WebView2 is not installed)",
     )
     ap.add_argument("--token", default=None)
+    ap.add_argument("--shared-secret", default=None)
     ap.add_argument("--server", default=None)
     args = ap.parse_args()
 
@@ -1714,7 +1715,7 @@ def main() -> int:
         logging.info("--webview-debug requested")
 
     if args.daemon and not args.ui:
-        return int(run_daemon(token=args.token, server_url=args.server))
+        return int(run_daemon(token=args.token, server_url=args.server, shared_secret=args.shared_secret))
 
     return int(run_ui())
 

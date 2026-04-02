@@ -445,15 +445,15 @@
 }
 
 @media (min-width: 1025px) {
-  /* Keep right-side content from sitting under the fixed user/logout header */
+  /* Keep a tiny offset only; large offsets create a visible blank gap. */
   .jd-right .jd-panel:first-child {
-    margin-top: 128px;
+    margin-top: 10px;
   }
 }
 
 @media (min-width: 768px) and (max-width: 1024px) {
   .jd-right .jd-panel:first-child {
-    margin-top: 110px;
+    margin-top: 8px;
   }
 }
 

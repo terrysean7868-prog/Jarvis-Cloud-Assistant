@@ -170,7 +170,11 @@ def _load_agent_shared_secret_from_db() -> str:
         )
         if not doc:
             return ""
-        return _clean_cfg_str(doc.get("shared_secret") or doc.get("agent_shared_secret"))
+        raw = doc.get("shared_secret") or doc.get("agent_shared_secret") or ""
+        secret = str(raw).strip()
+        if len(secret) >= 2 and secret[0] == secret[-1] and secret[0] in ('"', "'"):
+            secret = secret[1:-1].strip()
+        return secret
     except Exception:
         return ""
 
