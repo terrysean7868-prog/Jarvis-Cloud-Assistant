@@ -3273,6 +3273,7 @@ export default function App() {
       {activeDisplay !== "autonomy" && (
         <JarvisDashboard
           isAuthenticated={isAuthenticated}
+          isDeviceConnected={isDeviceConnected}
           logs={logs}
           tasks={tasks}
           emotion={emotion}
@@ -3287,7 +3288,7 @@ export default function App() {
           agentCfgLoaded={agentCfgLoaded}
           agentCfgError={agentCfgError}
           onConnectPcAgent={connectPcAgent}
-          showConnectPcAgentButton={!isDeviceConnected}
+          showConnectPcAgentButton={true}
           systemInfo={systemInfo}
           themeColor={themeColor}
           onThemeColorChange={setThemeColor}

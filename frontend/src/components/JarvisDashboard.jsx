@@ -65,6 +65,7 @@ async function copyText(text) {
 
 export default function JarvisDashboard({
   isAuthenticated = false,
+  isDeviceConnected = false,
   logs = [],
   tasks = [],
   emotion = "calm",
@@ -85,6 +86,7 @@ export default function JarvisDashboard({
 }) {
   const [copyStatus, setCopyStatus] = useState(null);
   const [graphicsName, setGraphicsName] = useState("—");
+  const showStatusBadges = !isDeviceConnected;
 
   useEffect(() => {
     // Best-effort GPU renderer string (browser-side).
@@ -265,11 +267,25 @@ export default function JarvisDashboard({
               </div>
             )}
 
-            {showConnectPcAgentButton && (
-              <button className="jd-btn jd-connectBtn" onClick={onConnectPcAgent} disabled={typeof onConnectPcAgent !== "function"}>
-                Connect PC Agent
-              </button>
-            )}
+            <div className="jd-connectRow">
+              {showStatusBadges && (
+                <div className="jd-statusBadges" aria-label="Agent status">
+                  <div className="jd-statusBadge jd-statusBadgeWarning">System degraded</div>
+                  <div className="jd-statusBadge jd-statusBadgeDanger">Agent offline</div>
+                </div>
+              )}
+
+              {showConnectPcAgentButton && (
+                <button
+                  className="jd-btn jd-connectBtn"
+                  onClick={onConnectPcAgent}
+                  disabled={typeof onConnectPcAgent !== "function"}
+                  style={{ flex: isDeviceConnected ? "1 1 auto" : "1 1 260px" }}
+                >
+                  Connect PC Agent
+                </button>
+              )}
+            </div>
 
             <div className="jd-metricsGrid" aria-label="System metrics">
               <div className="jd-metric">

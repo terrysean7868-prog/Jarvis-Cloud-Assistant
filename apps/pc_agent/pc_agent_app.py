@@ -103,6 +103,21 @@ def _copy_text_to_clipboard(text: str) -> bool:
     s = str(text or "")
     if not s:
         return False
+
+    if os.name == "nt":
+        try:
+            import win32clipboard  # type: ignore
+
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(s, win32clipboard.CF_UNICODETEXT)
+            finally:
+                win32clipboard.CloseClipboard()
+            return True
+        except Exception:
+            pass
+
     try:
         import tkinter as tk
 
@@ -110,6 +125,7 @@ def _copy_text_to_clipboard(text: str) -> bool:
         root.withdraw()
         root.clipboard_clear()
         root.clipboard_append(s)
+        root.update_idletasks()
         root.update()
         root.destroy()
         return True
@@ -751,6 +767,7 @@ def run_ui() -> int:
                 <div id="logs" class="logs"></div>
                 <div class="toolbar">
                     <button class="btn" id="clear">Clear</button>
+                            <button class="btn" id="copyLogs">Copy Logs</button>
                     <span class="spacer"></span>
                     <div class="muted" id="last">—</div>
                 </div>
@@ -1085,6 +1102,20 @@ def run_ui() -> int:
                         toast('Cleared logs', 'good', 1200);
                     }).catch(function () {
                         toast('Clear failed', 'bad');
+                    });
+                };
+
+                $('copyLogs').onclick = function () {
+                    if (!ensureReady()) return;
+                    toast('Copying logs…', 'warn', 1200);
+                    window.pywebview.api.copy_logs().then(function (res) {
+                        if (res && res.ok) {
+                            toast('Logs copied', 'good', 1400);
+                        } else {
+                            toast('No logs to copy', 'bad', 1600);
+                        }
+                    }).catch(function () {
+                        toast('Copy failed', 'bad');
                     });
                 };
 

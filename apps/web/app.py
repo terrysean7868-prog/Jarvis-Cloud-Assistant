@@ -3976,11 +3976,16 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
 
     # Only expose the shared secret for local/dev setups.
     # In cloud mode, avoid leaking a global secret unless explicitly enabled.
-    allow_secret = bool(AGENT_SHARED_SECRET) and (not CLOUD_MODE or EXPOSE_AGENT_SHARED_SECRET or _is_local_request(request))
+    owner_device = _get_owner_device_id(username)
+    allow_secret = bool(AGENT_SHARED_SECRET) and (
+        (not CLOUD_MODE)
+        or EXPOSE_AGENT_SHARED_SECRET
+        or _is_local_request(request)
+        or role == "admin"
+        or (_normalize_device_id(owner_device or "") == _normalize_device_id(did))
+    )
     if allow_secret:
-        # If explicitly enabled in cloud mode, restrict to admins (unless it's a local request).
-        if (not CLOUD_MODE) or _is_local_request(request) or (role == "admin"):
-            payload["agent_shared_secret"] = AGENT_SHARED_SECRET
+        payload["agent_shared_secret"] = AGENT_SHARED_SECRET
 
     # Cache briefly to make refresh/login feel instant.
     try:

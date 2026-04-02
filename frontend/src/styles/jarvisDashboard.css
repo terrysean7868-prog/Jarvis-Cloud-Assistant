@@ -286,6 +286,45 @@
   margin-top: 12px;
 }
 
+.jd-connectRow {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.jd-statusBadges {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.jd-statusBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.jd-statusBadgeWarning {
+  background: rgba(255, 193, 7, 0.12);
+  border-color: rgba(255, 193, 7, 0.45);
+  color: #ffd86a;
+}
+
+.jd-statusBadgeDanger {
+  background: rgba(255, 77, 79, 0.12);
+  border-color: rgba(255, 77, 79, 0.45);
+  color: #ff9a9b;
+}
+
 .jd-toast {
   /* Fixed overlay so it doesn't push content and stays bottom-right on screen */
   position: fixed;
