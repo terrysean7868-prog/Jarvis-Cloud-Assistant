@@ -215,6 +215,33 @@ def _persist_agent_shared_secret_to_db(secret: str) -> None:
     except Exception:
         return
 
+
+def _ensure_agent_shared_secret() -> str:
+    """Ensure a non-empty shared secret is available and persisted."""
+    global AGENT_SHARED_SECRET
+
+    current = str(AGENT_SHARED_SECRET or "").strip()
+    if not current:
+        current = _load_agent_shared_secret_from_db()
+
+    if PC_AGENT_ENABLED and not current:
+        try:
+            current = secrets.token_urlsafe(32)
+        except Exception:
+            current = os.urandom(32).hex()
+
+    AGENT_SHARED_SECRET = str(current or "").strip()
+    if AGENT_SHARED_SECRET:
+        try:
+            hub = globals().get("device_hub")
+            if hub is not None and hasattr(hub, "_shared_secret"):
+                hub._shared_secret = AGENT_SHARED_SECRET
+        except Exception:
+            pass
+        _persist_agent_shared_secret_to_db(AGENT_SHARED_SECRET)
+
+    return AGENT_SHARED_SECRET
+
 # =========================================================
 # FastAPI Initialization
 # =========================================================
@@ -226,15 +253,7 @@ async def lifespan(_app: FastAPI):
     print("[OK] Jarvis server startup (lifespan)")
 
     try:
-        db_secret = _load_agent_shared_secret_from_db()
-        if db_secret:
-            global AGENT_SHARED_SECRET
-            AGENT_SHARED_SECRET = db_secret
-            try:
-                if hasattr(device_hub, "_shared_secret"):
-                    device_hub._shared_secret = db_secret
-            except Exception:
-                pass
+        _ensure_agent_shared_secret()
     except Exception:
         pass
 
@@ -257,7 +276,7 @@ async def lifespan(_app: FastAPI):
     try:
         database._ensure_connected()
         print("[DB] Connection check complete")
-        _persist_agent_shared_secret_to_db(AGENT_SHARED_SECRET)
+        _ensure_agent_shared_secret()
     except Exception as e:
         print(f"[INFO] DB error during startup (will retry): {e}")
 
@@ -2344,6 +2363,7 @@ if PC_AGENT_ENABLED and (not AGENT_SHARED_SECRET):
         AGENT_SHARED_SECRET = secrets.token_urlsafe(32)
     except Exception:
         AGENT_SHARED_SECRET = os.urandom(32).hex()
+_persist_agent_shared_secret_to_db(AGENT_SHARED_SECRET)
 
 device_hub = (
     DeviceHub(shared_secret=AGENT_SHARED_SECRET, broker=_BROKER, instance_id=jarvis_settings.instance_id)
@@ -3976,6 +3996,7 @@ async def agent_config(req: AgentConfigRequest, background_tasks: BackgroundTask
     that the PC agent can present over /ws/agent.
     """
     _require_pc_agent_enabled()
+    _ensure_agent_shared_secret()
     p = _require_authenticated_session(req.session_id)
     username = (p.get("username") or "").strip().lower()
     role = (p.get("role") or "user").strip().lower()

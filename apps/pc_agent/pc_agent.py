@@ -1115,11 +1115,11 @@ async def _execute_action(action: dict) -> dict:
             if last is not None and (now - last) < 4.0:
                 return {"status": "skipped", "action_type": t, "app": n, "message": "Skipped duplicate open_app"}
             _RECENT_APP_OPENS[n] = now
-            return mgr.open_app(name, action.get("args") or [])
+            return await asyncio.to_thread(mgr.open_app, name, action.get("args") or [])
         if t == "close_app":
-            return mgr.close_app(name)
+            return await asyncio.to_thread(mgr.close_app, name)
         if t == "switch_app":
-            return mgr.switch_to_app(name)
+            return await asyncio.to_thread(mgr.switch_to_app, name)
 
     if t == "list_running_apps":
         if not ALLOW_APP_CONTROL:
@@ -1128,7 +1128,7 @@ async def _execute_action(action: dict) -> dict:
         if not mgr:
             return {"status": "error", "action_type": t, "message": "App manager not available on this agent"}
         try:
-            apps = mgr.list_running_apps()
+            apps = await asyncio.to_thread(mgr.list_running_apps)
             return {"status": "success", "action_type": t, "apps": apps if isinstance(apps, list) else []}
         except Exception as e:
             return {"status": "error", "action_type": t, "message": str(e)}
