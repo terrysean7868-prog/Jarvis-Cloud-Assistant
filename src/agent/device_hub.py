@@ -296,10 +296,7 @@ class DeviceHub:
 
     async def is_connected(self, device_id: str) -> bool:
         async with self._lock:
-            if device_id in self._agents:
-                return True
-        reg = await self._get_registry(device_id)
-        return bool(isinstance(reg, dict) and (reg.get("instance_id") or reg.get("device_id")))
+            return device_id in self._agents
 
     async def send_job(self, device_id: str, job: Dict[str, Any]) -> None:
         """Send a job to the connected agent."""

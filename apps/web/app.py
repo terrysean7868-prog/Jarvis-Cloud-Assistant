@@ -2110,7 +2110,9 @@ async def _delegate_or_queue_cloud_action(
         out["plan_score"] = selected_score
         return out
 
-    if _is_agent_temporarily_unavailable(did):
+    agent_connected_now = bool(await device_hub.is_connected(did))
+
+    if _is_agent_temporarily_unavailable(did) and (not agent_connected_now):
         queued_steps = plan_steps[:1] if len(plan_steps) > 1 else plan_steps
         task = _queue_delegated_task(
             username=username,
@@ -2137,7 +2139,7 @@ async def _delegate_or_queue_cloud_action(
         out["plan_score"] = selected_score
         return out
 
-    if not await device_hub.is_connected(did):
+    if not agent_connected_now:
         queued_steps = plan_steps[:1] if len(plan_steps) > 1 else plan_steps
         task = _queue_delegated_task(
             username=username,
@@ -2186,14 +2188,28 @@ async def _delegate_or_queue_cloud_action(
         await_timeout_s=await_timeout_s,
     )
     if not payload:
-        _mark_agent_unavailable(did, reason="agent_response_timeout")
-        _retry_or_fail_delegated_task(running_task.get("task_id"), reason=str(plan_error or "agent_response_timeout"), fallback_status="queued_for_agent")
-        out = _cloud_envelope(
-            status="queued_for_agent",
-            execution={"feature": feature, "device_id": did, "plan": plan_steps},
-            result=None,
-            message="PC agent response timeout. Task queued for automatic retry.",
-        )
+        still_connected = bool(await device_hub.is_connected(did))
+        if not still_connected:
+            _mark_agent_unavailable(did, reason="agent_response_timeout")
+            _retry_or_fail_delegated_task(running_task.get("task_id"), reason=str(plan_error or "agent_response_timeout"), fallback_status="queued_for_agent")
+            out = _cloud_envelope(
+                status="queued_for_agent",
+                execution={"feature": feature, "device_id": did, "plan": plan_steps},
+                result=None,
+                message="PC agent response timeout. Task queued for automatic retry.",
+            )
+        else:
+            _mark_delegated_task(
+                task_id=running_task.get("task_id"),
+                status_value="failed",
+                extra={"error": str(plan_error or "agent_response_timeout")[:300]},
+            )
+            out = _cloud_envelope(
+                status="failed",
+                execution={"feature": feature, "device_id": did, "plan": plan_steps},
+                result=None,
+                message="PC agent did not return a result in time.",
+            )
         out["feature"] = feature
         out["device_id"] = did
         out["plan"] = plan_steps
@@ -4558,6 +4574,18 @@ async def device_dispatch(req: DeviceDispatchRequest):
     ]) or "device_action"
 
     did = None
+
+    def _connected_owner_device(owner_name: str | None, connected_ids: list[str]) -> str | None:
+        owner_norm = (owner_name or "").strip().lower()
+        if not owner_norm:
+            return None
+        for cid in connected_ids:
+            try:
+                if (_get_device_owner(cid) or "").strip().lower() == owner_norm:
+                    return cid
+            except Exception:
+                continue
+        return None
     if role == "admin":
         if req.device_id:
             did = _validate_device_id_or_400(req.device_id)
@@ -4603,6 +4631,19 @@ async def device_dispatch(req: DeviceDispatchRequest):
         if not did and DEVICE_OWNER_USERNAME and username == DEVICE_OWNER_USERNAME.lower():
             did = DEFAULT_DEVICE_ID
         if not did:
+            # Runtime alignment: if a websocket-connected device is already mapped to this owner,
+            # use it directly instead of entering awaiting_agent flow.
+            try:
+                connected_map = await device_hub.list_agents()
+                connected_ids = [str(k or "").strip().lower() for k in (connected_map or {}).keys() if str(k or "").strip()]
+                owner_connected = _connected_owner_device(username, connected_ids)
+                if owner_connected:
+                    did = owner_connected
+                    _OWNER_TO_DEVICE_CACHE[username] = (time.time(), did)
+            except Exception:
+                did = did or None
+
+        if not did:
             _log_requirement_event(
                 user_id=username,
                 device_id=None,
@@ -4633,6 +4674,32 @@ async def device_dispatch(req: DeviceDispatchRequest):
                 "action": "configure_pc",
                 "hint": "Configure a device via /api/user/device/configure (auto-pick) or /api/user/device/set (explicit device_id).",
             }
+
+    # Runtime alignment: stale owner-device links can diverge from active websocket device_id.
+    # If current did is not connected, prefer an active websocket device for the same owner.
+    try:
+        connected_map = await device_hub.list_agents()
+        connected_ids = [str(k or "").strip().lower() for k in (connected_map or {}).keys() if str(k or "").strip()]
+    except Exception:
+        connected_ids = []
+
+    did_norm = _normalize_device_id(did)
+    if did_norm and connected_ids and (did_norm not in connected_ids):
+        replacement = None
+        if role == "admin":
+            owner_hint = (req.owner_username or username).strip().lower() if (req.owner_username or username) else None
+            replacement = _connected_owner_device(owner_hint, connected_ids)
+            if (not replacement) and DEFAULT_DEVICE_ID and (_normalize_device_id(DEFAULT_DEVICE_ID) in connected_ids):
+                replacement = _normalize_device_id(DEFAULT_DEVICE_ID)
+            if (not replacement) and len(connected_ids) == 1:
+                replacement = connected_ids[0]
+        else:
+            replacement = _connected_owner_device(username, connected_ids)
+
+        if replacement:
+            did = replacement
+            if role != "admin":
+                _OWNER_TO_DEVICE_CACHE[username] = (time.time(), did)
 
     if not await device_hub.is_connected(did):
         _log_requirement_event(
@@ -5120,6 +5187,22 @@ async def device_permissions_get(session_id: str, device_id: str | None = None, 
                 },
             )
 
+    # Runtime alignment: if owner mapping is stale, prefer active websocket-connected owner device.
+    try:
+        connected_map = await device_hub.list_agents()
+        connected_ids = [str(k or "").strip().lower() for k in (connected_map or {}).keys() if str(k or "").strip()]
+    except Exception:
+        connected_ids = []
+    if connected_ids and _normalize_device_id(did) not in connected_ids:
+        owner_hint = (owner_username or username).strip().lower() if role == "admin" else username
+        for cid in connected_ids:
+            try:
+                if (_get_device_owner(cid) or "").strip().lower() == owner_hint:
+                    did = cid
+                    break
+            except Exception:
+                continue
+
     saved = _get_saved_device_permissions(did) or {}
     connected = False
     try:
@@ -5165,6 +5248,24 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
                     "hint": "Configure a device via /api/user/device/configure (auto-pick) or /api/user/device/set (explicit device_id).",
                 },
             )
+
+    # Runtime alignment: if owner mapping is stale, target active websocket-connected owner device.
+    try:
+        connected_map = await device_hub.list_agents()
+        connected_ids = [str(k or "").strip().lower() for k in (connected_map or {}).keys() if str(k or "").strip()]
+    except Exception:
+        connected_ids = []
+    if connected_ids and _normalize_device_id(did) not in connected_ids:
+        owner_hint = (req.owner_username or username).strip().lower() if role == "admin" else username
+        for cid in connected_ids:
+            try:
+                if (_get_device_owner(cid) or "").strip().lower() == owner_hint:
+                    did = cid
+                    if role != "admin":
+                        _OWNER_TO_DEVICE_CACHE[username] = (time.time(), did)
+                    break
+            except Exception:
+                continue
 
     perms = req.permissions or {}
     if not isinstance(perms, dict) or not perms:
@@ -5254,9 +5355,13 @@ async def device_permissions_grant(req: DevicePermissionsGrantRequest):
             details={"enabled": bool(enabled)},
         )
 
-    # Manual mode: permission grants do not auto-resume queued tasks.
+    try:
+        asyncio.create_task(_resume_pending_permission_delegations_for_device(did))
+        asyncio.create_task(_resume_queued_delegations_for_device(did))
+    except Exception:
+        pass
 
-    return {"status": "queued", "job": job, "device_id": did, "permissions": normalized}
+    return {"status": "delegated", "job": job, "device_id": did, "permissions": normalized}
 
 
 @app.get("/api/device/status")
@@ -5269,11 +5374,6 @@ async def device_status(session_id: str):
     health = await _collect_full_health_checks()
     if role == "admin":
         connected = bool(agents_by_id)
-        if (not connected) and DEFAULT_DEVICE_ID:
-            try:
-                connected = bool(await device_hub.is_connected(DEFAULT_DEVICE_ID))
-            except Exception:
-                connected = False
         return {
             "status": "success",
             "agents": list(agents_by_id.values()),
@@ -5310,23 +5410,6 @@ async def device_status(session_id: str):
         }
     agent = agents_by_id.get(did)
     connected = bool(agent)
-    if not connected:
-        try:
-            connected = bool(await device_hub.is_connected(did))
-        except Exception:
-            connected = False
-        if connected:
-            try:
-                remote_agent = await device_hub.get_agent(did)
-                if isinstance(remote_agent, dict):
-                    agent = {
-                        "device_id": did,
-                        "connected_at": remote_agent.get("connected_at"),
-                        "last_seen_at": remote_agent.get("last_seen_at"),
-                        "capabilities": remote_agent.get("capabilities") or {},
-                    }
-            except Exception:
-                pass
     return {
         "status": "success",
         "agents": ([agent] if agent else []),
