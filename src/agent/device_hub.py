@@ -150,12 +150,36 @@ class DeviceHub:
             pass
 
     async def _get_registry(self, device_id: str) -> Optional[dict]:
-        if not self._broker:
-            return None
-        try:
-            return await self._broker.get_json(f"agent_registry:{device_id}")
-        except Exception:
-            return None
+        reg: Optional[dict] = None
+        if self._broker:
+            try:
+                maybe = await self._broker.get_json(f"agent_registry:{device_id}")
+                if isinstance(maybe, dict):
+                    reg = maybe
+            except Exception:
+                reg = None
+
+        # Fallback to Mongo registry to keep status stable across short broker/poll gaps.
+        if not reg:
+            try:
+                db._ensure_connected()
+                if db.db is not None:
+                    row = db.db["device_registry"].find_one(
+                        {"device_id": device_id},
+                        {"_id": 0, "device_id": 1, "instance_id": 1, "connected": 1, "connected_at": 1, "last_seen_at": 1, "capabilities": 1},
+                    )
+                    if isinstance(row, dict) and bool(row.get("connected")):
+                        reg = {
+                            "device_id": row.get("device_id") or device_id,
+                            "instance_id": row.get("instance_id") or "",
+                            "connected_at": row.get("connected_at"),
+                            "last_seen_at": row.get("last_seen_at"),
+                            "capabilities": row.get("capabilities") or {},
+                        }
+            except Exception:
+                reg = reg or None
+
+        return reg
 
     async def register(self, device_id: str, secret: str, websocket: WebSocket, capabilities: Optional[Dict[str, Any]] = None) -> None:
         if not self._shared_secret:
@@ -275,7 +299,7 @@ class DeviceHub:
             if device_id in self._agents:
                 return True
         reg = await self._get_registry(device_id)
-        return bool(isinstance(reg, dict) and reg.get("instance_id"))
+        return bool(isinstance(reg, dict) and (reg.get("instance_id") or reg.get("device_id")))
 
     async def send_job(self, device_id: str, job: Dict[str, Any]) -> None:
         """Send a job to the connected agent."""

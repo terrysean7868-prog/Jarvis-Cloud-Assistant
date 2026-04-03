@@ -5268,6 +5268,11 @@ async def device_status(session_id: str):
     health = await _collect_full_health_checks()
     if role == "admin":
         connected = bool(agents_by_id)
+        if (not connected) and DEFAULT_DEVICE_ID:
+            try:
+                connected = bool(await device_hub.is_connected(DEFAULT_DEVICE_ID))
+            except Exception:
+                connected = False
         return {
             "status": "success",
             "agents": list(agents_by_id.values()),
@@ -5304,6 +5309,23 @@ async def device_status(session_id: str):
         }
     agent = agents_by_id.get(did)
     connected = bool(agent)
+    if not connected:
+        try:
+            connected = bool(await device_hub.is_connected(did))
+        except Exception:
+            connected = False
+        if connected:
+            try:
+                remote_agent = await device_hub.get_agent(did)
+                if isinstance(remote_agent, dict):
+                    agent = {
+                        "device_id": did,
+                        "connected_at": remote_agent.get("connected_at"),
+                        "last_seen_at": remote_agent.get("last_seen_at"),
+                        "capabilities": remote_agent.get("capabilities") or {},
+                    }
+            except Exception:
+                pass
     return {
         "status": "success",
         "agents": ([agent] if agent else []),

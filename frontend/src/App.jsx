@@ -172,10 +172,11 @@ export default function App() {
   const isDeviceConnected = deviceStatusConnected === true;
 
   const googleSttDisabledUntilRef = useRef(0);
-  const lastWakeNoSpeechLogRef = useRef(0);
   const wakeDisabledUntilRef = useRef(0);
   const wakePermissionHintedRef = useRef(false);
   const lastWakeDetectedAtRef = useRef(0);
+  const agentLastConnectedAtRef = useRef(0);
+  const agentOfflineMissesRef = useRef(0);
   const [voiceUnlocked, setVoiceUnlocked] = useState(() => !isMobile);
   const [vizAudioUnlocked, setVizAudioUnlocked] = useState(false);
 
@@ -1217,6 +1218,8 @@ export default function App() {
       setSystemInfo(null);
       setDeviceStatusConnected(false);
       setAgentOffline(false);
+      agentLastConnectedAtRef.current = 0;
+      agentOfflineMissesRef.current = 0;
       return;
     }
 
@@ -1240,8 +1243,21 @@ export default function App() {
           setSystemHealth(fullHealth);
         }
         const connected = !!status?.device_status?.connected;
-        setDeviceStatusConnected(connected);
-        setAgentOffline(!connected);
+        if (connected) {
+          agentLastConnectedAtRef.current = Date.now();
+          agentOfflineMissesRef.current = 0;
+          setDeviceStatusConnected(true);
+          setAgentOffline(false);
+        } else {
+          agentOfflineMissesRef.current = Number(agentOfflineMissesRef.current || 0) + 1;
+          const lastConnectedAt = Number(agentLastConnectedAtRef.current || 0);
+          const staleForMs = lastConnectedAt ? (Date.now() - lastConnectedAt) : Number.POSITIVE_INFINITY;
+          const shouldFlipOffline = agentOfflineMissesRef.current >= 3 && staleForMs > 15000;
+          if (shouldFlipOffline) {
+            setDeviceStatusConnected(false);
+            setAgentOffline(true);
+          }
+        }
         const agents = Array.isArray(status?.agents) ? status.agents : [];
         const sys = agents[0]?.capabilities?.system_info || null;
         if (sys && typeof sys === "object") {
@@ -2580,12 +2596,8 @@ export default function App() {
 
     let active = false;
     let startAttempts = 0;
-    let restartBurstCount = 0;
-    let restartBurstWindowStart = Date.now();
     let lastRestartLogAt = 0;
     let restartTimer = null;
-    let watchdogTimer = null;
-    let lastEventAt = Date.now();
 
     const scheduleStart = (ms, reason = "retry") => {
       try {
@@ -2596,23 +2608,10 @@ export default function App() {
 
     const safeStart = (reason = "manual") => {
       if (active) return;
+      if (isHandlingCommand.current) return;
+      if (speakingRef.current) return;
 
       const now = Date.now();
-      if ((now - restartBurstWindowStart) > 60_000) {
-        restartBurstWindowStart = now;
-        restartBurstCount = 0;
-      }
-      restartBurstCount += 1;
-      if (restartBurstCount > 20) {
-        wakeDisabledUntilRef.current = now + 30_000;
-        try { setWakeListeningOnline(false); } catch {}
-        if ((now - lastRestartLogAt) > 8_000) {
-          lastRestartLogAt = now;
-          addLog("system", "listener restarted too frequently; pausing for recovery.");
-        }
-        scheduleStart(31_000, "cooldown");
-        return;
-      }
 
       const disabledUntil = Number(wakeDisabledUntilRef.current || 0);
       if (disabledUntil && now < disabledUntil) {
@@ -2625,7 +2624,6 @@ export default function App() {
         recognizer.start();
         active = true;
         startAttempts = 0;
-        lastEventAt = Date.now();
         if ((Date.now() - lastRestartLogAt) > 5_000 && reason !== "manual") {
           lastRestartLogAt = Date.now();
           addLog("system", "listener restarted");
@@ -2635,8 +2633,8 @@ export default function App() {
         if (startAttempts < 6) {
           scheduleStart(400 + startAttempts * 200, "start_failed");
         } else {
-          wakeDisabledUntilRef.current = Date.now() + 10_000;
-          scheduleStart(10_500, "start_backoff");
+          // Keep retrying gently without hard offline flapping.
+          scheduleStart(3000, "start_backoff");
         }
       }
     };
@@ -2644,12 +2642,10 @@ export default function App() {
     recognizer.onstart = () => {
       active = true;
       try { setWakeListeningOnline(true); } catch {}
-      lastEventAt = Date.now();
     };
 
     recognizer.onresult = (e) => {
       try {
-        lastEventAt = Date.now();
         const result = e.results[e.resultIndex];
         const rawTranscript = (result[0].transcript || "").toString().trim();
         const transcript = normalizeWake(rawTranscript);
@@ -2718,8 +2714,9 @@ export default function App() {
 
     recognizer.onerror = async (ev) => {
       const errName = ev?.error || "unknown";
-      lastEventAt = Date.now();
-      addLog("system", `mic error: ${errName}`);
+      if (errName !== "no-speech" && errName !== "aborted") {
+        addLog("system", `mic error: ${errName}`);
+      }
 
       // Some errors are not recoverable without user action (permissions / missing mic).
       // Avoid an infinite restart loop that spams logs in packaged desktop builds.
@@ -2812,56 +2809,16 @@ export default function App() {
       // Reduce disruptive log spam; "no-speech"/"aborted" are common and not actionable.
       if (errName !== "no-speech" && errName !== "aborted") {
         addLog("system", `Wake listener error: ${errName}`);
-      } else {
-        const now = Date.now();
-        // Common idle/transition events; keep them very quiet.
-        if (now - lastWakeNoSpeechLogRef.current > 10 * 60 * 1000) {
-          lastWakeNoSpeechLogRef.current = now;
-          addLog("system", "Wake listener: idle (no speech)");
-        }
       }
       active = false;
-      try { setWakeListeningOnline(false); } catch {}
-      // restart with backoff
-      if (isAuthenticated) scheduleStart(errName === "aborted" ? 250 : 900, `error_${errName}`);
+      // no-speech ends only the current recognition pass; keep wake listener alive.
+      if (isAuthenticated) scheduleStart(errName === "aborted" ? 200 : 500, `error_${errName}`);
     };
 
     recognizer.onend = () => {
       active = false;
-      try { setWakeListeningOnline(false); } catch {}
-      lastEventAt = Date.now();
       if (!isHandlingCommand.current && isAuthenticated) scheduleStart(250, "onend");
     };
-
-    // Desktop/Electron/WebView builds sometimes end up with a "stuck" recognizer
-    // that stops emitting events but also doesn't reliably fire onend. Add a small
-    // watchdog so the user doesn't need to refresh the UI.
-    watchdogTimer = setInterval(() => {
-      try {
-        if (!isAuthenticated) return;
-        if (isHandlingCommand.current) return;
-        if (speakingRef.current) return;
-
-        const now = Date.now();
-        const quietMs = now - (lastEventAt || now);
-
-        // If nothing has happened for a while, restart recognition.
-        if (quietMs > 45_000) {
-          try { recognizer.stop(); } catch {}
-          active = false;
-          lastEventAt = now;
-          scheduleStart(1200, "watchdog_quiet");
-          return;
-        }
-
-        // If we are not active, attempt a gentle restart.
-        if (!active) {
-          scheduleStart(1200, "watchdog_inactive");
-        }
-      } catch {
-        // ignore
-      }
-    }, 12_000);
 
     // Start after a short delay to avoid slowing initial paint
     const startTimer = setTimeout(() => safeStart("boot"), 120);
@@ -2873,9 +2830,6 @@ export default function App() {
       clearTimeout(startTimer);
       try {
         if (restartTimer) clearTimeout(restartTimer);
-      } catch {}
-      try {
-        if (watchdogTimer) clearInterval(watchdogTimer);
       } catch {}
       try {
         setWakeListeningOnline(false);

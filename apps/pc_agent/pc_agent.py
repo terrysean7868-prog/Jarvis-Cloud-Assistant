@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+import base64
 import json
 import os
 import sys
@@ -306,6 +307,23 @@ def _resolve_device_id(override_device_id: str | None = None) -> str:
     if host_did:
         return host_did
     return "primary"
+
+
+def _token_device_id_unverified(token: str | None) -> str:
+    raw = str(token or "").strip()
+    if not raw or raw.count(".") < 2:
+        return ""
+    try:
+        payload_part = raw.split(".")[1]
+        pad = "=" * (-len(payload_part) % 4)
+        decoded = base64.urlsafe_b64decode((payload_part + pad).encode("utf-8"))
+        payload = json.loads(decoded.decode("utf-8", errors="ignore"))
+        if not isinstance(payload, dict):
+            return ""
+        did = str(payload.get("device_id") or payload.get("sub") or "").strip().lower()
+        return did
+    except Exception:
+        return ""
 
 
 def _inspect_system_state() -> dict:
@@ -2020,6 +2038,13 @@ async def run_agent(
     if not agent_token and not selected_shared_secret:
         raise SystemExit("Missing agent auth. Provide --token (recommended) or --shared-secret.")
 
+    if agent_token:
+        token_did = _token_device_id_unverified(agent_token)
+        if token_did and selected_device_id and token_did != selected_device_id:
+            raise SystemExit(
+                f"Token/device mismatch: token is bound to '{token_did}' but selected device_id is '{selected_device_id}'. Clear token and request a new /api/agent/config token for this device."
+            )
+
     print(f"[AGENT] Connecting to {ws_url} as device_id={selected_device_id}", flush=True)
 
     stop_event = asyncio.Event()
@@ -2196,8 +2221,14 @@ async def run_agent(
                 except Exception:
                     pass
                 print(f"[AGENT] Connection error: {msg}", flush=True)
+                ml = (msg or "").lower()
+                if "server rejected connection:" in ml and (
+                    "invalid_agent_token" in ml
+                    or "device_not_authorized" in ml
+                    or "invalid_shared_secret" in ml
+                ):
+                    raise SystemExit(msg)
                 try:
-                    ml = msg.lower()
                     if (
                         "refused" in ml
                         or "connect call failed" in ml
@@ -2210,7 +2241,7 @@ async def run_agent(
                         )
                 except Exception:
                     pass
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
