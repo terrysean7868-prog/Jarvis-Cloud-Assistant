@@ -309,6 +309,14 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        async def _await_shutdown(coro):
+            try:
+                await coro
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         # Shutdown
         if SCHEDULER_AVAILABLE and shutdown_scheduler:
             try:
@@ -317,37 +325,30 @@ async def lifespan(_app: FastAPI):
                 pass
 
         # Best-effort cleanup for async HTTP sessions.
-        try:
-            await _shutdown_cleanup()
-        except Exception:
-            pass
+        await _await_shutdown(_shutdown_cleanup())
 
         # Broker shutdown (best-effort)
-        try:
-            await notification_hub.shutdown()
-        except Exception:
-            pass
+        await _await_shutdown(notification_hub.shutdown())
         try:
             if hasattr(device_hub, "shutdown"):
-                await device_hub.shutdown()
+                await _await_shutdown(device_hub.shutdown())
         except Exception:
             pass
         try:
             if _BROKER is not None:
-                await _BROKER.close()
+                await _await_shutdown(_BROKER.close())
         except Exception:
             pass
 
-        try:
-            await autonomy_runtime.stop()
-        except Exception:
-            pass
+        await _await_shutdown(autonomy_runtime.stop())
 
         global _STABILITY_MONITOR_TASK
         if _STABILITY_MONITOR_TASK and not _STABILITY_MONITOR_TASK.done():
             _STABILITY_MONITOR_TASK.cancel()
             try:
                 await _STABILITY_MONITOR_TASK
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
             _STABILITY_MONITOR_TASK = None
@@ -5680,6 +5681,8 @@ async def _shutdown_cleanup():
         llm = getattr(brain, "llm", None)
         if llm and hasattr(llm, "close"):
             await llm.close()
+    except asyncio.CancelledError:
+        pass
     except Exception:
         pass
 
@@ -5688,6 +5691,8 @@ async def _shutdown_cleanup():
         from src.internet.web_scraper import close_scraper
 
         await close_scraper()
+    except asyncio.CancelledError:
+        pass
     except Exception:
         pass
 

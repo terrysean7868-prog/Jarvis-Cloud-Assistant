@@ -155,6 +155,15 @@ class LLMAdapter:
 
     @staticmethod
     def _resolve_local_reasoner_state_path() -> Path:
+        configured = str(getattr(rd, "LOCAL_REASONER_STATE_FILE", "") or "").strip()
+        if configured:
+            try:
+                return Path(configured).expanduser().resolve()
+            except Exception:
+                try:
+                    return Path(configured)
+                except Exception:
+                    pass
         try:
             root = Path(__file__).resolve().parents[2]
         except Exception:
@@ -224,6 +233,87 @@ class LLMAdapter:
             p.write_text(json.dumps(self._local_reasoner_state, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    @staticmethod
+    def _extract_user_scope_key(user_prefs: dict | None) -> str | None:
+        if not isinstance(user_prefs, dict):
+            return None
+        candidates = (
+            user_prefs.get("user_id"),
+            user_prefs.get("uid"),
+            user_prefs.get("username"),
+            user_prefs.get("email"),
+            user_prefs.get("sub"),
+        )
+        for raw in candidates:
+            token = str(raw or "").strip().lower()
+            if token:
+                token = re.sub(r"[^a-z0-9._:@-]+", "_", token)
+                token = token.strip("_")
+                if token:
+                    return token
+        return None
+
+    def _load_local_reasoner_state_for_key(self, state_key: str) -> dict:
+        default_state = self._default_local_reasoner_state()
+        key = str(state_key or "global").strip().lower() or "global"
+
+        if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
+            try:
+                data = db.local_reasoner_state_get(key)
+                if isinstance(data, dict):
+                    if "stats" not in data:
+                        data["stats"] = {"learn_events": 0, "hits": 0}
+                    if "cycles" not in data:
+                        data["cycles"] = []
+                    return data
+            except Exception:
+                pass
+
+        try:
+            if key == "global":
+                p = self._local_reasoner_state_path
+                if p.exists():
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        if "stats" not in data:
+                            data["stats"] = {"learn_events": 0, "hits": 0}
+                        if "cycles" not in data:
+                            data["cycles"] = []
+                        return data
+        except Exception:
+            pass
+
+        return default_state
+
+    def _ensure_local_reasoner_state_scope(self, user_prefs: dict | None) -> None:
+        configured_key = self._resolve_local_reasoner_state_key()
+        target_key = configured_key
+
+        if configured_key == "user":
+            user_key = self._extract_user_scope_key(user_prefs)
+            target_key = f"user:{user_key}" if user_key else "global"
+
+        target_key = str(target_key or "global").strip().lower() or "global"
+        if target_key == self._local_reasoner_state_key and isinstance(self._local_reasoner_state, dict):
+            return
+
+        target_state = self._load_local_reasoner_state_for_key(target_key)
+
+        # For first-time user scopes in DB mode, seed from global context.
+        if target_key.startswith("user:") and bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
+            try:
+                existing = db.local_reasoner_state_get(target_key)
+                if not isinstance(existing, dict):
+                    seed = self._load_local_reasoner_state_for_key("global")
+                    if isinstance(seed, dict):
+                        target_state = json.loads(json.dumps(seed))
+            except Exception:
+                pass
+
+        self._local_reasoner_state_key = target_key
+        self._local_reasoner_state = target_state if isinstance(target_state, dict) else self._default_local_reasoner_state()
+        self._save_local_reasoner_state()
 
     def _local_reasoner_daily_maintenance(self) -> None:
         if not bool(getattr(rd, "LOCAL_REASONER_LEARNING_ENABLED", True)):
@@ -3120,7 +3210,15 @@ class LLMAdapter:
             return False
 
         primary_intent = LLMAdapter._classify_primary_intent(user_text)
-        if primary_intent in {"action_intent", "generation_intent", "clarification_intent"}:
+        is_high_level_analysis = False
+        try:
+            is_high_level_analysis = LLMAdapter._is_high_level_analysis_task(user_text)
+        except Exception:
+            is_high_level_analysis = False
+
+        if primary_intent in {"action_intent", "generation_intent"}:
+            return False
+        if primary_intent == "clarification_intent" and not is_high_level_analysis:
             return False
 
         # If global factual mode is enabled, default to web-first for non-local informational queries.
@@ -3155,7 +3253,7 @@ class LLMAdapter:
         # Only trigger web for analysis when the user explicitly requests research/sources
         # or when the topic is time-sensitive.
         try:
-            if LLMAdapter._is_high_level_analysis_task(user_text):
+            if is_high_level_analysis:
                 analysis_web_triggers = (
                     "research",
                     "do research",
@@ -3322,7 +3420,14 @@ class LLMAdapter:
             if tl.startswith("you are ") or ("provided web context" in tl):
                 return parsed
 
-            if LLMAdapter._classify_primary_intent(user_text) != "informational_intent":
+            primary_intent = LLMAdapter._classify_primary_intent(user_text)
+            is_high_level_analysis = False
+            try:
+                is_high_level_analysis = LLMAdapter._is_high_level_analysis_task(user_text)
+            except Exception:
+                is_high_level_analysis = False
+
+            if primary_intent != "informational_intent" and not is_high_level_analysis:
                 return parsed
 
             if not LLMAdapter._should_use_web_lookup(user_text):
@@ -3524,7 +3629,8 @@ class LLMAdapter:
         # We only do this when we did NOT match a deterministic PC command above.
         try:
             if (mode or "").lower() == "voice":
-                if primary_intent == "informational_intent" and self._should_use_web_lookup(text):
+                is_analysis = self._is_high_level_analysis_task(text)
+                if (primary_intent == "informational_intent" or is_analysis) and self._should_use_web_lookup(text):
                     parsed = {"text": "Looking it up online.", "actions": []}
                     try:
                         parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
