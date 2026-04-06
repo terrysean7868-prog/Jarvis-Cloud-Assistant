@@ -7,9 +7,8 @@ import re
 import random
 import time
 import logging
-from copy import deepcopy
 from urllib.parse import quote_plus
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pathlib import Path
 from src.utils.db import db
@@ -112,7 +111,6 @@ class LLMAdapter:
         self._last_provider_notice_at = 0.0
         self._recent_intents: list[dict] = []
         self.learning_engine = SelfLearningEngine(cooldown_seconds=60) if SelfLearningEngine is not None else None
-        self._runtime_task_contexts: dict[str, dict] = {}
 
     async def _call_ollama_chat(
         self,
@@ -185,201 +183,7 @@ class LLMAdapter:
                 "hits": 0,
             },
             "cycles": [],
-            "user_habits": {},
         }
-
-    @staticmethod
-    def _default_user_habits_bucket() -> dict:
-        return {
-            "frequent_apps": {},
-            "common_actions": {},
-            "preferred_workflows": [],
-            "repeated_patterns": {},
-            "updated_at": "",
-        }
-
-    def _ensure_local_reasoner_defaults(self, data: dict | None) -> dict:
-        out = data if isinstance(data, dict) else self._default_local_reasoner_state()
-        if "stats" not in out:
-            out["stats"] = {"learn_events": 0, "hits": 0}
-        if "cycles" not in out:
-            out["cycles"] = []
-        if "user_habits" not in out or not isinstance(out.get("user_habits"), dict):
-            out["user_habits"] = {}
-        # Ensure habit buckets loaded from DB/files include all expected fields.
-        try:
-            normalized: dict[str, dict] = {}
-            for k, v in (out.get("user_habits") or {}).items():
-                if not isinstance(v, dict):
-                    normalized[str(k)] = self._default_user_habits_bucket()
-                    continue
-                b = {**self._default_user_habits_bucket(), **v}
-                if not isinstance(b.get("frequent_apps"), dict):
-                    b["frequent_apps"] = {}
-                if not isinstance(b.get("common_actions"), dict):
-                    b["common_actions"] = {}
-                if not isinstance(b.get("preferred_workflows"), list):
-                    b["preferred_workflows"] = []
-                if not isinstance(b.get("repeated_patterns"), dict):
-                    b["repeated_patterns"] = {}
-                normalized[str(k)] = b
-            out["user_habits"] = normalized
-        except Exception:
-            pass
-        return out
-
-    def _user_habits_key(self, user_prefs: dict | None) -> str:
-        u = self._extract_user_scope_key(user_prefs)
-        return str(u or "global")
-
-    def _get_user_habits_bucket(self, user_prefs: dict | None) -> dict:
-        st = self._ensure_local_reasoner_defaults(self._local_reasoner_state)
-        buckets = st.get("user_habits") if isinstance(st.get("user_habits"), dict) else {}
-        key = self._user_habits_key(user_prefs)
-        bucket = buckets.get(key) if isinstance(buckets.get(key), dict) else self._default_user_habits_bucket()
-        buckets[key] = bucket
-        st["user_habits"] = buckets
-        self._local_reasoner_state = st
-        return bucket
-
-    @staticmethod
-    def _normalize_pattern_tokens(actions: list[dict]) -> list[str]:
-        toks: list[str] = []
-        for a in (actions or [])[:4]:
-            if not isinstance(a, dict):
-                continue
-            at = str(a.get("type") or "").strip().lower()
-            if at in {"open_app", "switch_app", "close_app"}:
-                app = str(a.get("app_name") or "").strip().lower()
-                toks.append(f"{at}:{app}" if app else at)
-            elif at == "device_action":
-                nm = str(a.get("name") or "").strip().lower()
-                toks.append(f"device_action:{nm}" if nm else "device_action")
-            else:
-                toks.append(at)
-        return [t for t in toks if t]
-
-    def _update_user_habits_from_step(self, *, user_prefs: dict | None, user_text: str, actions: list[dict], success: bool) -> None:
-        try:
-            if not bool(getattr(rd, "LOCAL_REASONER_LEARNING_ENABLED", True)):
-                return
-            if not isinstance(actions, list) or not actions:
-                return
-
-            bucket = self._get_user_habits_bucket(user_prefs)
-            apps = bucket.get("frequent_apps") if isinstance(bucket.get("frequent_apps"), dict) else {}
-            common = bucket.get("common_actions") if isinstance(bucket.get("common_actions"), dict) else {}
-            patterns = bucket.get("repeated_patterns") if isinstance(bucket.get("repeated_patterns"), dict) else {}
-
-            action_tokens = self._normalize_pattern_tokens(actions)
-            for tok in action_tokens:
-                common[tok] = int(common.get(tok) or 0) + 1
-
-            for a in actions:
-                if not isinstance(a, dict):
-                    continue
-                at = str(a.get("type") or "").strip().lower()
-                if at in {"open_app", "switch_app"}:
-                    app = str(a.get("app_name") or "").strip().lower()
-                    if app:
-                        apps[app] = int(apps.get(app) or 0) + 1
-
-            if success:
-                key = " -> ".join(action_tokens[:3]).strip()
-                if key:
-                    patterns[key] = int(patterns.get(key) or 0) + 1
-
-            workflow = {
-                "goal": self._infer_high_level_goal(user_text=user_text, actions=actions),
-                "pattern": " -> ".join(action_tokens[:3]),
-                "hits": int(patterns.get(" -> ".join(action_tokens[:3])) or 0),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            preferred = bucket.get("preferred_workflows") if isinstance(bucket.get("preferred_workflows"), list) else []
-            preferred = [w for w in preferred if not (isinstance(w, dict) and str(w.get("pattern") or "") == str(workflow.get("pattern") or ""))]
-            preferred.insert(0, workflow)
-
-            bucket["frequent_apps"] = dict(sorted(apps.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:12])
-            bucket["common_actions"] = dict(sorted(common.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:20])
-            bucket["repeated_patterns"] = dict(sorted(patterns.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:20])
-            bucket["preferred_workflows"] = preferred[:8]
-            bucket["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-            buckets = self._local_reasoner_state.get("user_habits") if isinstance(self._local_reasoner_state.get("user_habits"), dict) else {}
-            buckets[self._user_habits_key(user_prefs)] = bucket
-            self._local_reasoner_state["user_habits"] = buckets
-
-            stats = self._local_reasoner_state.get("stats") if isinstance(self._local_reasoner_state.get("stats"), dict) else {}
-            stats["learn_events"] = int(stats.get("learn_events") or 0) + 1
-            self._local_reasoner_state["stats"] = stats
-            self._save_local_reasoner_state()
-        except Exception:
-            pass
-
-    def _user_habits_prompt_block(self, user_prefs: dict | None) -> str:
-        try:
-            bucket = self._get_user_habits_bucket(user_prefs)
-            apps = list((bucket.get("frequent_apps") or {}).keys())[:3]
-            actions = list((bucket.get("common_actions") or {}).keys())[:4]
-            flows = [str((w or {}).get("pattern") or "") for w in (bucket.get("preferred_workflows") or []) if isinstance(w, dict)]
-            flows = [f for f in flows if f][:2]
-            if not apps and not actions and not flows:
-                return "(none)"
-            return (
-                f"frequent_apps: {', '.join(apps) if apps else '(none)'}\n"
-                f"common_actions: {', '.join(actions) if actions else '(none)'}\n"
-                f"preferred_workflows: {', '.join(flows) if flows else '(none)'}"
-            )
-        except Exception:
-            return "(none)"
-
-    def _personalize_next_possible_actions(self, *, base_actions: list[str], user_prefs: dict | None, context_state: dict | None) -> list[str]:
-        base = [str(x).strip() for x in (base_actions or []) if str(x).strip()]
-        try:
-            bucket = self._get_user_habits_bucket(user_prefs)
-            preferred = bucket.get("preferred_workflows") if isinstance(bucket.get("preferred_workflows"), list) else []
-            common = bucket.get("common_actions") if isinstance(bucket.get("common_actions"), dict) else {}
-            personalized: list[str] = []
-
-            last_action = str((context_state or {}).get("last_action") or "").strip().lower()
-            for wf in preferred[:4]:
-                if not isinstance(wf, dict):
-                    continue
-                pat = str(wf.get("pattern") or "").strip().lower()
-                if not pat or not last_action:
-                    continue
-                parts = [p.strip() for p in pat.split("->") if p.strip()]
-                for i, part in enumerate(parts[:-1]):
-                    if last_action in part:
-                        nxt = parts[i + 1]
-                        if nxt.startswith("open_app:"):
-                            app = nxt.split(":", 1)[1].strip()
-                            if app:
-                                personalized.append(f"open {app}")
-                        elif nxt.startswith("web_search"):
-                            personalized.append("refine search")
-                        elif nxt.startswith("type_text"):
-                            personalized.append("compose message")
-                        elif nxt:
-                            personalized.append(nxt.replace("_", " "))
-
-            for k in list(common.keys())[:6]:
-                kk = str(k or "").strip().lower()
-                if kk.startswith("device_action:set_volume"):
-                    personalized.append("adjust volume")
-                elif kk.startswith("open_url"):
-                    personalized.append("open your usual site")
-
-            merged = []
-            for x in personalized + base:
-                sx = str(x).strip()
-                if sx and sx.lower() not in {m.lower() for m in merged}:
-                    merged.append(sx)
-                if len(merged) >= 2:
-                    break
-            return merged or base[:2]
-        except Exception:
-            return base[:2]
 
     def _load_local_reasoner_state(self) -> dict:
         state = self._default_local_reasoner_state()
@@ -388,29 +192,24 @@ class LLMAdapter:
             try:
                 data = db.local_reasoner_state_get(self._local_reasoner_state_key)
                 if isinstance(data, dict):
-                    return self._ensure_local_reasoner_defaults(data)
-                logger.warning(
-                    "[local_reasoner.persistence] DB enabled but no state found for key=%s; falling back to file/default",
-                    self._local_reasoner_state_key,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[local_reasoner.persistence] DB read failed for key=%s: %s; falling back to file/default",
-                    self._local_reasoner_state_key,
-                    str(e),
-                )
+                    if "stats" not in data:
+                        data["stats"] = {"learn_events": 0, "hits": 0}
+                    if "cycles" not in data:
+                        data["cycles"] = []
+                    return data
+            except Exception:
+                pass
 
         try:
             p = self._local_reasoner_state_path
             if p.exists():
-                if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)) and bool(self.cloud_mode):
-                    logger.warning(
-                        "[local_reasoner.persistence] Cloud mode using local file fallback for reasoner state: %s",
-                        str(p),
-                    )
                 data = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    return self._ensure_local_reasoner_defaults(data)
+                    if "stats" not in data:
+                        data["stats"] = {"learn_events": 0, "hits": 0}
+                    if "cycles" not in data:
+                        data["cycles"] = []
+                    return data
         except Exception:
             pass
 
@@ -426,31 +225,14 @@ class LLMAdapter:
                 )
                 if ok:
                     return
-                logger.warning(
-                    "[local_reasoner.persistence] DB upsert returned false for key=%s; using file fallback",
-                    self._local_reasoner_state_key,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[local_reasoner.persistence] DB upsert failed for key=%s: %s; using file fallback",
-                    self._local_reasoner_state_key,
-                    str(e),
-                )
+            except Exception:
+                pass
         try:
             p = self._local_reasoner_state_path
             p.parent.mkdir(parents=True, exist_ok=True)
-            if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)) and bool(self.cloud_mode):
-                logger.warning(
-                    "[local_reasoner.persistence] Cloud mode writing local reasoner file fallback: %s",
-                    str(p),
-                )
             p.write_text(json.dumps(self._local_reasoner_state, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.warning(
-                "[local_reasoner.persistence] Local file fallback write failed for key=%s: %s",
-                self._local_reasoner_state_key,
-                str(e),
-            )
+        except Exception:
+            pass
 
     @staticmethod
     def _extract_user_scope_key(user_prefs: dict | None) -> str | None:
@@ -480,31 +262,25 @@ class LLMAdapter:
             try:
                 data = db.local_reasoner_state_get(key)
                 if isinstance(data, dict):
-                    return self._ensure_local_reasoner_defaults(data)
-                logger.warning(
-                    "[local_reasoner.persistence] DB enabled but no state found for key=%s; falling back to file/default",
-                    key,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[local_reasoner.persistence] DB read failed for key=%s: %s; falling back to file/default",
-                    key,
-                    str(e),
-                )
+                    if "stats" not in data:
+                        data["stats"] = {"learn_events": 0, "hits": 0}
+                    if "cycles" not in data:
+                        data["cycles"] = []
+                    return data
+            except Exception:
+                pass
 
         try:
             if key == "global":
                 p = self._local_reasoner_state_path
                 if p.exists():
-                    if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)) and bool(self.cloud_mode):
-                        logger.warning(
-                            "[local_reasoner.persistence] Cloud mode using local file fallback for key=%s: %s",
-                            key,
-                            str(p),
-                        )
                     data = json.loads(p.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
-                        return self._ensure_local_reasoner_defaults(data)
+                        if "stats" not in data:
+                            data["stats"] = {"learn_events": 0, "hits": 0}
+                        if "cycles" not in data:
+                            data["cycles"] = []
+                        return data
         except Exception:
             pass
 
@@ -1780,11 +1556,14 @@ class LLMAdapter:
                 "response_strategy": "clarify",
             }
 
-        primary_intent = LLMAdapter._classify_primary_intent(user_text)
-        direct_action = primary_intent == "action_intent"
-        generation_intent = primary_intent == "generation_intent"
-        informational = primary_intent == "informational_intent"
-
+        direct_action = bool(
+            re.search(
+                r"\b(open|launch|start|run|execute|close|quit|switch\s+to|focus|go\s+to|"
+                r"set\s+|turn\s+on|turn\s+off|enable|disable|restart|shutdown|lock\s+screen|"
+                r"take\s+(a\s+)?screenshot|capture\s+screen)\b",
+                tl,
+            )
+        )
         goal_oriented = bool(
             re.search(
                 r"\b(i\s+want\s+to|help\s+me\s+to|learn|improve|fix|achieve|master|"
@@ -1792,19 +1571,18 @@ class LLMAdapter:
                 tl,
             )
         )
-        ambiguous = bool(primary_intent == "clarification_intent")
-        if not ambiguous:
-            ambiguous = bool(
-                re.fullmatch(r"(do it|do this|do that|same|continue|go ahead|it|that|this)\.?", tl)
-                or (wc <= 2 and not direct_action and not goal_oriented and not informational)
-            )
+        informational = bool(
+            re.search(r"\b(what|why|how|when|where|which|who)\b", tl)
+            or re.search(r"\b(explain|define|meaning|overview)\b", tl)
+        )
+        ambiguous = bool(
+            re.fullmatch(r"(do it|do this|do that|same|continue|go ahead|it|that|this)\.?", tl)
+            or (wc <= 2 and not direct_action and not goal_oriented and not informational)
+        )
 
         if direct_action:
             intent_type = "direct_action"
             strategy = "execute_immediately"
-        elif generation_intent:
-            intent_type = "goal_oriented" if goal_oriented else "informational"
-            strategy = "explain_plus_plan_plus_optional_execution" if goal_oriented else "concise_explanation_only"
         elif goal_oriented:
             intent_type = "goal_oriented"
             strategy = "explain_plus_plan_plus_optional_execution"
@@ -1829,815 +1607,6 @@ class LLMAdapter:
             "intent_depth": depth,
             "response_strategy": strategy,
         }
-
-    @staticmethod
-    def _default_runtime_task_context() -> dict:
-        return {
-            "active_app": "",
-            "last_entity": "",
-            "last_action": "",
-            "last_result": "",
-            "last_result_status": "",
-            "task_chain": [],
-            "task_active": False,
-            "task_goal": "",
-            "task_step": 0,
-            "task_status": "",
-            "next_possible_actions": [],
-            "goal_progress": 0.0,
-            "proactive_mode": "assist",
-            "expires_at": "",
-            "updated_at": "",
-            "last_resolved_input": "",
-        }
-
-    @staticmethod
-    def _resolve_proactive_mode(user_prefs: dict | None, context_state: dict | None) -> str:
-        valid = {"manual", "assist", "auto"}
-        if isinstance(user_prefs, dict):
-            cand = str(user_prefs.get("proactive_mode") or user_prefs.get("assistant_mode") or "").strip().lower()
-            if cand in valid:
-                return cand
-        if isinstance(context_state, dict):
-            cand = str(context_state.get("proactive_mode") or "").strip().lower()
-            if cand in valid:
-                return cand
-        return "assist"
-
-    @staticmethod
-    def _is_explicit_execution_confirmation(user_text: str) -> bool:
-        tl = str(user_text or "").strip().lower()
-        if not tl:
-            return False
-        return bool(re.search(r"\b(go ahead|continue|execute|run it|proceed|yes do it|confirm)\b", tl))
-
-    @staticmethod
-    def _is_interrupt_instruction(user_text: str) -> bool:
-        tl = str(user_text or "").strip().lower()
-        if not tl:
-            return False
-        return bool(re.search(r"\b(stop|cancel|pause|hold|abort|never mind|forget that|forget it)\b", tl))
-
-    def _looks_like_new_task(self, user_text: str, context_state: dict | None) -> bool:
-        tl = str(user_text or "").strip().lower()
-        if not tl:
-            return False
-        if not isinstance(context_state, dict) or not bool(context_state.get("task_active")):
-            return False
-        if self._looks_like_continuation_request(tl) or self._is_explicit_execution_confirmation(tl):
-            return False
-        if self._is_interrupt_instruction(tl):
-            return False
-
-        active_app = str(context_state.get("active_app") or "").strip().lower()
-        new_action_intent = self._classify_primary_intent(tl) == "action_intent"
-        mentions_active_app = bool(active_app and re.search(rf"\b{re.escape(active_app)}\b", tl))
-        return bool(new_action_intent and not mentions_active_app)
-
-    def _override_active_task_context(self, *, context_state: dict, reason: str, user_prefs: dict | None) -> dict:
-        st = deepcopy(context_state if isinstance(context_state, dict) else self._default_runtime_task_context())
-        now = datetime.now(timezone.utc)
-        st["task_active"] = False
-        st["task_status"] = "paused" if reason == "interrupt" else "replaced"
-        st["task_goal"] = ""
-        st["task_step"] = 0
-        st["next_possible_actions"] = []
-        st["updated_at"] = now.isoformat()
-        st["expires_at"] = (now + timedelta(seconds=self._runtime_context_ttl_seconds())).isoformat()
-        self._set_runtime_task_context(user_prefs, st)
-        return st
-
-    @staticmethod
-    def _extract_url_from_result_payload(payload: dict | None) -> str:
-        if not isinstance(payload, dict):
-            return ""
-        url = str(payload.get("url") or "").strip()
-        if url:
-            return url
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        if isinstance(data, dict):
-            url = str(data.get("url") or "").strip()
-            if url:
-                return url
-        results = payload.get("results") if isinstance(payload.get("results"), list) else []
-        for item in results[:3]:
-            if isinstance(item, dict):
-                url = str(item.get("url") or "").strip()
-                if url:
-                    return url
-        return ""
-
-    def _derive_auto_next_action(self, context_state: dict | None) -> dict | None:
-        if not isinstance(context_state, dict):
-            return None
-        if not bool(context_state.get("task_active")):
-            return None
-
-        next_actions = context_state.get("next_possible_actions") if isinstance(context_state.get("next_possible_actions"), list) else []
-        hint = str(next_actions[0] if next_actions else "").strip().lower()
-        active_app = str(context_state.get("active_app") or "").strip()
-        last_result = context_state.get("last_result") if isinstance(context_state.get("last_result"), dict) else {}
-
-        if "open best result" in hint:
-            url = self._extract_url_from_result_payload(last_result)
-            if url:
-                return {"type": "open_url", "url": url}
-
-        if "verify system result" in hint and active_app:
-            return {"type": "switch_app", "app_name": active_app}
-
-        if "continue to next step" in hint and active_app:
-            return {"type": "switch_app", "app_name": active_app}
-
-        return None
-
-    @staticmethod
-    def _runtime_context_ttl_seconds() -> int:
-        try:
-            ttl = int(getattr(rd, "RUNTIME_TASK_CONTEXT_TTL_SECONDS", 1800) or 1800)
-            return max(120, ttl)
-        except Exception:
-            return 1800
-
-    @staticmethod
-    def _is_runtime_context_expired(context_state: dict | None) -> bool:
-        if not isinstance(context_state, dict):
-            return True
-        raw = str(context_state.get("expires_at") or "").strip()
-        if not raw:
-            return False
-        try:
-            expires_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            return datetime.now(timezone.utc) >= expires_at.astimezone(timezone.utc)
-        except Exception:
-            return False
-
-    def _runtime_task_context_scope(self, user_prefs: dict | None) -> str:
-        try:
-            user_key = self._extract_user_scope_key(user_prefs)
-            if user_key:
-                return f"user:{user_key}"
-        except Exception:
-            pass
-        return "global"
-
-    def _get_runtime_task_context(self, user_prefs: dict | None) -> dict:
-        key = self._runtime_task_context_scope(user_prefs)
-        state = self._runtime_task_contexts.get(key)
-        if (not isinstance(state, dict)) or self._is_runtime_context_expired(state):
-            state = self._default_runtime_task_context()
-            self._runtime_task_contexts[key] = state
-        return state
-
-    def _set_runtime_task_context(self, user_prefs: dict | None, context_state: dict) -> None:
-        key = self._runtime_task_context_scope(user_prefs)
-        self._runtime_task_contexts[key] = context_state if isinstance(context_state, dict) else self._default_runtime_task_context()
-
-    @staticmethod
-    def _extract_context_entity(user_text: str) -> str:
-        t = str(user_text or "").strip()
-        if not t:
-            return ""
-        for pat in (
-            r'"([^\"]{2,80})"',
-            r"'([^']{2,80})'",
-            r"\bto\s+([a-zA-Z0-9._@-]{2,80})\b",
-            r"\bfor\s+([a-zA-Z0-9._@-]{2,80})\b",
-        ):
-            m = re.search(pat, t, flags=re.IGNORECASE)
-            if m:
-                return str(m.group(1) or "").strip()
-        return ""
-
-    @staticmethod
-    def _looks_like_continuation_request(user_text: str) -> bool:
-        tl = str(user_text or "").strip().lower()
-        if not tl:
-            return False
-        if re.search(r"\b(this|that|same|continue|it|again)\b", tl):
-            return True
-        return bool(re.fullmatch(r"(do it|do this|do that|same|continue|go ahead)\.?", tl))
-
-    def _resolve_contextual_user_text(self, user_text: str, context_state: dict | None) -> str:
-        text = str(user_text or "").strip()
-        if not text or not isinstance(context_state, dict):
-            return text
-
-        active_app = str(context_state.get("active_app") or "").strip()
-        last_entity = str(context_state.get("last_entity") or "").strip()
-        last_action = str(context_state.get("last_action") or "").strip()
-
-        resolved = text
-        if last_entity:
-            resolved = re.sub(r"\b(this\s+person|this\s+contact|that\s+person|that\s+contact)\b", last_entity, resolved, flags=re.IGNORECASE)
-
-        if self._looks_like_continuation_request(text):
-            hints: list[str] = []
-            if active_app:
-                hints.append(f"active_app={active_app}")
-            if last_entity:
-                hints.append(f"last_entity={last_entity}")
-            if last_action:
-                hints.append(f"last_action={last_action}")
-            if hints:
-                resolved = f"{resolved}\nContext hints: {'; '.join(hints)}"
-
-        return resolved
-
-    @staticmethod
-    def _runtime_context_prompt_block(context_state: dict | None) -> str:
-        if not isinstance(context_state, dict):
-            return "(none)"
-        chain = context_state.get("task_chain") if isinstance(context_state.get("task_chain"), list) else []
-        recent_chain = chain[-3:]
-        chain_lines = []
-        for item in recent_chain:
-            if not isinstance(item, dict):
-                continue
-            chain_lines.append(
-                f"- input={str(item.get('input') or '').strip()} | actions={str(item.get('actions') or '').strip()} | result={str(item.get('result') or '').strip()}"
-            )
-        if not chain_lines:
-            chain_lines = ["- (none)"]
-        return (
-            f"active_app: {str(context_state.get('active_app') or '(none)')}\n"
-            f"last_entity: {str(context_state.get('last_entity') or '(none)')}\n"
-            f"last_action: {str(context_state.get('last_action') or '(none)')}\n"
-            f"last_result: {str(context_state.get('last_result') or '(none)')}\n"
-            f"last_result_status: {str(context_state.get('last_result_status') or '(none)')}\n"
-            f"task_active: {str(bool(context_state.get('task_active'))).lower()}\n"
-            f"task_goal: {str(context_state.get('task_goal') or '(none)')}\n"
-            f"task_step: {int(context_state.get('task_step') or 0)}\n"
-            f"task_status: {str(context_state.get('task_status') or '(none)')}\n"
-            f"goal_progress: {float(context_state.get('goal_progress') or 0.0):.2f}\n"
-            f"next_possible_actions: {', '.join([str(x) for x in (context_state.get('next_possible_actions') or [])[:2]]) or '(none)'}\n"
-            "task_chain:\n"
-            + "\n".join(chain_lines)
-        )
-
-    @staticmethod
-    def _infer_task_goal(user_text: str, planning_text: str) -> str:
-        base = str(user_text or "").strip() or str(planning_text or "").strip()
-        if not base:
-            return ""
-        goal = re.sub(r"\s+", " ", base).strip()
-        goal = re.sub(r"(?i)\b(please|jarvis|can you|could you|would you)\b", "", goal).strip()
-        if len(goal) > 140:
-            goal = goal[:140].rstrip(" ,.;:")
-        return goal
-
-    @staticmethod
-    def _infer_high_level_goal(user_text: str, actions: list[dict] | None = None) -> str:
-        text = str(user_text or "").strip().lower()
-        acts = actions if isinstance(actions, list) else []
-        action_types = {
-            str(a.get("type") or "").strip().lower()
-            for a in acts
-            if isinstance(a, dict)
-        }
-
-        if re.search(r"\b(message|chat|email|mail|reply|call|contact)\b", text):
-            return "communicate"
-        if re.search(r"\b(search|research|find|look\s+up|analyz|compare|docs|documentation)\b", text):
-            return "research"
-        if re.search(r"\b(write|draft|compose|format|rewrite|summarize|create\s+content)\b", text):
-            return "create_content"
-        if re.search(r"\b(file|folder|read|write|edit|delete|move|copy|path)\b", text):
-            return "file_management"
-        if re.search(r"\b(open|launch|switch|set|turn\s+on|turn\s+off|settings|device|system)\b", text):
-            return "system_control"
-
-        if "web_search" in action_types or "fetch_url" in action_types:
-            return "research"
-        if "type_text" in action_types or "generate_email" in action_types:
-            return "create_content"
-        if {"read", "write", "edit", "delete", "move", "copy"} & action_types:
-            return "file_management"
-        if {"open_app", "switch_app", "device_action", "open_url"} & action_types:
-            return "system_control"
-
-        return "assist"
-
-    @staticmethod
-    def _estimate_goal_progress(*, task_status: str, task_step: int, prev_progress: float) -> float:
-        status = str(task_status or "").strip().lower()
-        if status == "completed":
-            return 1.0
-        if status == "failed":
-            return max(0.05, min(0.9, float(prev_progress or 0.0)))
-        if task_step <= 0:
-            return max(0.0, min(0.2, float(prev_progress or 0.0)))
-        inferred = min(0.9, 0.2 + (0.2 * max(0, int(task_step) - 1)))
-        return max(float(prev_progress or 0.0), inferred)
-
-    @staticmethod
-    def _compute_next_possible_actions(*, goal: str, last_action: str, status: str) -> list[str]:
-        s = str(status or "").strip().lower()
-        if s == "failed":
-            return [
-                "retry with safer fallback",
-                "switch to a simpler step",
-            ]
-
-        g = str(goal or "").strip().lower()
-        la = str(last_action or "").strip().lower()
-
-        if "web_search" in la or "fetch_url" in la or g == "research":
-            return ["open best result", "refine query"]
-        if "open_app" in la or "switch_app" in la or g == "communicate":
-            return ["send a message", "start a call"]
-        if g == "create_content" or "type_text" in la:
-            return ["refine draft", "send or save output"]
-        if g == "file_management" or any(x in la for x in ["read", "write", "edit", "list", "delete"]):
-            return ["apply next file change", "verify file state"]
-        if g == "system_control" or "device_action" in la:
-            return ["apply next setting", "verify system result"]
-        return ["continue to next step", "review result"]
-
-    @staticmethod
-    def _execution_result_success(item: dict) -> bool | None:
-        if not isinstance(item, dict):
-            return None
-        if isinstance(item.get("success"), bool):
-            return bool(item.get("success"))
-        st = str(item.get("status") or "").strip().lower()
-        if st in {"success", "completed", "done", "opened", "sent", "ok"}:
-            return True
-        if st in {"failed", "error", "denied", "timeout", "forbidden"}:
-            return False
-        return None
-
-    @staticmethod
-    def _execution_result_message(item: dict) -> str:
-        if not isinstance(item, dict):
-            return ""
-        msg = (
-            str(item.get("message") or "").strip()
-            or str(item.get("error") or "").strip()
-            or str(item.get("detail") or "").strip()
-        )
-        return msg
-
-    @staticmethod
-    def _looks_generic_completion_text(text: str) -> bool:
-        tl = str(text or "").strip().lower()
-        if not tl:
-            return True
-        return tl in {
-            "done",
-            "done.",
-            "opening it.",
-            "opening it",
-            "applying that setting.",
-            "i am on it.",
-        }
-
-    def ingest_execution_feedback(
-        self,
-        *,
-        user_text: str,
-        response: dict,
-        execution_results: list[dict] | None,
-        user_prefs: dict | None = None,
-    ) -> dict:
-        """Ingest real ActionExecutor results to refine context and final user response.
-
-        Integration point: call after executor completes and before final response return.
-        """
-        out = dict(response or {})
-        results = execution_results if isinstance(execution_results, list) else []
-        if not results:
-            return out
-
-        success_count = 0
-        fail_count = 0
-        first_success = None
-        first_fail = None
-        for r in results:
-            if not isinstance(r, dict):
-                continue
-            ok = self._execution_result_success(r)
-            if ok is True:
-                success_count += 1
-                if first_success is None:
-                    first_success = r
-            elif ok is False:
-                fail_count += 1
-                if first_fail is None:
-                    first_fail = r
-
-        primary = first_fail if first_fail is not None else first_success
-        primary_message = self._execution_result_message(primary or {})
-
-        # Update runtime context with actual execution outcomes.
-        try:
-            ctx = deepcopy(self._get_runtime_task_context(user_prefs))
-            status = "failed" if fail_count > 0 and success_count == 0 else "success"
-            if fail_count > 0 and success_count > 0:
-                status = "failed"
-
-            ctx["updated_at"] = datetime.now(timezone.utc).isoformat()
-            ctx["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=self._runtime_context_ttl_seconds())).isoformat()
-            ctx["last_result"] = primary if isinstance(primary, dict) else {"message": primary_message or "execution finished"}
-            ctx["last_result_status"] = status
-            if bool(ctx.get("task_active")):
-                ctx["task_status"] = "failed" if status == "failed" else "in_progress"
-            if status == "failed":
-                ctx["next_possible_actions"] = self._compute_next_possible_actions(
-                    goal=str(ctx.get("task_goal") or ""),
-                    last_action=str(ctx.get("last_action") or ""),
-                    status="failed",
-                )[:2]
-                ctx["goal_progress"] = max(0.05, float(ctx.get("goal_progress") or 0.0) - 0.1)
-            else:
-                ctx["next_possible_actions"] = self._compute_next_possible_actions(
-                    goal=str(ctx.get("task_goal") or ""),
-                    last_action=str(ctx.get("last_action") or ""),
-                    status="in_progress",
-                )[:2]
-                ctx["goal_progress"] = min(1.0, float(ctx.get("goal_progress") or 0.0) + 0.2)
-
-            ctx["next_possible_actions"] = self._personalize_next_possible_actions(
-                base_actions=ctx.get("next_possible_actions") if isinstance(ctx.get("next_possible_actions"), list) else [],
-                user_prefs=user_prefs,
-                context_state=ctx,
-            )[:2]
-
-            exec_actions = out.get("actions") if isinstance(out.get("actions"), list) else []
-            self._update_user_habits_from_step(
-                user_prefs=user_prefs,
-                user_text=user_text,
-                actions=exec_actions,
-                success=(status == "success"),
-            )
-
-            self._set_runtime_task_context(user_prefs, ctx)
-        except Exception:
-            pass
-
-        # Improve final user-facing text with real execution feedback.
-        try:
-            current_text = str(out.get("text") or "").strip()
-            if primary_message:
-                if fail_count > 0 and success_count == 0:
-                    out["text"] = f"{primary_message}. Trying an alternative path."
-                elif self._looks_generic_completion_text(current_text):
-                    out["text"] = primary_message
-            elif fail_count > 0 and success_count == 0 and self._looks_generic_completion_text(current_text):
-                out["text"] = "Execution failed. Trying an alternative path."
-        except Exception:
-            pass
-
-        return out
-
-    @staticmethod
-    def _infer_result_status(text_result: str, has_actions: bool) -> str:
-        tl = str(text_result or "").strip().lower()
-        if re.search(r"\b(fail|failed|error|denied|unable|cannot|can't|could not|timeout)\b", tl):
-            return "failed"
-        if has_actions or re.search(r"\b(done|completed|finished|sent|opened|applied|success|successful)\b", tl):
-            return "success"
-        return ""
-
-    @staticmethod
-    def _is_task_completion_text(text_result: str) -> bool:
-        tl = str(text_result or "").strip().lower()
-        if not tl:
-            return False
-        return bool(re.search(r"\b(completed|finished|all set|done|resolved|successfully)\b", tl))
-
-    @staticmethod
-    def _suggest_next_task_step(context_state: dict, parsed: dict) -> str:
-        if not isinstance(context_state, dict):
-            return ""
-        status = str(context_state.get("task_status") or "").strip().lower()
-        step = int(context_state.get("task_step") or 0)
-        active = bool(context_state.get("task_active"))
-        next_actions = context_state.get("next_possible_actions") if isinstance(context_state.get("next_possible_actions"), list) else []
-        if status == "failed":
-            options = ", ".join([str(x) for x in next_actions[:2]]) if next_actions else "retry with safer fallback"
-            return f"I can recover automatically: {options}. Would you like me to continue?"
-        if not active:
-            return ""
-        if next_actions:
-            if len(next_actions) > 1:
-                return f"Based on your usual flow, the best next options are {next_actions[0]} or {next_actions[1]}."
-            return f"Based on your usual flow, the best next option is {next_actions[0]}."
-        actions = parsed.get("actions") if isinstance(parsed, dict) else []
-        if isinstance(actions, list) and actions:
-            return f"Step {step} is queued. I can continue to step {step + 1} next."
-        return "I can continue with the next step when you say continue."
-
-    @staticmethod
-    def _apply_assistant_personality_tone(text: str, *, task_active: bool, mode: str) -> str:
-        t = str(text or "").strip()
-        if not t:
-            return t
-        if not task_active:
-            return t
-        if mode not in {"assist", "auto"}:
-            return t
-        tl = t.lower().strip()
-        if tl in {"done", "done.", "completed", "completed."}:
-            return "Done. I can keep this flow going for you."
-        if tl in {"opening it.", "opening it"}:
-            return "Opening it now. I can handle the next step too."
-        if tl in {"applying that setting.", "applying that setting"}:
-            return "Applying that setting now."
-        return t
-
-    def _apply_confidence_execution_control(
-        self,
-        *,
-        user_text: str,
-        parsed: dict,
-        context_state: dict | None,
-        planning_confidence: float | None,
-    ) -> dict:
-        if not isinstance(parsed, dict):
-            return parsed
-        actions = parsed.get("actions")
-        if not isinstance(actions, list) or not actions:
-            return parsed
-
-        confidence = planning_confidence if isinstance(planning_confidence, (int, float)) else None
-        if confidence is None:
-            confidence = 0.7
-
-        try:
-            threshold = float(getattr(rd, "CONTEXT_EXECUTION_MIN_CONFIDENCE", 0.35) or 0.35)
-        except Exception:
-            threshold = 0.35
-
-        risky = False
-        risky_device_names = {"shutdown", "restart", "sleep", "hibernate", "logoff"}
-        for a in actions:
-            if not isinstance(a, dict):
-                continue
-            at = str(a.get("type") or "").strip().lower()
-            if at in {"execute_command", "delete"}:
-                risky = True
-                break
-            if at in {"write", "edit"} and bool(context_state and context_state.get("task_active")):
-                risky = True
-                break
-            if at == "device_action":
-                name = str(a.get("name") or "").strip().lower()
-                if name in risky_device_names:
-                    risky = True
-                    break
-
-        if risky and float(confidence) < threshold:
-            parsed["actions"] = []
-            parsed["text"] = (
-                "I understood the task, but confidence is low for a safe execution. "
-                "Please confirm and I will continue with a guarded next step."
-            )
-            parsed["task_status_hint"] = "low_confidence_hold"
-        return parsed
-
-    @staticmethod
-    def _action_label_for_context(action: dict) -> str:
-        if not isinstance(action, dict):
-            return ""
-        t = str(action.get("type") or "").strip().lower()
-        if not t:
-            return ""
-        if t in {"open_app", "switch_app", "close_app"}:
-            name = str(action.get("app_name") or "").strip()
-            return f"{t}:{name}" if name else t
-        if t == "device_action":
-            name = str(action.get("name") or "").strip()
-            return f"device_action:{name}" if name else "device_action"
-        if t in {"web_search", "fetch_url", "open_url", "read", "write", "edit", "list", "delete"}:
-            arg = str(action.get("query") or action.get("url") or action.get("path") or "").strip()
-            return f"{t}:{arg[:60]}" if arg else t
-        return t
-
-    def _apply_context_to_actions(self, user_text: str, parsed: dict, context_state: dict | None) -> dict:
-        if not isinstance(parsed, dict):
-            return parsed
-        actions = parsed.get("actions")
-        if not isinstance(actions, list) or not isinstance(context_state, dict):
-            return parsed
-
-        active_app = str(context_state.get("active_app") or "").strip()
-        continuation = self._looks_like_continuation_request(user_text)
-        patched_actions = [dict(a) if isinstance(a, dict) else a for a in actions]
-
-        for act in patched_actions:
-            if not isinstance(act, dict):
-                continue
-            t = str(act.get("type") or "").strip().lower()
-            if t in {"switch_app", "close_app"} and not str(act.get("app_name") or "").strip() and active_app:
-                act["app_name"] = active_app
-
-        if continuation and active_app:
-            has_focus_action = any(
-                isinstance(a, dict) and str(a.get("type") or "").strip().lower() in {"open_app", "switch_app"}
-                for a in patched_actions
-            )
-            has_interaction = any(
-                isinstance(a, dict) and str(a.get("type") or "").strip().lower() in {"type_text", "press_key", "hotkey", "device_action"}
-                for a in patched_actions
-            )
-            if has_interaction and not has_focus_action:
-                patched_actions.insert(0, {"type": "switch_app", "app_name": active_app})
-
-        parsed["actions"] = patched_actions
-        return parsed
-
-    def _update_runtime_task_context(self, *, user_text: str, planning_text: str, parsed: dict, user_prefs: dict | None) -> None:
-        context_state = deepcopy(self._get_runtime_task_context(user_prefs))
-        actions = parsed.get("actions") if isinstance(parsed, dict) else []
-        if not isinstance(actions, list):
-            actions = []
-
-        now = datetime.now(timezone.utc)
-        context_state["updated_at"] = now.isoformat()
-        context_state["expires_at"] = (now + timedelta(seconds=self._runtime_context_ttl_seconds())).isoformat()
-        context_state["last_resolved_input"] = str(planning_text or user_text or "").strip()
-
-        entity = self._extract_context_entity(user_text)
-        if not entity and planning_text and planning_text != user_text:
-            entity = self._extract_context_entity(planning_text)
-        if entity:
-            context_state["last_entity"] = entity
-
-        for act in actions:
-            if not isinstance(act, dict):
-                continue
-            t = str(act.get("type") or "").strip().lower()
-            if t in {"open_app", "switch_app"}:
-                app_name = str(act.get("app_name") or "").strip()
-                if app_name:
-                    context_state["active_app"] = app_name
-            elif t == "open_url":
-                context_state["active_app"] = "browser"
-
-        if actions:
-            labels = [self._action_label_for_context(a) for a in actions if isinstance(a, dict)]
-            labels = [x for x in labels if x]
-            if labels:
-                context_state["last_action"] = labels[-1]
-            chain = context_state.get("task_chain") if isinstance(context_state.get("task_chain"), list) else []
-            chain.append(
-                {
-                    "ts": context_state["updated_at"],
-                    "input": str(user_text or "").strip()[:220],
-                    "actions": labels[:6],
-                    "result": str((parsed or {}).get("text") or "").strip()[:220],
-                }
-            )
-            context_state["task_chain"] = chain[-8:]
-
-        has_actions = bool(actions)
-        result_text = str((parsed or {}).get("text") or "").strip()
-        result_status = self._infer_result_status(result_text, has_actions)
-        if result_status:
-            context_state["last_result_status"] = result_status
-
-        task_goal = str(context_state.get("task_goal") or "").strip()
-        task_active = bool(context_state.get("task_active"))
-        task_step = int(context_state.get("task_step") or 0)
-
-        if has_actions and not task_goal:
-            task_goal = self._infer_high_level_goal(user_text=user_text, actions=actions)
-            if not task_goal:
-                task_goal = self._infer_task_goal(user_text=user_text, planning_text=planning_text)
-
-        if has_actions:
-            task_active = True
-            task_step = max(1, task_step + 1)
-            context_state["task_status"] = "failed" if result_status == "failed" else "in_progress"
-        else:
-            if task_active and result_status == "failed":
-                context_state["task_status"] = "failed"
-            elif task_active and self._is_task_completion_text(result_text):
-                context_state["task_status"] = "completed"
-                task_active = False
-
-        context_state["task_active"] = bool(task_active)
-        context_state["task_goal"] = task_goal
-        context_state["task_step"] = int(task_step)
-        context_state["goal_progress"] = self._estimate_goal_progress(
-            task_status=str(context_state.get("task_status") or ""),
-            task_step=int(context_state.get("task_step") or 0),
-            prev_progress=float(context_state.get("goal_progress") or 0.0),
-        )
-        base_next = self._compute_next_possible_actions(
-            goal=str(context_state.get("task_goal") or ""),
-            last_action=str(context_state.get("last_action") or ""),
-            status=str(context_state.get("task_status") or ""),
-        )
-        context_state["next_possible_actions"] = self._personalize_next_possible_actions(
-            base_actions=base_next,
-            user_prefs=user_prefs,
-            context_state=context_state,
-        )[:2]
-
-        text_result = str((parsed or {}).get("text") or "").strip()
-        if text_result:
-            context_state["last_result"] = self._first_sentences(text_result, max_sentences=1)[:220]
-
-        self._set_runtime_task_context(user_prefs, context_state)
-
-        self._update_user_habits_from_step(
-            user_prefs=user_prefs,
-            user_text=user_text,
-            actions=actions,
-            success=(str(context_state.get("last_result_status") or "").strip().lower() != "failed"),
-        )
-
-    def _finalize_response_with_context(
-        self,
-        *,
-        user_text: str,
-        planning_text: str,
-        parsed: dict,
-        user_prefs: dict | None,
-    ) -> dict:
-        out = parsed if isinstance(parsed, dict) else {"text": str(parsed or ""), "actions": []}
-        if not isinstance(out.get("actions"), list):
-            out["actions"] = []
-        if "text" not in out:
-            out["text"] = ""
-
-        planning_confidence = out.pop("_planning_confidence", None)
-        proactive_mode = out.pop("_proactive_mode", None)
-
-        try:
-            runtime_ctx = self._get_runtime_task_context(user_prefs)
-            out = self._apply_context_to_actions(user_text=user_text, parsed=out, context_state=runtime_ctx)
-        except Exception:
-            pass
-
-        try:
-            runtime_ctx = self._get_runtime_task_context(user_prefs)
-            mode = str(proactive_mode or self._resolve_proactive_mode(user_prefs, runtime_ctx)).strip().lower()
-            runtime_ctx["proactive_mode"] = mode if mode in {"manual", "assist", "auto"} else "assist"
-            self._set_runtime_task_context(user_prefs, runtime_ctx)
-
-            # manual mode: require explicit user confirmation before each executable step.
-            if mode == "manual":
-                acts = out.get("actions") if isinstance(out.get("actions"), list) else []
-                if acts and not self._is_explicit_execution_confirmation(user_text):
-                    out["actions"] = []
-                    out["text"] = "I am in manual mode. Confirm and I will execute the next step."
-
-            # auto mode: continue only when task is active, confidence high, and next step is obvious/safe.
-            if mode == "auto":
-                acts = out.get("actions") if isinstance(out.get("actions"), list) else []
-                conf = float(planning_confidence if isinstance(planning_confidence, (int, float)) else 0.7)
-                threshold = float(getattr(rd, "PROACTIVE_AUTO_MIN_CONFIDENCE", 0.75) or 0.75)
-                if (not acts) and bool(runtime_ctx.get("task_active")) and conf >= threshold:
-                    nxt = self._derive_auto_next_action(runtime_ctx)
-                    if isinstance(nxt, dict) and nxt.get("type"):
-                        out["actions"] = [nxt]
-                        base = str(out.get("text") or "").strip()
-                        out["text"] = (base + "\n\nAuto mode: continuing with the next step.").strip() if base else "Auto mode: continuing with the next step."
-
-            out = self._apply_confidence_execution_control(
-                user_text=user_text,
-                parsed=out,
-                context_state=runtime_ctx,
-                planning_confidence=planning_confidence,
-            )
-        except Exception:
-            pass
-
-        try:
-            self._update_runtime_task_context(
-                user_text=user_text,
-                planning_text=planning_text,
-                parsed=out,
-                user_prefs=user_prefs,
-            )
-        except Exception:
-            pass
-
-        try:
-            runtime_ctx = self._get_runtime_task_context(user_prefs)
-            suggestion = self._suggest_next_task_step(runtime_ctx, out)
-            txt = str(out.get("text") or "").strip()
-            low = txt.lower()
-            if bool(runtime_ctx.get("task_active")) and suggestion and ("next step" not in low) and ("want me to continue" not in low):
-                out["text"] = (txt + "\n\nNext step: " + suggestion).strip()
-        except Exception:
-            pass
-
-        try:
-            runtime_ctx = self._get_runtime_task_context(user_prefs)
-            mode = str(runtime_ctx.get("proactive_mode") or "assist").strip().lower()
-            out["text"] = self._apply_assistant_personality_tone(
-                str(out.get("text") or ""),
-                task_active=bool(runtime_ctx.get("task_active")),
-                mode=mode,
-            )
-        except Exception:
-            pass
-
-        return out
 
     @staticmethod
     def _build_goal_oriented_plan_response(user_text: str, user_prefs: dict | None = None) -> dict | None:
@@ -4536,89 +3505,6 @@ class LLMAdapter:
             return parsed
 
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
-        original_text = str(text or "")
-        try:
-            self._ensure_local_reasoner_state_scope(user_prefs)
-        except Exception:
-            pass
-
-        runtime_task_context = self._get_runtime_task_context(user_prefs)
-        habits_block = self._user_habits_prompt_block(user_prefs)
-        proactive_mode = self._resolve_proactive_mode(user_prefs, runtime_task_context)
-        runtime_task_context["proactive_mode"] = proactive_mode
-        self._set_runtime_task_context(user_prefs, runtime_task_context)
-
-        # Smart waiting: with no input, continue only when safe in auto mode; otherwise wait.
-        if not str(original_text or "").strip():
-            if proactive_mode == "auto" and bool(runtime_task_context.get("task_active")):
-                nxt = self._derive_auto_next_action(runtime_task_context)
-                if isinstance(nxt, dict) and nxt.get("type"):
-                    return self._finalize_response_with_context(
-                        user_text="",
-                        planning_text="",
-                        parsed={
-                            "text": "Auto mode: continuing safely.",
-                            "actions": [nxt],
-                            "source": "proactive-auto-wait",
-                            "_planning_confidence": 0.9,
-                            "_proactive_mode": proactive_mode,
-                        },
-                        user_prefs=user_prefs,
-                    )
-            return self._finalize_response_with_context(
-                user_text="",
-                planning_text="",
-                parsed={
-                    "text": "Waiting for your next instruction.",
-                    "actions": [],
-                    "source": "proactive-wait",
-                    "_planning_confidence": 1.0,
-                    "_proactive_mode": proactive_mode,
-                },
-                user_prefs=user_prefs,
-            )
-
-        # Interrupt handling + multi-task control.
-        if bool(runtime_task_context.get("task_active")):
-            if self._is_interrupt_instruction(original_text):
-                runtime_task_context = self._override_active_task_context(
-                    context_state=runtime_task_context,
-                    reason="interrupt",
-                    user_prefs=user_prefs,
-                )
-            elif self._looks_like_new_task(original_text, runtime_task_context):
-                runtime_task_context = self._override_active_task_context(
-                    context_state=runtime_task_context,
-                    reason="replace",
-                    user_prefs=user_prefs,
-                )
-
-        planning_text = self._resolve_contextual_user_text(original_text, runtime_task_context)
-        text = planning_text or original_text
-
-        if runtime_task_context:
-            context_block = self._runtime_context_prompt_block(runtime_task_context)
-            context = (
-                f"{(context or '').strip()}\n\n"
-                "[RUNTIME_TASK_CONTEXT]\n"
-                f"{context_block}\n\n"
-                "[USER_HABITS_MEMORY]\n"
-                f"{habits_block}"
-            ).strip()
-
-        def _finalize(parsed: dict) -> dict:
-            try:
-                if isinstance(parsed, dict):
-                    parsed["_proactive_mode"] = proactive_mode
-            except Exception:
-                pass
-            return self._finalize_response_with_context(
-                user_text=original_text,
-                planning_text=text,
-                parsed=parsed,
-                user_prefs=user_prefs,
-            )
-
         try:
             mixed = self._build_mixed_intent_generation_first_response(text)
             if isinstance(mixed, dict):
@@ -4631,7 +3517,7 @@ class LLMAdapter:
                     mixed["emotion"] = mixed.get("emotion") or self._infer_emotion(mixed.get("text") or text)
                 except Exception:
                     pass
-                return _finalize(mixed)
+                return mixed
         except Exception:
             pass
 
@@ -4651,16 +3537,16 @@ class LLMAdapter:
                         goal_plan["emotion"] = goal_plan.get("emotion") or self._infer_emotion(goal_plan.get("text") or text)
                     except Exception:
                         pass
-                    return _finalize(goal_plan)
+                    return goal_plan
         except Exception:
             pass
 
         try:
-            repeated = self._get_cached_response(original_text, max_age_s=240)
+            repeated = self._get_cached_response(text, max_age_s=240)
             if isinstance(repeated, dict) and not (repeated.get("actions") or []):
                 repeated_text = str(repeated.get("text") or "").strip()
                 if repeated_text and primary_intent in {"generation_intent", "action_intent", "clarification_intent"}:
-                    return _finalize({
+                    return {
                         "text": self._compact_repeat_reply(text, repeated_text),
                         "actions": [],
                         "source": "repeat-aware-cache",
@@ -4669,7 +3555,7 @@ class LLMAdapter:
                             "model": "local-fast-path",
                             "fallback_used": True,
                         },
-                    })
+                    }
         except Exception:
             pass
 
@@ -4686,7 +3572,7 @@ class LLMAdapter:
                         deterministic_action["emotion"] = deterministic_action.get("emotion") or self._infer_emotion(deterministic_action.get("text") or text)
                     except Exception:
                         pass
-                    return _finalize(deterministic_action)
+                    return deterministic_action
             except Exception:
                 pass
 
@@ -4704,7 +3590,7 @@ class LLMAdapter:
                         generated["emotion"] = generated.get("emotion") or self._infer_emotion(generated.get("text") or text)
                     except Exception:
                         pass
-                    return _finalize(generated)
+                    return generated
             except Exception:
                 pass
 
@@ -4725,7 +3611,7 @@ class LLMAdapter:
                 str(quick.get("source") or "deterministic-local-chat"),
                 (text or "")[:80].replace("\n", " "),
             )
-            return _finalize(quick)
+            return quick
 
         """
         Generate a rich, humanlike structured response.
@@ -4734,6 +3620,11 @@ class LLMAdapter:
         This method handles: Goal (detect intent) + Plan (generate actions)
         Execution, evaluation, and improvement are handled by callers after agent runs.
         """
+        try:
+            self._ensure_local_reasoner_state_scope(user_prefs)
+        except Exception:
+            pass
+
         # Voice + web-worthy requests: do web_search first (better UX, fewer hallucinations).
         # We only do this when we did NOT match a deterministic PC command above.
         try:
@@ -4747,7 +3638,7 @@ class LLMAdapter:
                         pass
                     if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list) and parsed["actions"]:
                         parsed["source"] = "voice-pre-web"
-                        return _finalize(parsed)
+                        return parsed
         except Exception:
             pass
         # Optional offline mode: reduce dependency on OpenAI for high-level analysis.
@@ -4770,7 +3661,7 @@ class LLMAdapter:
                     # Ensure we actually returned a web_search action.
                     if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list) and parsed["actions"]:
                         parsed["source"] = "offline-web"
-                        return _finalize(parsed)
+                        return parsed
 
                 # Also bypass OpenAI when there's no key configured, but only for
                 # web-required high-level questions (keeps local automation usable).
@@ -4782,7 +3673,7 @@ class LLMAdapter:
                         pass
                     if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list) and parsed["actions"]:
                         parsed["source"] = "offline-web"
-                        return _finalize(parsed)
+                        return parsed
         except Exception:
             # Never break response generation due to offline toggle logic.
             pass
@@ -4809,7 +3700,7 @@ class LLMAdapter:
                         pass
                     if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list) and parsed["actions"]:
                         parsed["source"] = "pre-web"
-                        return _finalize(parsed)
+                        return parsed
         except Exception:
             pass
 
@@ -4872,8 +3763,6 @@ class LLMAdapter:
         except Exception:
             decision_hint = None
 
-        planning_confidence = float((decision_hint or {}).get("confidence") or 0.7) if isinstance(decision_hint, dict) else 0.7
-
         # If the assistant likely lacks knowledge (unknown/low-confidence intent), auto-search the web.
         # This triggers the existing 2-pass web pipeline (search -> continue with web context).
         try:
@@ -4889,7 +3778,7 @@ class LLMAdapter:
                     parsed = self._postprocess_force_web_lookup(user_text=text, parsed=parsed)
                     if parsed.get("actions"):
                         parsed["source"] = "auto-web-unknown"
-                        return _finalize(parsed)
+                        return parsed
         except Exception:
             pass
 
@@ -4908,8 +3797,7 @@ class LLMAdapter:
                             local["emotion"] = self._infer_emotion(local.get("text") or text)
                     except Exception:
                         pass
-                    local["_planning_confidence"] = planning_confidence
-                    return _finalize(local)
+                    return local
         except Exception:
             pass
 
@@ -5056,16 +3944,16 @@ Style tone: {tone}.
         runtime_ctx = self._fetch_recent_runtime_context(text, limit=3, include_rag=include_rag)
         cached_best = str((runtime_ctx or {}).get("cached_best_response") or "").strip()
         if cached_best and complexity == 0:
-            return _finalize({
+            return {
                 "text": cached_best,
                 "actions": [],
                 "source": "learning-memory-cache",
-            })
+            }
         if complexity == 0:
-            cached_quick = self._get_cached_response(original_text, max_age_s=600)
+            cached_quick = self._get_cached_response(text, max_age_s=600)
             if isinstance(cached_quick, dict) and not (cached_quick.get("actions") or []):
                 cached_quick["source"] = "fast-cache"
-                return _finalize(cached_quick)
+                return cached_quick
         reasoning_hint = self._build_reasoning_hint(text)
         short_mem = self._short_term_memory_block()
         long_mem = self._long_term_memory_block(user_prefs=user_prefs)
@@ -5081,8 +3969,6 @@ Style tone: {tone}.
             return (
                 "[USER_QUERY]\n"
                 f"{text}\n\n"
-                "[USER_HABITS_MEMORY]\n"
-                f"{habits_block}\n\n"
                 "[RECENT_CHAT_CONTEXT]\n"
                 f"{recent_chat}\n\n"
                 "[RAG_CONTEXT]\n"
@@ -5101,8 +3987,6 @@ Style tone: {tone}.
                 f"{error_fix_hints}\n\n"
                 "[LEARNING_HINTS]\n"
                 f"{learning_hints}\n\n"
-                "[CONTEXTUAL_TASK_MEMORY]\n"
-                f"{self._runtime_context_prompt_block(runtime_task_context)}\n\n"
                 "[EXTERNAL_CONTEXT]\n"
                 f"{clipped_ctx}\n\n"
                 "Return ONLY valid JSON matching:\n"
@@ -5529,7 +4413,6 @@ Style tone: {tone}.
                 "task_type": route_task_type,
                 "deployment_profile": route_profile,
             }
-            parsed["_planning_confidence"] = planning_confidence
             logger.info(
                 "[llm.response] source=%s latency=%s fallback_used=%s",
                 provider_source,
@@ -5540,7 +4423,7 @@ Style tone: {tone}.
             try:
                 if self.learning_engine is not None:
                     self.learning_engine.record_model_performance(
-                        task_type=str(route_task_type or self._knowledge_query_type(original_text) or "simple_chat"),
+                        task_type=str(route_task_type or self._knowledge_query_type(text) or "simple_chat"),
                         model_id=str(routed_model or chosen_model or "unknown"),
                         provider=str(provider_source or chosen_provider or "unknown"),
                         success=True,
@@ -5552,7 +4435,7 @@ Style tone: {tone}.
                 pass
 
             try:
-                self._cache_response(original_text, parsed)
+                self._cache_response(text, parsed)
             except Exception:
                 pass
 
@@ -5560,7 +4443,7 @@ Style tone: {tone}.
                 self._recent_intents.append(
                     {
                         "ts": datetime.now(timezone.utc).isoformat(),
-                        "intent": self._knowledge_query_type(original_text),
+                        "intent": self._knowledge_query_type(text),
                         "task": route_task_type or "unknown",
                         "source": provider_source,
                     }
@@ -5570,10 +4453,10 @@ Style tone: {tone}.
             except Exception:
                 pass
 
-            self._learn_from_actions(original_text, parsed.get("actions") or [])
+            self._learn_from_actions(text, parsed.get("actions") or [])
 
             print(f"[LLM] {parsed}")
-            return _finalize(parsed)
+            return parsed
 
         except Exception as e:
             print(f"[LLM ERROR] {e}")
@@ -5582,7 +4465,7 @@ Style tone: {tone}.
             try:
                 if self.learning_engine is not None:
                     self.learning_engine.record_model_performance(
-                        task_type=str(self._knowledge_query_type(original_text) or "simple_chat"),
+                        task_type=str(self._knowledge_query_type(text) or "simple_chat"),
                         model_id=str((self._last_model_ops_route or {}).get("primary", {}).get("model_id") or self.primary_model or "unknown"),
                         provider=str((self._last_model_ops_route or {}).get("primary", {}).get("provider") or self.provider or "unknown"),
                         success=False,
@@ -5627,21 +4510,21 @@ Style tone: {tone}.
                     if not q:
                         q = (text or "").strip()
 
-                    return _finalize({
+                    return {
                         "text": "Looking it up online.",
                         "actions": [{"type": "web_search", "query": q, "num_results": 5}],
                         "source": "fallback-web",
-                    })
+                    }
             except Exception:
                 pass
 
             # Cached-context fallback for short/simple prompts when providers fail.
             try:
-                simple = bool(re.fullmatch(r"[\w\s?.!,:+\-/*]{1,180}", str(original_text or "").strip()))
+                simple = bool(re.fullmatch(r"[\w\s?.!,:+\-/*]{1,180}", str(text or "").strip()))
                 if simple:
-                    cached = self._get_cached_response(original_text)
+                    cached = self._get_cached_response(text)
                     if isinstance(cached, dict):
-                        return _finalize(cached)
+                        return cached
             except Exception:
                 pass
 
@@ -5656,8 +4539,8 @@ Style tone: {tone}.
                         "actions": deterministic.get("actions") if isinstance(deterministic.get("actions"), list) else [],
                         "source": str(deterministic.get("source") or "fallback-local-deterministic"),
                     }
-                    self._learn_from_actions(original_text, out.get("actions") or [])
-                    return _finalize(out)
+                    self._learn_from_actions(text, out.get("actions") or [])
+                    return out
             except Exception:
                 pass
 
@@ -5716,8 +4599,8 @@ Style tone: {tone}.
                     else:
                         parsed["text"] = "Done."
                     parsed["source"] = "fallback-local"
-                    self._learn_from_actions(original_text, parsed.get("actions") or [])
-                    return _finalize(parsed)
+                    self._learn_from_actions(text, parsed.get("actions") or [])
+                    return parsed
             except Exception:
                 pass
 
@@ -5725,11 +4608,11 @@ Style tone: {tone}.
             try:
                 tl = (text or "").strip().lower()
                 if re.match(r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+jarvis)?([\s!?.]*)$", tl):
-                    return _finalize({
+                    return {
                         "text": "Hey! I am online. I can help with chat, research prompts, and connected PC actions.",
                         "actions": [],
                         "source": "fallback-local-chat",
-                    })
+                    }
 
                 m = re.match(r"^(what\s+is\s+)?(-?\d+)\s*([+\-*/])\s*(-?\d+)\??$", tl)
                 if m:
@@ -5744,32 +4627,32 @@ Style tone: {tone}.
                         ans = a * b
                     else:
                         ans = "undefined" if b == 0 else (a / b)
-                    return _finalize({
+                    return {
                         "text": f"{a} {op} {b} = {ans}",
                         "actions": [],
                         "source": "fallback-local-chat",
-                    })
+                    }
 
                 if "what can you do" in tl or "capabilit" in tl:
-                    return _finalize({
+                    return {
                         "text": "I can chat, answer questions, run research prompts, and trigger connected PC actions like opening apps, URLs, screenshots, and automation tasks when permissions are granted.",
                         "actions": [],
                         "source": "fallback-local-chat",
-                    })
+                    }
 
                 if tl.startswith("summarize") or tl.startswith("summarise"):
-                    return _finalize({
+                    return {
                         "text": "Summary: Provider-backed generation is currently unavailable. I can still execute deterministic device commands and basic local fallback responses.",
                         "actions": [],
                         "source": "fallback-local-chat",
-                    })
+                    }
 
                 if tl.startswith("compare ") or " compare " in tl:
-                    return _finalize({
+                    return {
                         "text": "Quick comparison: option A usually offers stronger performance control and lower-level tuning, while option B typically offers faster development and simpler operations. If you share your exact use case, I can tailor the recommendation.",
                         "actions": [],
                         "source": "fallback-local-chat",
-                    })
+                    }
             except Exception:
                 pass
 
@@ -5779,17 +4662,17 @@ Style tone: {tone}.
             now = time.time()
             include_provider_notice = not self._has_local_fallback_capability(text)
             if (now - float(self._last_provider_notice_at or 0.0)) < 90.0:
-                return _finalize({
+                return {
                     "text": self._build_actionable_fallback_text(text, include_provider_notice=include_provider_notice),
                     "actions": [],
                     "source": "fallback",
-                })
+                }
             self._last_provider_notice_at = now
-            return _finalize({
+            return {
                 "text": self._build_actionable_fallback_text(text, include_provider_notice=include_provider_notice),
                 "actions": [],
                 "source": "fallback",
-            })
+            }
 
     def _postprocess_multi_step_chain_actions(self, user_text: str, parsed: dict) -> dict:
         actions = parsed.get("actions") or []

@@ -1048,6 +1048,22 @@ class ChatOrchestrator:
         # then injected as context on the next generate_response() call so the LLM
         # adapts to any scenario without adding new deterministic handlers.
         inline_results = response.get("action_results") or []
+
+        # REAL EXECUTION FEEDBACK LOOP — inject actual executor results into LLMAdapter
+        # before returning final response text to the user.
+        if inline_results:
+            try:
+                ingest = getattr(getattr(self.brain, "llm", None), "ingest_execution_feedback", None)
+                if callable(ingest):
+                    response = ingest(
+                        user_text=text,
+                        response=response,
+                        execution_results=list(inline_results) if isinstance(inline_results, list) else [],
+                        user_prefs={"user_id": user_id} if user_id else None,
+                    )
+            except Exception:
+                pass
+
         if inline_results and user_id:
             try:
                 _cycle_fn = (
