@@ -1998,6 +1998,15 @@ class LLMAdapter:
         t = str(user_text or "").strip()
         if not t:
             return ""
+        stop_tokens = {"it", "this", "that", "app", "application", "site", "website", "browser"}
+
+        def _clean(v: str) -> str:
+            cand = re.sub(r"\s+", " ", str(v or "").strip()).strip(" .,;:!?\t\n\r")
+            low = cand.lower()
+            if (not cand) or (low in stop_tokens):
+                return ""
+            return cand
+
         for pat in (
             r'"([^\"]{2,80})"',
             r"'([^']{2,80})'",
@@ -2006,7 +2015,25 @@ class LLMAdapter:
         ):
             m = re.search(pat, t, flags=re.IGNORECASE)
             if m:
-                return str(m.group(1) or "").strip()
+                out = _clean(str(m.group(1) or ""))
+                if out:
+                    return out
+
+        # Also capture direct app-like command targets: "open gemini", "switch to chrome".
+        m = re.search(
+            r"\b(?:open|launch|start|switch\s+to|switch|close|quit|exit)\b\s+(.+)$",
+            t,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            raw = str(m.group(1) or "")
+            raw = re.split(r"\b(?:and\s+then|then|so|because|but|and|after\s+that)\b", raw, maxsplit=1, flags=re.IGNORECASE)[0]
+            raw = raw.strip()
+            # Keep only the leading token-ish phrase to avoid absorbing full sentence tails.
+            raw = re.sub(r"[^a-zA-Z0-9._@\-\s].*$", "", raw).strip()
+            out = _clean(raw)
+            if out:
+                return out
         return ""
 
     @staticmethod
@@ -2027,9 +2054,33 @@ class LLMAdapter:
         last_entity = str(context_state.get("last_entity") or "").strip()
         last_action = str(context_state.get("last_action") or "").strip()
 
+        fallback_entity = ""
+        if not last_entity and last_action:
+            m = re.match(r"^(?:open_app|switch_app|close_app):(.+)$", last_action, flags=re.IGNORECASE)
+            if m:
+                fallback_entity = str(m.group(1) or "").strip()
+
         resolved = text
         if last_entity:
             resolved = re.sub(r"\b(this\s+person|this\s+contact|that\s+person|that\s+contact)\b", last_entity, resolved, flags=re.IGNORECASE)
+
+        pronoun_target = last_entity or fallback_entity or active_app
+        if pronoun_target and self._looks_like_continuation_request(text):
+            # Convert continuation pronouns into explicit commands using prior task entity.
+            pronoun = r"(?:it|that|this|the\s+app|app)"
+            resolved = re.sub(rf"\bopen\s+{pronoun}\b", f"open {pronoun_target}", resolved, flags=re.IGNORECASE)
+            resolved = re.sub(rf"\blaunch\s+{pronoun}\b", f"launch {pronoun_target}", resolved, flags=re.IGNORECASE)
+            resolved = re.sub(rf"\bstart\s+{pronoun}\b", f"start {pronoun_target}", resolved, flags=re.IGNORECASE)
+            resolved = re.sub(rf"\bswitch\s+to\s+{pronoun}\b", f"switch to {pronoun_target}", resolved, flags=re.IGNORECASE)
+            resolved = re.sub(rf"\bclose\s+{pronoun}\b", f"close {pronoun_target}", resolved, flags=re.IGNORECASE)
+
+            # Failure/retry phrasing should resolve into a concrete retry action target.
+            if re.search(r"\b(try\s+again|retry|again|did(?:\s+not|n't)\s+open|not\s+open(?:ed)?|failed\s+to\s+open)\b", resolved, flags=re.IGNORECASE):
+                has_explicit_open = bool(
+                    re.search(r"\b(open|launch|start)\s+" + re.escape(pronoun_target) + r"\b", resolved, flags=re.IGNORECASE)
+                )
+                if not has_explicit_open:
+                    resolved = f"open {pronoun_target}"
 
         if self._looks_like_continuation_request(text):
             hints: list[str] = []
@@ -2480,6 +2531,12 @@ class LLMAdapter:
             labels = [x for x in labels if x]
             if labels:
                 context_state["last_action"] = labels[-1]
+                if not str(context_state.get("last_entity") or ""):
+                    m = re.match(r"^(?:open_app|switch_app|close_app):(.+)$", str(labels[-1]), flags=re.IGNORECASE)
+                    if m:
+                        target = str(m.group(1) or "").strip()
+                        if target and target.lower() not in {"it", "this", "that", "app", "application"}:
+                            context_state["last_entity"] = target
             chain = context_state.get("task_chain") if isinstance(context_state.get("task_chain"), list) else []
             chain.append(
                 {

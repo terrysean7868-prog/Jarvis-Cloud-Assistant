@@ -62,6 +62,58 @@ def test_provider_unavailable_fallback_resets_stale_runtime_task(monkeypatch):
         asyncio.run(adapter.close())
 
 
+def test_resolve_contextual_user_text_rewrites_open_it_from_last_action():
+    adapter = LLMAdapter()
+    ctx = adapter._default_runtime_task_context()
+    ctx["last_action"] = "open_app:gemini"
+    ctx["task_active"] = True
+
+    out = adapter._resolve_contextual_user_text("Gemini but didn't open so open it", ctx)
+    assert "open gemini" in str(out or "").lower()
+
+
+def test_resolve_contextual_user_text_rewrites_open_that_and_close_it():
+    adapter = LLMAdapter()
+    ctx = adapter._default_runtime_task_context()
+    ctx["last_action"] = "open_app:chrome"
+    ctx["task_active"] = True
+
+    out_open = adapter._resolve_contextual_user_text("open that", ctx)
+    assert "open chrome" in str(out_open or "").lower()
+
+    out_close = adapter._resolve_contextual_user_text("close it", ctx)
+    assert "close chrome" in str(out_close or "").lower()
+
+
+def test_resolve_contextual_user_text_rewrites_retry_again_to_open_target():
+    adapter = LLMAdapter()
+    ctx = adapter._default_runtime_task_context()
+    ctx["last_action"] = "open_app:gemini"
+    ctx["task_active"] = True
+
+    out = adapter._resolve_contextual_user_text("it did not open, try again", ctx)
+    first_line = str(out or "").strip().lower().splitlines()[0]
+    assert first_line == "open gemini"
+
+
+def test_update_runtime_context_derives_last_entity_from_open_app_action():
+    adapter = LLMAdapter()
+    parsed = {
+        "text": "Opening gemini.",
+        "actions": [{"type": "open_app", "app_name": "gemini"}],
+    }
+
+    adapter._update_runtime_task_context(
+        user_text="open gemini",
+        planning_text="open gemini",
+        parsed=parsed,
+        user_prefs=None,
+    )
+
+    ctx = adapter._get_runtime_task_context(None)
+    assert str(ctx.get("last_entity") or "").lower() == "gemini"
+
+
 def test_voice_analysis_prompt_triggers_preweb_search(monkeypatch):
     """Voice mode should run web_search first for research/time-sensitive prompts."""
 
