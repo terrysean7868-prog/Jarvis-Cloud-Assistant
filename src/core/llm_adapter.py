@@ -2494,6 +2494,22 @@ class LLMAdapter:
         has_actions = bool(actions)
         result_text = str((parsed or {}).get("text") or "").strip()
         result_status = self._infer_result_status(result_text, has_actions)
+        task_status_hint = str((parsed or {}).get("task_status_hint") or "").strip().lower()
+
+        if task_status_hint == "provider_unavailable" and not has_actions:
+            # Provider fallback with no executable action should not keep stale task state active.
+            context_state["task_active"] = False
+            context_state["task_goal"] = ""
+            context_state["task_step"] = 0
+            context_state["task_status"] = "waiting_for_input"
+            context_state["goal_progress"] = 0.0
+            context_state["next_possible_actions"] = []
+            context_state["last_result_status"] = ""
+            if result_text:
+                context_state["last_result"] = self._first_sentences(result_text, max_sentences=1)[:220]
+            self._set_runtime_task_context(user_prefs, context_state)
+            return
+
         if result_status:
             context_state["last_result_status"] = result_status
 
@@ -5783,12 +5799,14 @@ Style tone: {tone}.
                     "text": self._build_actionable_fallback_text(text, include_provider_notice=include_provider_notice),
                     "actions": [],
                     "source": "fallback",
+                    "task_status_hint": "provider_unavailable",
                 })
             self._last_provider_notice_at = now
             return _finalize({
                 "text": self._build_actionable_fallback_text(text, include_provider_notice=include_provider_notice),
                 "actions": [],
                 "source": "fallback",
+                "task_status_hint": "provider_unavailable",
             })
 
     def _postprocess_multi_step_chain_actions(self, user_text: str, parsed: dict) -> dict:

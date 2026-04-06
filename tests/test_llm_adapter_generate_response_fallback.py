@@ -28,6 +28,40 @@ def test_generate_response_falls_back_to_open_app_when_llm_down(monkeypatch):
         asyncio.run(adapter.close())
 
 
+def test_provider_unavailable_fallback_resets_stale_runtime_task(monkeypatch):
+    monkeypatch.setattr(llm_mod.db, "save_system_event", lambda *a, **k: None)
+
+    adapter = LLMAdapter()
+
+    async def _boom(*_a, **_k):
+        raise Exception("OpenAI down")
+
+    monkeypatch.setattr(adapter, "_call_openai", _boom)
+
+    # Simulate a stale active task context from a prior turn.
+    stale = adapter._default_runtime_task_context()
+    stale["task_active"] = True
+    stale["task_goal"] = "old task"
+    stale["task_step"] = 3
+    stale["task_status"] = "in_progress"
+    adapter._set_runtime_task_context(None, stale)
+
+    try:
+        out = asyncio.run(adapter.generate_response("tell me something", context="", mode="chat"))
+        assert isinstance(out, dict)
+        assert out.get("source") == "fallback"
+
+        ctx = adapter._get_runtime_task_context(None)
+        assert ctx.get("task_active") is False
+        assert str(ctx.get("task_status") or "") == "waiting_for_input"
+
+        next_out = asyncio.run(adapter.generate_response("open notepad", context="", mode="chat"))
+        actions = next_out.get("actions") or []
+        assert any(isinstance(a, dict) and a.get("type") == "open_app" for a in actions)
+    finally:
+        asyncio.run(adapter.close())
+
+
 def test_voice_analysis_prompt_triggers_preweb_search(monkeypatch):
     """Voice mode should run web_search first for research/time-sensitive prompts."""
 
