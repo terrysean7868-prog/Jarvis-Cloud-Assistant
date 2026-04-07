@@ -2368,7 +2368,7 @@ export default function App() {
         isHandlingCommand.current = false;
       });
     }
-  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, getWakeCommandRemainder, promptForRequirement, resolvePermissionPromptDecision]);
+  }, [sessionId, addLog, addStructuredLog, buildDirectChatCompletionSpeech, buildDeviceCompletionSpeech, isMobile, isIOS, voiceLang, endWakeSessionWindow, googleSttEnabled, voiceBiometricsEnabled, voiceBiometricsActive, startWakeSessionWindow, getWakeCommandRemainder, promptForRequirement, resolvePermissionPromptDecision]);
 
   // ---------- Wake-word listener (same logic but keep stable callbacks) ----------
   useEffect(() => {
