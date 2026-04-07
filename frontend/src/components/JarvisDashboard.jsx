@@ -75,7 +75,6 @@ export default function JarvisDashboard({
   agentToken = "",
   agentSharedSecret = "",
   agentServerUrl = "",
-  agentWsUrl = "",
   agentCfgLoaded = false,
   agentCfgError = null,
   onConnectPcAgent,
@@ -161,14 +160,6 @@ export default function JarvisDashboard({
     if (agentCfgError) return "(not available)";
     return "(not set)";
   }, [agentCfgError, agentCfgLoaded, agentServerUrl, isAuthenticated]);
-
-  const wsUrlDisplay = useMemo(() => {
-    if (!isAuthenticated) return "(login to view)";
-    if (agentWsUrl) return agentWsUrl;
-    if (!agentCfgLoaded && !agentCfgError) return "(loading…)";
-    if (agentCfgError) return "(not available)";
-    return "(not set)";
-  }, [agentCfgError, agentCfgLoaded, agentWsUrl, isAuthenticated]);
 
   return (
     <div className="jarvis-dashboard" aria-label="Jarvis dashboard">
