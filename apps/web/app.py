@@ -1638,7 +1638,7 @@ async def _execute_dynamic_plan(
             else:
                 first = _extract_agent_contract_entry(payload)
                 s = str((first or {}).get("status") or "").strip().lower()
-                mapped = "completed" if s in {"success", "ok", "completed"} else "failed"
+                mapped = "completed" if s == "ok" else "failed"
                 final_entry = dict(first or {})
                 final_entry["status"] = mapped
 
@@ -1658,7 +1658,7 @@ async def _execute_dynamic_plan(
                     retries_used += 1
                     first = _extract_agent_contract_entry(payload) if isinstance(payload, dict) else {}
                     s = str((first or {}).get("status") or "").strip().lower()
-                    if s in {"success", "ok", "completed"}:
+                    if s == "ok":
                         success = True
                         final_entry = dict(first or {})
                         final_entry["status"] = "completed"
@@ -1714,15 +1714,66 @@ def _normalize_flow_status(value: str | None, *, default: str = "awaiting_agent"
 def _extract_agent_contract_entry(payload: dict[str, Any] | None) -> dict[str, Any]:
     rows = (payload or {}).get("results") or []
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-        return dict(rows[0])
+        return _normalize_agent_result_row(rows[0])
     return {}
+
+
+def _idempotent_message_success(message: str | None) -> bool:
+    m = str(message or "").strip().lower()
+    if not m:
+        return False
+    return ("already" in m) or ("not found" in m) or ("no change needed" in m)
+
+
+def _normalize_agent_result_row(row: dict[str, Any] | None) -> dict[str, Any]:
+    src = dict(row or {}) if isinstance(row, dict) else {}
+    result = src.get("result") if isinstance(src.get("result"), dict) else {}
+
+    raw_status = str(src.get("status") or result.get("status") or "").strip().lower()
+    action = str(src.get("action") or result.get("action") or result.get("action_type") or src.get("action_type") or "").strip()
+    message = str(src.get("message") or result.get("message") or "").strip()
+    error = str(src.get("error") or result.get("error") or "").strip()
+    if not message and error:
+        message = error
+
+    success_flag = result.get("success")
+    if isinstance(success_flag, bool):
+        success = bool(success_flag)
+    else:
+        success = raw_status in {"success", "ok", "completed"}
+
+    if _idempotent_message_success(message) or _idempotent_message_success(error):
+        success = True
+        error = ""
+
+    if success:
+        status = "ok"
+        error = ""
+    elif raw_status == "forbidden":
+        status = "forbidden"
+    elif raw_status in {"error", "failed"} or error:
+        status = "error"
+    else:
+        status = "error"
+
+    src["status"] = status
+    src["success"] = bool(success)
+    src["error"] = (error or None)
+    src["message"] = message
+    src["action"] = action
+    return src
 
 
 def _extract_agent_contract_result(payload: dict[str, Any] | None) -> dict[str, Any]:
     first = _extract_agent_contract_entry(payload)
-    result = first.get("result")
-    if isinstance(result, dict):
-        return _to_json_safe(dict(result))
+    result = first.get("result") if isinstance(first.get("result"), dict) else {}
+    if first:
+        merged = dict(result)
+        merged.setdefault("success", bool(first.get("success")))
+        merged.setdefault("error", first.get("error"))
+        merged.setdefault("message", str(first.get("message") or ""))
+        merged.setdefault("action", str(first.get("action") or ""))
+        return _to_json_safe(merged)
     # Backward compatibility with legacy agent shape.
     if first:
         return _to_json_safe(dict(first))
@@ -3946,13 +3997,21 @@ async def agent_ws(ws: WebSocket):
                 logger.info("[AGENT RESULT] %s", payload)
 
                 try:
+                    raw_results = (payload or {}).get("results") or []
+                    normalized_results = [
+                        _normalize_agent_result_row(r)
+                        for r in raw_results
+                        if isinstance(r, dict)
+                    ]
+                    if isinstance(payload, dict):
+                        payload["results"] = normalized_results
                     _remember_job_result(payload if isinstance(payload, dict) else {})
                     jid = str((payload or {}).get("job_id") or "").strip()
                     if jid:
-                        results = (payload or {}).get("results") or []
+                        results = normalized_results
                         first = results[0] if isinstance(results, list) and results else {}
-                        raw_status = str((first or {}).get("status") or "completed").strip().lower()
-                        if raw_status in {"success", "ok"}:
+                        raw_status = str((first or {}).get("status") or "ok").strip().lower()
+                        if raw_status == "ok":
                             flow_status = "completed"
                         elif raw_status in {"error", "forbidden"}:
                             flow_status = "failed"

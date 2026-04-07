@@ -707,8 +707,9 @@ export default function App() {
             let err = 0;
             let forbidden = 0;
             for (const r of results) {
+              const successFlag = r?.success;
               const st = (r?.status || "").toString().toLowerCase();
-              if (st === "success" || st === "opened" || st === "edited" || st === "written" || st === "copied" || st === "moved" || st === "deleted") ok += 1;
+              if (successFlag === true || st === "ok" || st === "completed" || st === "success" || st === "opened" || st === "edited" || st === "written" || st === "copied" || st === "moved" || st === "deleted") ok += 1;
               else if (st === "forbidden") forbidden += 1;
               else if (st) err += 1;
             }
@@ -2076,6 +2077,10 @@ export default function App() {
 
       const spokenResponse = buildDirectChatCompletionSpeech(res) || res.text || "Done.";
       let finalSpokenResponse = spokenResponse;
+      const responseActionResults = Array.isArray(res?.action_results) ? res.action_results : [];
+      if (responseActionResults.length) {
+        finalSpokenResponse = buildDeviceCompletionSpeech(responseActionResults, transcript);
+      }
 
       // run any actions returned
       if (Array.isArray(res.actions) && res.actions.length) {
@@ -2139,12 +2144,20 @@ export default function App() {
             try {
               const dispatchRes = await dispatchDeviceActions(deviceActions, sessionId, transcript);
               const flowStatus = String(dispatchRes?.status || "").toLowerCase();
+              const dispatchActionResults = Array.isArray(dispatchRes?.action_results)
+                ? dispatchRes.action_results
+                : (Array.isArray(dispatchRes?.agent_result?.results) ? dispatchRes.agent_result.results : []);
+
+              if (dispatchActionResults.length) {
+                finalSpokenResponse = buildDeviceCompletionSpeech(dispatchActionResults, transcript);
+              }
+
               if (flowStatus === "delegated") {
                 addLog("system", `PC actions delegated (${deviceActions.length}).`);
-              } else if (flowStatus === "queued_for_agent") {
+              } else if (flowStatus === "queued_for_agent" && dispatchActionResults.length === 0) {
                 addLog("system", "PC agent is not connected. Connect the agent and retry.");
                 finalSpokenResponse = "PC agent is not connected. Connect the agent and try again.";
-              } else if (flowStatus === "awaiting_agent") {
+              } else if (flowStatus === "awaiting_agent" && dispatchActionResults.length === 0) {
                 addLog("system", "No device assigned yet. Action is waiting for device setup.");
                 finalSpokenResponse = "No device is assigned yet. Configure your PC device to continue.";
                 promptForRequirement({
