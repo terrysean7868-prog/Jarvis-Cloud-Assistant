@@ -89,6 +89,30 @@ ACTION_ALLOWLIST = {a.strip() for a in _ALLOWLIST_RAW.split(",") if a.strip()} i
 # Allows the server to request agent shutdown (e.g., on user logout).
 _STOP_EVENT = None
 
+_ACTION_MAPPINGS_FILE_RAW = _env_str("JARVIS_AGENT_ACTION_MAPPINGS_FILE", "").strip()
+ACTION_MAPPINGS_FILE = Path(_ACTION_MAPPINGS_FILE_RAW).expanduser() if _ACTION_MAPPINGS_FILE_RAW else None
+MAX_LEARNED_ACTION_MAPPINGS = max(50, _env_int("JARVIS_AGENT_MAX_ACTION_MAPPINGS", 400))
+MIN_LEARNED_MAPPING_CONFIDENCE = 0.25
+
+DEVICE_ACTION_NAMES = {
+    "bluetooth_on",
+    "bluetooth_off",
+    "wifi_on",
+    "wifi_off",
+    "volume_up",
+    "volume_down",
+    "volume_mute",
+    "volume_unmute",
+    "brightness_up",
+    "brightness_down",
+    "lock_screen",
+    "sleep",
+    "shutdown",
+    "restart",
+    "open_app",
+    "close_app",
+}
+
 
 def _permissions_file_path() -> Path:
     if PERMISSIONS_FILE:
@@ -173,6 +197,17 @@ def _supported_actions_catalog() -> list[str]:
         "set_wifi",
         "set_bluetooth",
         "set_airplane_mode",
+        # Expanded high-level device_action names (dispatched by handle_device_action).
+        "bluetooth_on",
+        "bluetooth_off",
+        "wifi_on",
+        "wifi_off",
+        "volume_up",
+        "volume_down",
+        "volume_mute",
+        "volume_unmute",
+        "brightness_up",
+        "brightness_down",
         # UI automation (requires allow_screen)
         "show_desktop",
         "open_task_manager",
@@ -283,12 +318,17 @@ async def _execute_action_contract(action_payload: dict | None, *, job_id: str, 
 
 
 def _current_capabilities() -> dict:
+    windows = platform.system().lower() == "windows"
     return {
         "allow_execute_command": bool(ALLOW_EXECUTE_COMMAND),
         "allow_app_control": bool(ALLOW_APP_CONTROL),
         "allow_screen": bool(ALLOW_SCREEN),
         "allow_self_update": bool(ALLOW_SELF_UPDATE),
         "allow_file_ops": bool(ALLOW_FILE_OPS),
+        "bluetooth": bool(windows),
+        "wifi": bool(windows),
+        "volume": bool(windows),
+        "brightness": bool(windows),
         "platform": platform.system().lower(),
         "hostname": platform.node(),
         "actions": _supported_actions_catalog(),
@@ -787,6 +827,32 @@ $name = $ad.Name
     return True, ""
 
 
+def _set_windows_wifi_netsh(enabled: bool) -> tuple[bool, str]:
+    """Toggle Wi-Fi using netsh interface command, with adapter name probing."""
+    if platform.system() != "Windows":
+        return False, "Wi-Fi control is only supported on Windows agents."
+    state = "enabled" if enabled else "disabled"
+    candidates = ["Wi-Fi", "WiFi", "WLAN", "Wireless Network Connection"]
+    errors = []
+    for name in candidates:
+        try:
+            p = subprocess.run(
+                ["netsh", "interface", "set", "interface", f'name={name}', f"admin={state}"],
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+            )
+            if int(p.returncode) == 0:
+                return True, ""
+            err = (p.stderr or p.stdout or "").strip()
+            if err:
+                errors.append(f"{name}: {err}")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    joined = " | ".join(errors[:3]).strip()
+    return False, joined or "Failed to toggle Wi-Fi via netsh"
+
+
 def _set_windows_bluetooth(enabled: bool) -> tuple[bool, str]:
     """Best-effort Bluetooth toggle. Commonly requires admin privileges; falls back to Settings."""
     if platform.system() != "Windows":
@@ -808,6 +874,648 @@ $id = $dev.InstanceId
             msg = "No Bluetooth device found."
         return False, msg or "Failed to toggle Bluetooth"
     return True, ""
+
+
+def _get_windows_wifi_enabled() -> tuple[bool | None, str]:
+    if platform.system() != "Windows":
+        return None, "Wi-Fi state is only available on Windows agents."
+
+    ps = r"""
+$ad = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+  ($_.Name -match 'wi-?fi|wireless') -or ($_.InterfaceDescription -match 'wi-?fi|wireless')
+} | Select-Object -First 1
+if (-not $ad) { Write-Output 'NO_ADAPTER'; exit 2 }
+Write-Output $ad.Status
+"""
+    rc, out, err = _run_powershell(ps, timeout_s=8.0)
+    if rc == 0:
+        status = str(out or "").strip().lower()
+        if status:
+            return status == "up", ""
+    # Fallback: netsh state check.
+    try:
+        p = subprocess.run(["netsh", "interface", "show", "interface"], capture_output=True, text=True, timeout=8.0)
+        if int(p.returncode) == 0:
+            txt = str(p.stdout or "")
+            for raw_line in txt.splitlines():
+                line = raw_line.strip()
+                ll = line.lower()
+                if not line or "admin state" in ll:
+                    continue
+                if ("wi-fi" in ll) or ("wifi" in ll) or ("wireless" in ll) or ("wlan" in ll):
+                    up = ll.startswith("enabled")
+                    return up, ""
+    except Exception as e:
+        return None, str(e)
+
+    msg = (err or out or "").strip()
+    if "NO_ADAPTER" in str(out or ""):
+        msg = "No Wi-Fi adapter found."
+    return None, msg or "Unable to read Wi-Fi state"
+
+
+def _get_windows_bluetooth_enabled() -> tuple[bool | None, str]:
+    if platform.system() != "Windows":
+        return None, "Bluetooth state is only available on Windows agents."
+
+    ps = r"""
+$dev = Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object {
+  $_.Status -ne 'Unknown'
+} | Select-Object -First 1
+if (-not $dev) { Write-Output 'NO_BT'; exit 2 }
+Write-Output $dev.Status
+"""
+    rc, out, err = _run_powershell(ps, timeout_s=8.0)
+    if rc != 0:
+        msg = (err or out or "").strip()
+        if "NO_BT" in str(out or ""):
+            msg = "No Bluetooth device found."
+        return None, msg or "Unable to read Bluetooth state"
+
+    status = str(out or "").strip().lower()
+    if not status:
+        return None, "Unable to read Bluetooth state"
+    return status in {"ok", "up", "started"}, ""
+
+
+def _find_nircmd_exe() -> str | None:
+    p = shutil.which("nircmd") or shutil.which("nircmd.exe")
+    if p:
+        return p
+    program_files = [
+        os.getenv("ProgramFiles", r"C:\Program Files"),
+        os.getenv("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ]
+    for root in program_files:
+        if not root:
+            continue
+        cand = Path(root) / "NirCmd" / "nircmd.exe"
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def _run_nircmd(args: list[str], timeout_s: float = 5.0) -> tuple[bool, str]:
+    exe = _find_nircmd_exe()
+    if not exe:
+        return False, "nircmd not found"
+    try:
+        p = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout_s)
+        if int(p.returncode) != 0:
+            return False, (p.stderr or p.stdout or "").strip() or "nircmd command failed"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _action_mappings_file_path() -> Path:
+    if ACTION_MAPPINGS_FILE:
+        return ACTION_MAPPINGS_FILE
+    if platform.system() == "Windows":
+        local_app_data = str(os.getenv("LOCALAPPDATA") or "").strip()
+        if local_app_data:
+            return (Path(local_app_data) / "Jarvis" / "agent_action_mappings.json").resolve()
+    return (Path.home() / ".jarvis" / "agent_action_mappings.json").resolve()
+
+
+def _normalize_device_action_name(name: str) -> str:
+    n = str(name or "").strip().lower()
+    n = n.replace("-", "_").replace(" ", "_")
+    n = re.sub(r"[^a-z0-9_]+", "", n)
+    n = re.sub(r"_+", "_", n).strip("_")
+    return n
+
+
+def _build_semantic_action_aliases() -> dict[str, str]:
+    aliases = {
+        "bluetooth_on": "bluetooth_on",
+        "bluetooth_off": "bluetooth_off",
+        "turn_on_bluetooth": "bluetooth_on",
+        "enable_bluetooth": "bluetooth_on",
+        "turn_off_bluetooth": "bluetooth_off",
+        "disable_bluetooth": "bluetooth_off",
+        "wifi_on": "wifi_on",
+        "wifi_off": "wifi_off",
+        "wi_fi_on": "wifi_on",
+        "wi_fi_off": "wifi_off",
+        "turn_on_wifi": "wifi_on",
+        "enable_wifi": "wifi_on",
+        "turn_off_wifi": "wifi_off",
+        "disable_wifi": "wifi_off",
+        "volume_up": "volume_up",
+        "volume_down": "volume_down",
+        "increase_volume": "volume_up",
+        "decrease_volume": "volume_down",
+        "volume_mute": "volume_mute",
+        "volume_unmute": "volume_unmute",
+        "mute": "volume_mute",
+        "unmute": "volume_unmute",
+        "brightness_up": "brightness_up",
+        "brightness_down": "brightness_down",
+        "increase_brightness": "brightness_up",
+        "decrease_brightness": "brightness_down",
+        "lock_screen": "lock_screen",
+        "lock": "lock_screen",
+        "sleep": "sleep",
+        "shutdown": "shutdown",
+        "restart": "restart",
+        "open_app": "open_app",
+        "close_app": "close_app",
+    }
+    return { _normalize_device_action_name(k): v for k, v in aliases.items() }
+
+
+_SEMANTIC_DEVICE_ACTION_ALIASES = _build_semantic_action_aliases()
+
+
+def _load_learned_action_mappings() -> dict[str, dict]:
+    try:
+        p = _action_mappings_file_path()
+        if not p.exists():
+            return {}
+        raw = json.loads(p.read_text(encoding="utf-8") or "{}")
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, dict] = {}
+        for k, v in raw.items():
+            if not isinstance(v, dict):
+                continue
+            nk = _normalize_device_action_name(str(k or ""))
+            if not nk:
+                continue
+            out[nk] = {
+                "resolved_action": _normalize_device_action_name(str(v.get("resolved_action") or "")),
+                "confidence": float(v.get("confidence") or 0.0),
+                "usage_count": int(v.get("usage_count") or 0),
+                "success_count": int(v.get("success_count") or 0),
+                "failure_count": int(v.get("failure_count") or 0),
+                "last_used_at": str(v.get("last_used_at") or ""),
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def _save_learned_action_mappings(mappings: dict[str, dict]) -> None:
+    try:
+        if not isinstance(mappings, dict):
+            return
+        ordered = sorted(
+            mappings.items(),
+            key=lambda kv: (
+                float((kv[1] or {}).get("confidence") or 0.0),
+                int((kv[1] or {}).get("success_count") or 0),
+                int((kv[1] or {}).get("usage_count") or 0),
+            ),
+            reverse=True,
+        )
+        trimmed = dict(ordered[:MAX_LEARNED_ACTION_MAPPINGS])
+        p = _action_mappings_file_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(trimmed, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _resolve_category_action(normalized_action: str, params: dict) -> str:
+    if normalized_action in DEVICE_ACTION_NAMES:
+        return normalized_action
+
+    s = normalized_action
+    categories = {
+        "wifi": ("wifi", "wi_fi", "wireless", "wlan"),
+        "bluetooth": ("bluetooth", "bt"),
+        "volume": ("volume", "audio", "sound", "speaker", "mute", "unmute"),
+        "brightness": ("brightness", "display", "screen_light"),
+        "system": ("lock", "sleep", "shutdown", "restart", "reboot", "power"),
+        "app": ("open_app", "close_app", "launch_app", "kill_app", "switch_app", "application", "app"),
+    }
+
+    cat = ""
+    for key, toks in categories.items():
+        if any(tok in s for tok in toks):
+            cat = key
+            break
+
+    if not cat:
+        return ""
+
+    on = any(x in s for x in ("_on", "enable", "turn_on", "start"))
+    off = any(x in s for x in ("_off", "disable", "turn_off", "stop"))
+    up = any(x in s for x in ("_up", "increase", "raise", "higher"))
+    down = any(x in s for x in ("_down", "decrease", "lower"))
+
+    if cat == "wifi":
+        if on:
+            return "wifi_on"
+        if off:
+            return "wifi_off"
+    if cat == "bluetooth":
+        if on:
+            return "bluetooth_on"
+        if off:
+            return "bluetooth_off"
+    if cat == "volume":
+        if "unmute" in s:
+            return "volume_unmute"
+        if "mute" in s:
+            return "volume_mute"
+        if up:
+            return "volume_up"
+        if down:
+            return "volume_down"
+    if cat == "brightness":
+        if up:
+            return "brightness_up"
+        if down:
+            return "brightness_down"
+    if cat == "system":
+        if "lock" in s:
+            return "lock_screen"
+        if "sleep" in s:
+            return "sleep"
+        if "restart" in s or "reboot" in s:
+            return "restart"
+        if "shutdown" in s or "power_off" in s:
+            return "shutdown"
+    if cat == "app":
+        if "close" in s or "kill" in s or "exit" in s:
+            return "close_app"
+        if "open" in s or "launch" in s or "start" in s:
+            return "open_app"
+
+    # Intent-like params can disambiguate semantic variants.
+    try:
+        direction = _normalize_device_action_name(str((params or {}).get("direction") or ""))
+        if cat == "volume":
+            if direction in {"up", "increase"}:
+                return "volume_up"
+            if direction in {"down", "decrease"}:
+                return "volume_down"
+        if cat == "brightness":
+            if direction in {"up", "increase"}:
+                return "brightness_up"
+            if direction in {"down", "decrease"}:
+                return "brightness_down"
+    except Exception:
+        pass
+    return ""
+
+
+def _select_learned_mapping(normalized_action: str, mappings: dict[str, dict]) -> str:
+    item = mappings.get(normalized_action) if isinstance(mappings.get(normalized_action), dict) else None
+    if not item:
+        return ""
+    resolved = _normalize_device_action_name(str(item.get("resolved_action") or ""))
+    if resolved not in DEVICE_ACTION_NAMES:
+        return ""
+    conf = float(item.get("confidence") or 0.0)
+    if conf < MIN_LEARNED_MAPPING_CONFIDENCE:
+        return ""
+    return resolved
+
+
+def _update_learned_mapping(
+    *,
+    original_action: str,
+    resolved_action: str,
+    succeeded: bool,
+    mappings: dict[str, dict],
+) -> None:
+    key = _normalize_device_action_name(original_action)
+    if not key:
+        return
+    if resolved_action not in DEVICE_ACTION_NAMES:
+        return
+    item = mappings.get(key) if isinstance(mappings.get(key), dict) else {}
+    usage = int(item.get("usage_count") or 0) + 1
+    succ = int(item.get("success_count") or 0) + (1 if succeeded else 0)
+    fail = int(item.get("failure_count") or 0) + (0 if succeeded else 1)
+    conf = float(succ) / float(max(1, usage))
+    mappings[key] = {
+        "resolved_action": resolved_action,
+        "confidence": round(conf, 4),
+        "usage_count": usage,
+        "success_count": succ,
+        "failure_count": fail,
+        "last_used_at": _now_utc_iso(),
+    }
+
+    # Prune stale low-confidence entries when repeatedly failing.
+    if fail >= 3 and conf < MIN_LEARNED_MAPPING_CONFIDENCE:
+        try:
+            del mappings[key]
+        except Exception:
+            pass
+
+
+_LEARNED_DEVICE_ACTION_MAPPINGS = _load_learned_action_mappings()
+
+
+def resolve_and_execute(action: str, params: dict) -> dict:
+    """Central intelligent resolver for device actions with learning and fallback tiers."""
+    original_action = str(action or "")
+    normalized = _normalize_device_action_name(original_action)
+    p = params if isinstance(params, dict) else {}
+
+    fallback_used = False
+    verification = {
+        "attempted": False,
+        "state_changed": None,
+        "note": "",
+    }
+
+    resolved = ""
+    tier = ""
+
+    learned = _select_learned_mapping(normalized, _LEARNED_DEVICE_ACTION_MAPPINGS)
+    if learned:
+        resolved = learned
+        tier = "learned"
+
+    if not resolved:
+        aliased = _SEMANTIC_DEVICE_ACTION_ALIASES.get(normalized) or ""
+        if aliased in DEVICE_ACTION_NAMES:
+            resolved = aliased
+            tier = "direct" if normalized == resolved else "alias"
+
+    if not resolved:
+        by_category = _resolve_category_action(normalized, p)
+        if by_category:
+            resolved = by_category
+            tier = "category"
+            fallback_used = True
+
+    if not resolved:
+        return {
+            "success": False,
+            "original_action": original_action,
+            "resolved_action": "",
+            "message": "Unsupported device action.",
+            "error": f"Unable to resolve action '{original_action}'",
+            "verification": verification,
+            "fallback_used": True,
+        }
+
+    before_state = None
+    after_state = None
+
+    try:
+        if resolved in {"wifi_on", "wifi_off"}:
+            verification["attempted"] = True
+            before_state, _ = _get_windows_wifi_enabled()
+        elif resolved in {"bluetooth_on", "bluetooth_off"}:
+            verification["attempted"] = True
+            before_state, _ = _get_windows_bluetooth_enabled()
+        elif resolved in {"volume_up", "volume_down"}:
+            verification["attempted"] = True
+            before_state, _ = _get_windows_volume_percent()
+        elif resolved in {"volume_mute", "volume_unmute"}:
+            verification["attempted"] = True
+            before_state, _ = _get_windows_mute()
+        elif resolved in {"brightness_up", "brightness_down"}:
+            verification["attempted"] = True
+            before_state = _get_windows_brightness()
+    except Exception:
+        before_state = None
+
+    base = handle_device_action(resolved, p)
+    ok = bool(base.get("success"))
+
+    try:
+        if verification["attempted"]:
+            if resolved in {"wifi_on", "wifi_off"}:
+                after_state, state_err = _get_windows_wifi_enabled()
+                target_state = resolved.endswith("_on")
+                if (before_state is not None) and (after_state is not None):
+                    changed = bool(before_state != after_state)
+                    reached_target = bool(after_state == target_state)
+                    verification["state_changed"] = bool(changed and reached_target)
+                    verification["note"] = f"before={before_state}, after={after_state}, target={target_state}"
+                    ok = bool(ok and changed and reached_target)
+                    if not ok and not base.get("error"):
+                        base["error"] = "wifi_state_not_changed"
+                        base["message"] = "Wi-Fi state did not change to requested target."
+                else:
+                    verification["state_changed"] = False
+                    verification["note"] = f"state_unverified:{state_err or 'unknown'}"
+                    ok = False
+                    if not base.get("error"):
+                        base["error"] = "wifi_state_unverified"
+                        base["message"] = "Unable to verify Wi-Fi state after execution."
+            elif resolved in {"bluetooth_on", "bluetooth_off"}:
+                after_state, state_err = _get_windows_bluetooth_enabled()
+                target_state = resolved.endswith("_on")
+                if (before_state is not None) and (after_state is not None):
+                    changed = bool(before_state != after_state)
+                    reached_target = bool(after_state == target_state)
+                    verification["state_changed"] = bool(changed and reached_target)
+                    verification["note"] = f"before={before_state}, after={after_state}, target={target_state}"
+                    ok = bool(ok and changed and reached_target)
+                    if not ok and not base.get("error"):
+                        base["error"] = "bluetooth_state_not_changed"
+                        base["message"] = "Bluetooth state did not change to requested target."
+                else:
+                    verification["state_changed"] = False
+                    verification["note"] = f"state_unverified:{state_err or 'unknown'}"
+                    ok = False
+                    if not base.get("error"):
+                        base["error"] = "bluetooth_state_unverified"
+                        base["message"] = "Unable to verify Bluetooth state after execution."
+            elif resolved in {"volume_up", "volume_down"}:
+                after_state, _ = _get_windows_volume_percent()
+            elif resolved in {"volume_mute", "volume_unmute"}:
+                after_state, _ = _get_windows_mute()
+            elif resolved in {"brightness_up", "brightness_down"}:
+                after_state = _get_windows_brightness()
+
+            if resolved in {"wifi_on", "wifi_off", "bluetooth_on", "bluetooth_off"}:
+                pass
+            elif (before_state is not None) and (after_state is not None):
+                verification["state_changed"] = bool(before_state != after_state)
+                verification["note"] = f"before={before_state}, after={after_state}"
+            elif ok:
+                verification["state_changed"] = True
+                verification["note"] = "command_succeeded"
+            else:
+                verification["state_changed"] = False
+                verification["note"] = "command_failed"
+    except Exception:
+        pass
+
+    _update_learned_mapping(
+        original_action=normalized,
+        resolved_action=resolved,
+        succeeded=ok,
+        mappings=_LEARNED_DEVICE_ACTION_MAPPINGS,
+    )
+    _save_learned_action_mappings(_LEARNED_DEVICE_ACTION_MAPPINGS)
+
+    return {
+        "success": ok,
+        "original_action": original_action,
+        "resolved_action": resolved,
+        "message": str(base.get("message") or ""),
+        "error": base.get("error"),
+        "verification": verification,
+        "fallback_used": bool(fallback_used or tier in {"learned", "alias", "category"}),
+        "resolution_tier": tier,
+        "result": base,
+    }
+
+
+def _device_action_payload(success: bool, action_name: str, message: str, error: str | None = None, **extra) -> dict:
+    payload = {
+        "success": bool(success),
+        "action": str(action_name or "").strip(),
+        "message": str(message or "").strip(),
+        "error": (None if success else str(error or message or "execution_failed")),
+    }
+    payload.update(extra)
+    return payload
+
+
+def handle_device_action(action: str, params: dict) -> dict:
+    """Central dispatcher for device_action names with structured success/error payloads."""
+    action_name = str(action or "").strip().lower()
+    p = params if isinstance(params, dict) else {}
+
+    def _done(ok: bool, message: str, error: str | None = None, **extra) -> dict:
+        if ok:
+            print(f"[DEVICE_ACTION] {action_name} -> success", flush=True)
+        else:
+            print(f"[DEVICE_ACTION] {action_name} -> failed: {error or message}", flush=True)
+        return _device_action_payload(ok, action_name, message, error=error, **extra)
+
+    try:
+        if action_name in ("bluetooth_on", "bluetooth_off"):
+            ok, err = _set_windows_bluetooth(action_name == "bluetooth_on")
+            if not ok:
+                return _done(False, "Failed to toggle Bluetooth.", err)
+            return _done(True, f"Bluetooth {'enabled' if action_name.endswith('_on') else 'disabled'}.")
+
+        if action_name in ("wifi_on", "wifi_off"):
+            enabled = action_name == "wifi_on"
+            ok, err = _set_windows_wifi_netsh(enabled)
+            if not ok:
+                ok, err = _set_windows_wifi(enabled)
+            if not ok:
+                return _done(False, "Failed to toggle Wi-Fi.", err)
+            return _done(True, f"Wi-Fi {'enabled' if enabled else 'disabled'}.")
+
+        if action_name in ("volume_up", "volume_down"):
+            try:
+                step = int(float(p.get("step", 10)))
+            except Exception:
+                step = 10
+            step = max(1, min(30, abs(step)))
+            if action_name == "volume_down":
+                step = -step
+
+            current, err_cur = _get_windows_volume_percent()
+            if current is not None:
+                target = max(0, min(100, int(current + step)))
+                ok, err = _set_windows_volume_percent(target)
+                if not ok:
+                    return _done(False, "Failed to adjust volume.", err)
+                after, _ = _get_windows_volume_percent()
+                return _done(True, "Volume adjusted.", before_value=current, after_value=after, step=step)
+
+            # pycaw unavailable: nircmd fallback (65535 scale)
+            unit_step = int(65535 * (abs(step) / 100.0))
+            if unit_step <= 0:
+                unit_step = 655
+            if step < 0:
+                unit_step = -unit_step
+            ok, err = _run_nircmd(["changesysvolume", str(unit_step)])
+            if not ok:
+                return _done(False, "Failed to adjust volume.", err or err_cur)
+            return _done(True, "Volume adjusted.", step=step)
+
+        if action_name in ("volume_mute", "volume_unmute"):
+            muted = action_name == "volume_mute"
+            ok, err = _set_windows_mute(muted)
+            if not ok:
+                ok2, err2 = _run_nircmd(["mutesysvolume", "1" if muted else "0"])
+                if not ok2:
+                    return _done(False, "Failed to change mute state.", err or err2)
+            return _done(True, f"Volume {'muted' if muted else 'unmuted'}.", muted=muted)
+
+        if action_name in ("brightness_up", "brightness_down"):
+            current = _get_windows_brightness()
+            if current is None:
+                return _done(False, "Failed to read brightness.", "Current brightness unavailable")
+            try:
+                step = int(float(p.get("step", 10)))
+            except Exception:
+                step = 10
+            step = max(1, min(40, abs(step)))
+            target = current + step if action_name == "brightness_up" else current - step
+            target = max(0, min(100, int(target)))
+            ok, err = _set_windows_brightness(target)
+            if not ok:
+                return _done(False, "Failed to adjust brightness.", err)
+            after = _get_windows_brightness()
+            return _done(True, "Brightness adjusted.", before_value=current, after_value=after, value=target)
+
+        if action_name == "lock_screen":
+            if platform.system() != "Windows":
+                return _done(False, "Lock screen is unsupported on this OS.", "Windows only")
+            subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"], timeout=5.0)
+            return _done(True, "Screen locked.")
+
+        if action_name == "sleep":
+            if platform.system() != "Windows":
+                return _done(False, "Sleep is unsupported on this OS.", "Windows only")
+            subprocess.Popen(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"])
+            return _done(True, "System entering sleep.")
+
+        if action_name == "shutdown":
+            if platform.system() != "Windows":
+                return _done(False, "Shutdown is unsupported on this OS.", "Windows only")
+            subprocess.Popen(["shutdown", "/s", "/t", "0"])
+            return _done(True, "System shutdown initiated.")
+
+        if action_name == "restart":
+            if platform.system() != "Windows":
+                return _done(False, "Restart is unsupported on this OS.", "Windows only")
+            subprocess.Popen(["shutdown", "/r", "/t", "0"])
+            return _done(True, "System restart initiated.")
+
+        if action_name in ("open_app", "close_app"):
+            if not ALLOW_APP_CONTROL:
+                return _done(False, "App control disabled on agent.", "App control disabled")
+            mgr = _get_app_manager()
+            if not mgr:
+                return _done(False, "App manager not available on this agent.", "App manager unavailable")
+            app_name = p.get("app_name") or p.get("app") or p.get("name") or ""
+            app_name = str(app_name).strip()
+            if not app_name:
+                return _done(False, "app_name is required.", "Missing app_name")
+
+            if action_name == "open_app":
+                n = app_name.lower()
+                now = time.monotonic()
+                last = _RECENT_APP_OPENS.get(n)
+                if last is not None and (now - last) < 4.0:
+                    return _done(True, "Skipped duplicate open_app.", duplicate=True, app=app_name)
+                _RECENT_APP_OPENS[n] = now
+                app_result = mgr.open_app(app_name, p.get("args") or [])
+            else:
+                app_result = mgr.close_app(app_name)
+
+            if isinstance(app_result, dict):
+                st = str(app_result.get("status") or "").strip().lower()
+                msg = str(app_result.get("message") or "").strip() or f"{action_name} executed"
+                if st in {"error", "failed", "forbidden"}:
+                    return _done(False, msg, msg, app=app_name)
+                return _done(True, msg, app=app_name)
+
+            return _done(True, f"{action_name} executed.", app=app_name)
+
+        return _done(False, "Unsupported device action.", f"Unsupported action '{action_name}'")
+    except Exception as e:
+        return _done(False, "Device action failed.", str(e))
 
 
 def _confirmation_required(action: dict) -> bool:
@@ -832,16 +1540,47 @@ async def _execute_action(action: dict) -> dict:
 
     if t == "device_action":
         name = (action or {}).get("name") or (action or {}).get("action") or ""
-        args = (action or {}).get("args")
-        if not isinstance(args, dict):
-            args = {}
-        name = str(name or "").strip()
+        name = str(name or "").strip().lower()
         if not name or name == "device_action":
             return {"status": "error", "action_type": "device_action", "message": "Invalid device action name"}
-        # Convert into an existing action shape and reuse the normal dispatcher.
-        nested = {"type": name}
-        nested.update(args)
-        return await _execute_action(nested)
+
+        params = {}
+        for key in ("params", "args"):
+            raw = (action or {}).get(key)
+            if isinstance(raw, dict):
+                params.update(raw)
+        if isinstance(action, dict):
+            for k, v in action.items():
+                if k in {"type", "name", "action", "params", "args"}:
+                    continue
+                params.setdefault(k, v)
+
+        dres = resolve_and_execute(name, params)
+        return {
+            "status": "success" if bool(dres.get("success")) else "error",
+            "action_type": "device_action",
+            "device_action": str(dres.get("resolved_action") or name),
+            "message": str(dres.get("message") or ""),
+            "error": dres.get("error"),
+            "result": dres,
+        }
+
+    if t in DEVICE_ACTION_NAMES:
+        params = {}
+        if isinstance(action, dict):
+            for k, v in action.items():
+                if k == "type":
+                    continue
+                params[k] = v
+        dres = resolve_and_execute(str(t), params)
+        return {
+            "status": "success" if bool(dres.get("success")) else "error",
+            "action_type": "device_action",
+            "device_action": str(dres.get("resolved_action") or t),
+            "message": str(dres.get("message") or ""),
+            "error": dres.get("error"),
+            "result": dres,
+        }
 
     if t == "list_device_actions":
         # Read-only: returns a catalog of common supported universal actions.

@@ -2110,62 +2110,6 @@ async def _delegate_or_queue_cloud_action(
         out["plan_score"] = selected_score
         return out
 
-    agent_connected_now = bool(await device_hub.is_connected(did))
-
-    if _is_agent_temporarily_unavailable(did) and (not agent_connected_now):
-        queued_steps = plan_steps[:1] if len(plan_steps) > 1 else plan_steps
-        task = _queue_delegated_task(
-            username=username,
-            role=role,
-            device_id=did,
-            feature=feature,
-            source_text=source_text,
-            actions=actions,
-            status_value="queued_for_agent",
-            reason="agent_circuit_open",
-            plan_steps=queued_steps,
-            plan_source=str((selected_option or {}).get("source") or "dynamic"),
-        )
-        out = _cloud_envelope(
-            status="queued_for_agent",
-            execution={"feature": feature, "device_id": did, "task": task},
-            result=None,
-            message="PC agent temporarily unavailable. Using fallback single-step strategy and queueing for retry after cooldown.",
-        )
-        out["feature"] = feature
-        out["device_id"] = did
-        out["task"] = task
-        out["plan"] = queued_steps
-        out["plan_score"] = selected_score
-        return out
-
-    if not agent_connected_now:
-        queued_steps = plan_steps[:1] if len(plan_steps) > 1 else plan_steps
-        task = _queue_delegated_task(
-            username=username,
-            role=role,
-            device_id=did,
-            feature=feature,
-            source_text=source_text,
-            actions=actions,
-            status_value="queued_for_agent",
-            reason="agent_offline",
-            plan_steps=queued_steps,
-            plan_source=str((selected_option or {}).get("source") or "dynamic"),
-        )
-        out = _cloud_envelope(
-            status="queued_for_agent",
-            execution={"feature": feature, "device_id": did, "task": task},
-            result=None,
-            message="PC agent is offline. Multi-step execution avoided; fallback strategy queued for resume after reconnect.",
-        )
-        out["feature"] = feature
-        out["device_id"] = did
-        out["task"] = task
-        out["plan"] = queued_steps
-        out["plan_score"] = selected_score
-        return out
-
     running_task = _queue_delegated_task(
         username=username,
         role=role,
@@ -2179,14 +2123,17 @@ async def _delegate_or_queue_cloud_action(
         status_value="executing",
         reason="plan_generated",
     )
-    payload, plan_error = await _execute_dynamic_plan(
-        device_id=did,
-        username=username or "user",
-        source_text=source_text,
-        task_id=str(running_task.get("task_id") or ""),
-        plan_steps=plan_steps,
-        await_timeout_s=await_timeout_s,
-    )
+    try:
+        payload, plan_error = await _execute_dynamic_plan(
+            device_id=did,
+            username=username or "user",
+            source_text=source_text,
+            task_id=str(running_task.get("task_id") or ""),
+            plan_steps=plan_steps,
+            await_timeout_s=await_timeout_s,
+        )
+    except Exception as e:
+        payload, plan_error = None, str(e)
     if not payload:
         still_connected = bool(await device_hub.is_connected(did))
         if not still_connected:

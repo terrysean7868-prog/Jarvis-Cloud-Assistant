@@ -383,31 +383,44 @@ class LLMAdapter:
 
     def _load_local_reasoner_state(self) -> dict:
         state = self._default_local_reasoner_state()
+        db_enabled = bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True))
+        cloud_db_mode = bool(self.cloud_mode) and db_enabled
 
-        if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
+        if db_enabled:
             try:
                 data = db.local_reasoner_state_get(self._local_reasoner_state_key)
                 if isinstance(data, dict):
                     return self._ensure_local_reasoner_defaults(data)
+                if cloud_db_mode:
+                    logger.warning(
+                        "[local_reasoner.persistence] DB enabled but no state found for key=%s in cloud mode; using default state (no file fallback)",
+                        self._local_reasoner_state_key,
+                    )
+                    return state
                 logger.warning(
                     "[local_reasoner.persistence] DB enabled but no state found for key=%s; falling back to file/default",
                     self._local_reasoner_state_key,
                 )
             except Exception as e:
+                if cloud_db_mode:
+                    logger.warning(
+                        "[local_reasoner.persistence] DB read failed for key=%s in cloud mode: %s; using default state (no file fallback)",
+                        self._local_reasoner_state_key,
+                        str(e),
+                    )
+                    return state
                 logger.warning(
                     "[local_reasoner.persistence] DB read failed for key=%s: %s; falling back to file/default",
                     self._local_reasoner_state_key,
                     str(e),
                 )
 
+        if cloud_db_mode:
+            return state
+
         try:
             p = self._local_reasoner_state_path
             if p.exists():
-                if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)) and bool(self.cloud_mode):
-                    logger.warning(
-                        "[local_reasoner.persistence] Cloud mode using local file fallback for reasoner state: %s",
-                        str(p),
-                    )
                 data = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     return self._ensure_local_reasoner_defaults(data)
@@ -418,7 +431,9 @@ class LLMAdapter:
 
     def _save_local_reasoner_state(self) -> None:
         self._local_reasoner_state["updated_at"] = datetime.now(timezone.utc).isoformat()
-        if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
+        db_enabled = bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True))
+        cloud_db_mode = bool(self.cloud_mode) and db_enabled
+        if db_enabled:
             try:
                 ok = db.local_reasoner_state_upsert(
                     state=self._local_reasoner_state,
@@ -426,24 +441,39 @@ class LLMAdapter:
                 )
                 if ok:
                     return
+                if cloud_db_mode:
+                    logger.warning(
+                        "[local_reasoner.persistence] DB upsert returned false for key=%s in cloud mode; skipping file fallback",
+                        self._local_reasoner_state_key,
+                    )
+                    return
                 logger.warning(
                     "[local_reasoner.persistence] DB upsert returned false for key=%s; using file fallback",
                     self._local_reasoner_state_key,
                 )
             except Exception as e:
+                if cloud_db_mode:
+                    logger.warning(
+                        "[local_reasoner.persistence] DB upsert failed for key=%s in cloud mode: %s; skipping file fallback",
+                        self._local_reasoner_state_key,
+                        str(e),
+                    )
+                    return
                 logger.warning(
                     "[local_reasoner.persistence] DB upsert failed for key=%s: %s; using file fallback",
                     self._local_reasoner_state_key,
                     str(e),
                 )
+
+        if cloud_db_mode:
+            logger.warning(
+                "[local_reasoner.persistence] Cloud mode with DB enabled uses DB-only persistence for key=%s; local file write skipped",
+                self._local_reasoner_state_key,
+            )
+            return
         try:
             p = self._local_reasoner_state_path
             p.parent.mkdir(parents=True, exist_ok=True)
-            if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)) and bool(self.cloud_mode):
-                logger.warning(
-                    "[local_reasoner.persistence] Cloud mode writing local reasoner file fallback: %s",
-                    str(p),
-                )
             p.write_text(json.dumps(self._local_reasoner_state, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(
@@ -475,33 +505,45 @@ class LLMAdapter:
     def _load_local_reasoner_state_for_key(self, state_key: str) -> dict:
         default_state = self._default_local_reasoner_state()
         key = str(state_key or "global").strip().lower() or "global"
+        db_enabled = bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True))
+        cloud_db_mode = bool(self.cloud_mode) and db_enabled
 
-        if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)):
+        if db_enabled:
             try:
                 data = db.local_reasoner_state_get(key)
                 if isinstance(data, dict):
                     return self._ensure_local_reasoner_defaults(data)
+                if cloud_db_mode:
+                    logger.warning(
+                        "[local_reasoner.persistence] DB enabled but no state found for key=%s in cloud mode; using default state (no file fallback)",
+                        key,
+                    )
+                    return default_state
                 logger.warning(
                     "[local_reasoner.persistence] DB enabled but no state found for key=%s; falling back to file/default",
                     key,
                 )
             except Exception as e:
+                if cloud_db_mode:
+                    logger.warning(
+                        "[local_reasoner.persistence] DB read failed for key=%s in cloud mode: %s; using default state (no file fallback)",
+                        key,
+                        str(e),
+                    )
+                    return default_state
                 logger.warning(
                     "[local_reasoner.persistence] DB read failed for key=%s: %s; falling back to file/default",
                     key,
                     str(e),
                 )
 
+        if cloud_db_mode:
+            return default_state
+
         try:
             if key == "global":
                 p = self._local_reasoner_state_path
                 if p.exists():
-                    if bool(getattr(rd, "LOCAL_REASONER_DB_ENABLED", True)) and bool(self.cloud_mode):
-                        logger.warning(
-                            "[local_reasoner.persistence] Cloud mode using local file fallback for key=%s: %s",
-                            key,
-                            str(p),
-                        )
                     data = json.loads(p.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
                         return self._ensure_local_reasoner_defaults(data)
@@ -1831,6 +1873,59 @@ class LLMAdapter:
         }
 
     @staticmethod
+    def _intent_confidence_from_profile(intent_profile: dict, user_text: str, context_state: dict | None) -> float:
+        profile = intent_profile if isinstance(intent_profile, dict) else {}
+        intent_type = str(profile.get("intent_type") or "ambiguous").strip().lower()
+        depth = str(profile.get("intent_depth") or "low").strip().lower()
+        text = str(user_text or "").strip()
+        tl = text.lower()
+
+        base = 0.55
+        if intent_type == "direct_action":
+            base = 0.86
+        elif intent_type == "goal_oriented":
+            base = 0.74
+        elif intent_type == "informational":
+            base = 0.78
+        elif intent_type == "ambiguous":
+            base = 0.42
+
+        if depth == "medium":
+            base += 0.03
+        elif depth == "high":
+            base -= 0.04
+
+        if LLMAdapter._looks_like_continuation_request(tl) and isinstance(context_state, dict):
+            if bool(context_state.get("task_active")):
+                base += 0.08
+            if str(context_state.get("last_entity") or "").strip() or str(context_state.get("active_app") or "").strip():
+                base += 0.04
+
+        if not text:
+            base = 0.15
+        return max(0.05, min(0.98, float(base)))
+
+    def _build_unified_intelligence_state(self, *, user_text: str, context_state: dict | None, user_prefs: dict | None) -> dict:
+        profile = self._classify_intent_profile(user_text)
+        proactive_mode = self._resolve_proactive_mode(user_prefs, context_state)
+        continuation = self._looks_like_continuation_request(user_text)
+        interrupt = self._is_interrupt_instruction(user_text)
+        new_task = self._looks_like_new_task(user_text, context_state)
+        confidence = self._intent_confidence_from_profile(profile, user_text, context_state)
+
+        return {
+            "intent_type": str(profile.get("intent_type") or "ambiguous"),
+            "intent_depth": str(profile.get("intent_depth") or "low"),
+            "response_strategy": str(profile.get("response_strategy") or "clarify"),
+            "primary_intent": self._classify_primary_intent(user_text),
+            "confidence": float(confidence),
+            "proactive_mode": proactive_mode,
+            "continuation": bool(continuation),
+            "interrupt": bool(interrupt),
+            "new_task": bool(new_task),
+        }
+
+    @staticmethod
     def _default_runtime_task_context() -> dict:
         return {
             "active_app": "",
@@ -2230,6 +2325,75 @@ class LLMAdapter:
         return msg
 
     @staticmethod
+    def _derive_recovery_actions_from_execution_result(item: dict | None) -> list[dict]:
+        if not isinstance(item, dict):
+            return []
+        action_type = str(item.get("action_type") or item.get("action") or "").strip().lower()
+        message = str(item.get("message") or item.get("error") or "").strip().lower()
+
+        if action_type in {"open_url"}:
+            url = str(item.get("url") or "").strip()
+            if url:
+                return [{"type": "open_url", "url": url}]
+
+        if action_type in {"web_search", "search"}:
+            query = str(item.get("query") or "").strip()
+            if query:
+                return [{"type": "web_search", "query": query, "num_results": 5}]
+
+        if action_type in {"open_app", "switch_app", "close_app"}:
+            app_name = str(item.get("app_name") or item.get("app") or "").strip()
+            if app_name and action_type in {"open_app", "switch_app"}:
+                return [{"type": "open_app", "app_name": app_name, "args": []}]
+
+        if action_type in {"device_action"}:
+            name = str(item.get("name") or item.get("device_action") or "").strip().lower()
+            if name:
+                # Keep retries conservative: re-issue exact final-effect action once.
+                return [{"type": "device_action", "name": name, "args": {}}]
+
+        if "timeout" in message and action_type in {"fetch_url"}:
+            url = str(item.get("url") or "").strip()
+            if url:
+                return [{"type": "fetch_url", "url": url}]
+
+        return []
+
+    def _derive_autonomous_followup_actions(
+        self,
+        *,
+        context_state: dict | None,
+        execution_results: list[dict] | None,
+        proactive_mode: str,
+        confidence: float,
+    ) -> list[dict]:
+        if not isinstance(context_state, dict):
+            return []
+        mode = str(proactive_mode or "assist").strip().lower()
+        conf = max(0.0, min(1.0, float(confidence or 0.0)))
+        results = execution_results if isinstance(execution_results, list) else []
+        if not results or not bool(context_state.get("task_active")):
+            return []
+
+        # Auto mode: continue safe obvious step when confidence is high.
+        if mode == "auto" and conf >= 0.78:
+            nxt = self._derive_auto_next_action(context_state)
+            if isinstance(nxt, dict) and nxt.get("type"):
+                return [nxt]
+
+        # Failure branch: propose one conservative recovery action in assist/auto.
+        fail = None
+        for r in results:
+            ok = self._execution_result_success(r if isinstance(r, dict) else {})
+            if ok is False:
+                fail = r if isinstance(r, dict) else None
+                break
+        if fail is not None and mode in {"assist", "auto"}:
+            return self._derive_recovery_actions_from_execution_result(fail)
+
+        return []
+
+    @staticmethod
     def _looks_generic_completion_text(text: str) -> bool:
         tl = str(text or "").strip().lower()
         if not tl:
@@ -2280,9 +2444,12 @@ class LLMAdapter:
         primary = first_fail if first_fail is not None else first_success
         primary_message = self._execution_result_message(primary or {})
 
+        followup_actions: list[dict] = []
+
         # Update runtime context with actual execution outcomes.
         try:
             ctx = deepcopy(self._get_runtime_task_context(user_prefs))
+            proactive_mode = self._resolve_proactive_mode(user_prefs, ctx)
             status = "failed" if fail_count > 0 and success_count == 0 else "success"
             if fail_count > 0 and success_count > 0:
                 status = "failed"
@@ -2314,6 +2481,17 @@ class LLMAdapter:
                 context_state=ctx,
             )[:2]
 
+            feedback_conf = 0.9 if status == "success" else 0.7
+            followup_actions = self._derive_autonomous_followup_actions(
+                context_state=ctx,
+                execution_results=results,
+                proactive_mode=proactive_mode,
+                confidence=feedback_conf,
+            )
+
+            if followup_actions:
+                ctx["task_status"] = "in_progress"
+
             exec_actions = out.get("actions") if isinstance(out.get("actions"), list) else []
             self._update_user_habits_from_step(
                 user_prefs=user_prefs,
@@ -2331,11 +2509,21 @@ class LLMAdapter:
             current_text = str(out.get("text") or "").strip()
             if primary_message:
                 if fail_count > 0 and success_count == 0:
-                    out["text"] = f"{primary_message}. Trying an alternative path."
+                    out["text"] = f"That did not work: {primary_message}. I can try a safer next step."
                 elif self._looks_generic_completion_text(current_text):
                     out["text"] = primary_message
             elif fail_count > 0 and success_count == 0 and self._looks_generic_completion_text(current_text):
-                out["text"] = "Execution failed. Trying an alternative path."
+                out["text"] = "That step failed. I can recover with a safer path."
+
+            if followup_actions:
+                existing_actions = out.get("actions") if isinstance(out.get("actions"), list) else []
+                if not existing_actions:
+                    out["actions"] = followup_actions
+                tl = str(out.get("text") or "").strip().lower()
+                if fail_count > 0 and "safer" not in tl:
+                    out["text"] = (str(out.get("text") or "").strip() + " I can retry a safer method.").strip()
+                elif success_count > 0 and fail_count == 0 and "next step" not in tl:
+                    out["text"] = (str(out.get("text") or "").strip() + " I can continue with the next step.").strip()
         except Exception:
             pass
 
@@ -2433,9 +2621,6 @@ class LLMAdapter:
                 continue
             at = str(a.get("type") or "").strip().lower()
             if at in {"execute_command", "delete"}:
-                risky = True
-                break
-            if at in {"write", "edit"} and bool(context_state and context_state.get("task_active")):
                 risky = True
                 break
             if at == "device_action":
@@ -4716,7 +4901,12 @@ class LLMAdapter:
 
         runtime_task_context = self._get_runtime_task_context(user_prefs)
         habits_block = self._user_habits_prompt_block(user_prefs)
-        proactive_mode = self._resolve_proactive_mode(user_prefs, runtime_task_context)
+        intelligence_state = self._build_unified_intelligence_state(
+            user_text=original_text,
+            context_state=runtime_task_context,
+            user_prefs=user_prefs,
+        )
+        proactive_mode = str(intelligence_state.get("proactive_mode") or "assist").strip().lower()
         runtime_task_context["proactive_mode"] = proactive_mode
         self._set_runtime_task_context(user_prefs, runtime_task_context)
 
@@ -4752,13 +4942,13 @@ class LLMAdapter:
 
         # Interrupt handling + multi-task control.
         if bool(runtime_task_context.get("task_active")):
-            if self._is_interrupt_instruction(original_text):
+            if bool(intelligence_state.get("interrupt")):
                 runtime_task_context = self._override_active_task_context(
                     context_state=runtime_task_context,
                     reason="interrupt",
                     user_prefs=user_prefs,
                 )
-            elif self._looks_like_new_task(original_text, runtime_task_context):
+            elif bool(intelligence_state.get("new_task")):
                 runtime_task_context = self._override_active_task_context(
                     context_state=runtime_task_context,
                     reason="replace",
@@ -4807,8 +4997,17 @@ class LLMAdapter:
         except Exception:
             pass
 
-        primary_intent = self._classify_primary_intent(text)
-        intent_profile = self._classify_intent_profile(text)
+        intelligence_state = self._build_unified_intelligence_state(
+            user_text=text,
+            context_state=runtime_task_context,
+            user_prefs=user_prefs,
+        )
+        primary_intent = str(intelligence_state.get("primary_intent") or self._classify_primary_intent(text))
+        intent_profile = {
+            "intent_type": intelligence_state.get("intent_type"),
+            "intent_depth": intelligence_state.get("intent_depth"),
+            "response_strategy": intelligence_state.get("response_strategy"),
+        }
 
         try:
             if intent_profile.get("intent_type") == "goal_oriented":
@@ -5044,7 +5243,9 @@ class LLMAdapter:
         except Exception:
             decision_hint = None
 
-        planning_confidence = float((decision_hint or {}).get("confidence") or 0.7) if isinstance(decision_hint, dict) else 0.7
+        base_conf = float((decision_hint or {}).get("confidence") or 0.0) if isinstance(decision_hint, dict) else 0.0
+        unified_conf = float(intelligence_state.get("confidence") or 0.7)
+        planning_confidence = base_conf if base_conf > 0 else unified_conf
 
         # If the assistant likely lacks knowledge (unknown/low-confidence intent), auto-search the web.
         # This triggers the existing 2-pass web pipeline (search -> continue with web context).
