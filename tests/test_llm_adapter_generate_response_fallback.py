@@ -96,6 +96,26 @@ def test_resolve_contextual_user_text_rewrites_retry_again_to_open_target():
     assert first_line == "open gemini"
 
 
+def test_infer_result_status_does_not_mark_success_from_actions_only():
+    llm = LLMAdapter()
+    assert llm._infer_result_status("", has_actions=True) == ""
+
+
+def test_suggest_next_task_step_reports_queued_waiting_message():
+    llm = LLMAdapter()
+    ctx = llm._default_runtime_task_context()
+    ctx["task_active"] = True
+    ctx["task_status"] = "queued"
+    parsed = {"actions": [{"type": "device_action", "name": "set_brightness"}]}
+    msg = llm._suggest_next_task_step(ctx, parsed)
+    assert "execution queued" in str(msg or "").lower()
+
+
+def test_action_text_for_device_action_is_queued_not_done():
+    msg = LLMAdapter._action_text_from_first_action([{"type": "device_action", "name": "set_bluetooth"}])
+    assert "queued" in str(msg or "").lower()
+
+
 def test_update_runtime_context_derives_last_entity_from_open_app_action():
     adapter = LLMAdapter()
     parsed = {

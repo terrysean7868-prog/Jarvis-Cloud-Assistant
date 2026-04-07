@@ -24,6 +24,22 @@ def test_set_brightness_emits_device_action():
     assert (da.get("args") or {}).get("value") == 40
 
 
+def test_set_brightness_with_spoken_number_percent_emits_device_action():
+    parsed = {"text": "", "actions": []}
+    out = LLMAdapter._postprocess_pc_settings_actions("set brightness to twenty percent", parsed)
+    da = _find_device_action(out.get("actions"), "set_brightness")
+    assert da is not None
+    assert (da.get("args") or {}).get("value") == 20
+
+
+def test_set_brightness_with_typo_emits_device_action():
+    parsed = {"text": "", "actions": []}
+    out = LLMAdapter._postprocess_pc_settings_actions("set brighness 20%", parsed)
+    da = _find_device_action(out.get("actions"), "set_brightness")
+    assert da is not None
+    assert (da.get("args") or {}).get("value") == 20
+
+
 def test_increase_brightness_emits_delta_action():
     parsed = {"text": "", "actions": []}
     out = LLMAdapter._postprocess_pc_settings_actions("increase brightness", parsed)
@@ -78,6 +94,22 @@ def test_bluetooth_toggle_emits_device_action():
     da = _find_device_action(out.get("actions"), "set_bluetooth")
     assert da is not None
     assert (da.get("args") or {}).get("enabled") is True
+
+
+def test_bluetooth_toggle_with_typo_emits_device_action():
+    parsed = {"text": "", "actions": []}
+    out = LLMAdapter._postprocess_pc_settings_actions("turn on blue tooth", parsed)
+    da = _find_device_action(out.get("actions"), "set_bluetooth")
+    assert da is not None
+    assert (da.get("args") or {}).get("enabled") is True
+
+
+def test_deterministic_voice_parses_set_brightness_without_open_verb():
+    out = LLMAdapter._preparse_deterministic_voice_actions("set brighness twenty percent")
+    assert isinstance(out, dict)
+    da = _find_device_action(out.get("actions"), "set_brightness")
+    assert da is not None
+    assert (da.get("args") or {}).get("value") == 20
 
 
 def test_night_light_opens_settings_via_device_action():

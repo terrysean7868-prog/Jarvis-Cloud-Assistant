@@ -2346,7 +2346,9 @@ class LLMAdapter:
         tl = str(text_result or "").strip().lower()
         if re.search(r"\b(fail|failed|error|denied|unable|cannot|can't|could not|timeout)\b", tl):
             return "failed"
-        if has_actions or re.search(r"\b(done|completed|finished|sent|opened|applied|success|successful)\b", tl):
+        # Do not infer success merely because actions were planned; actual execution
+        # feedback arrives later via ingest_execution_feedback.
+        if re.search(r"\b(done|completed|finished|sent|opened|applied|success|successful)\b", tl):
             return "success"
         return ""
 
@@ -2365,6 +2367,11 @@ class LLMAdapter:
         step = int(context_state.get("task_step") or 0)
         active = bool(context_state.get("task_active"))
         next_actions = context_state.get("next_possible_actions") if isinstance(context_state.get("next_possible_actions"), list) else []
+        actions = parsed.get("actions") if isinstance(parsed, dict) else []
+
+        if status in {"queued", "in_progress", "executing", "delegated"} and isinstance(actions, list) and actions:
+            return "Execution queued. I will report the result once the device responds."
+
         if status == "failed":
             options = ", ".join([str(x) for x in next_actions[:2]]) if next_actions else "retry with safer fallback"
             return f"I can recover automatically: {options}. Would you like me to continue?"
@@ -2374,7 +2381,6 @@ class LLMAdapter:
             if len(next_actions) > 1:
                 return f"Based on your usual flow, the best next options are {next_actions[0]} or {next_actions[1]}."
             return f"Based on your usual flow, the best next option is {next_actions[0]}."
-        actions = parsed.get("actions") if isinstance(parsed, dict) else []
         if isinstance(actions, list) and actions:
             return f"Step {step} is queued. I can continue to step {step + 1} next."
         return "I can continue with the next step when you say continue."
@@ -2582,7 +2588,12 @@ class LLMAdapter:
         if has_actions:
             task_active = True
             task_step = max(1, task_step + 1)
-            context_state["task_status"] = "failed" if result_status == "failed" else "in_progress"
+            if result_status == "failed":
+                context_state["task_status"] = "failed"
+            elif result_status == "success":
+                context_state["task_status"] = "in_progress"
+            else:
+                context_state["task_status"] = "queued"
         else:
             if task_active and result_status == "failed":
                 context_state["task_status"] = "failed"
@@ -2950,25 +2961,25 @@ class LLMAdapter:
     @staticmethod
     def _action_text_from_first_action(actions: list[dict]) -> str:
         if not isinstance(actions, list) or not actions:
-            return "Done."
+            return "Execution queued."
         first = actions[0] if isinstance(actions[0], dict) else {}
         at = str(first.get("type") or "").strip().lower()
         if at == "open_app":
             name = str(first.get("app_name") or "").strip() or "the app"
-            return f"Opening {name}."
+            return f"Queued: opening {name}."
         if at == "close_app":
             name = str(first.get("app_name") or "").strip() or "the app"
-            return f"Closing {name}."
+            return f"Queued: closing {name}."
         if at == "switch_app":
             name = str(first.get("app_name") or "").strip() or "the app"
-            return f"Switching to {name}."
+            return f"Queued: switching to {name}."
         if at == "open_url":
-            return "Opening it."
+            return "Queued: opening the link."
         if at == "web_search":
-            return "Looking it up online."
+            return "Queued: looking it up online."
         if at == "device_action":
-            return "Applying that setting."
-        return "Done."
+            return "Queued: applying that setting."
+        return "Execution queued."
 
     def _postprocess_proactive_followup(self, user_text: str, parsed: dict) -> dict:
         """Add concise assistant-style confirmations and optional follow-up suggestions."""
@@ -2988,7 +2999,7 @@ class LLMAdapter:
             important = {"open_app", "switch_app", "close_app", "execute_command", "device_action"}
             if at in important:
                 confirm = self._action_text_from_first_action(actions).strip()
-                if confirm.endswith("."):
+                if confirm.endswith(".") and (not confirm.lower().startswith("queued:")):
                     confirm = confirm[:-1] + " now."
                 if (not txt) or ("opening" not in txt.lower() and "switching" not in txt.lower() and "closing" not in txt.lower() and "applying" not in txt.lower()):
                     parsed["text"] = confirm
@@ -3315,6 +3326,7 @@ class LLMAdapter:
         if not t:
             return None
 
+        t = LLMAdapter._normalize_voice_control_text(t)
         tl = t.lower().strip()
 
         # Skill invocation: "run skill X" / "use X skill" / "skill X"
@@ -3624,6 +3636,20 @@ class LLMAdapter:
 
         parsed: dict = {"text": "", "actions": []}
 
+        # Deterministic settings route: handle "set/turn/increase/decrease ..."
+        # even when no open/switch/close verb is present.
+        if re.search(r"\b(set|turn\s+on|turn\s+off|enable|disable|increase|decrease|raise|lower)\b", tl):
+            try:
+                settings_parsed = LLMAdapter._postprocess_pc_settings_actions(user_text=t, parsed={"text": "", "actions": []})
+                settings_actions = settings_parsed.get("actions") if isinstance(settings_parsed.get("actions"), list) else []
+                if settings_actions:
+                    settings_parsed["source"] = "deterministic-voice"
+                    if not str(settings_parsed.get("text") or "").strip():
+                        settings_parsed["text"] = LLMAdapter._action_text_from_first_action(settings_actions)
+                    return settings_parsed
+            except Exception:
+                pass
+
         # Accept natural phrasing, not just "<verb> <target>".
         # Examples:
         # - jarvis please open notepad
@@ -3787,6 +3813,79 @@ class LLMAdapter:
         )
 
     @staticmethod
+    def _spoken_number_to_int(phrase: str) -> int | None:
+        p = str(phrase or "").strip().lower()
+        if not p:
+            return None
+        units = {
+            "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+            "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+            "seventeen": 17, "eighteen": 18, "nineteen": 19,
+        }
+        tens = {
+            "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+            "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+        }
+        if p in units:
+            return units[p]
+        if p in tens:
+            return tens[p]
+        m = re.fullmatch(
+            r"(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)[ -](one|two|three|four|five|six|seven|eight|nine)",
+            p,
+        )
+        if m:
+            return int(tens[m.group(1)] + units[m.group(2)])
+        if p == "hundred" or p == "one hundred":
+            return 100
+        return None
+
+    @classmethod
+    def _normalize_voice_control_text(cls, text: str) -> str:
+        t = str(text or "").strip().lower()
+        if not t:
+            return ""
+
+        # Normalize common ASR spelling variants for control intents.
+        replacements = [
+            (r"\bblue\s*tooth\b", "bluetooth"),
+            (r"\bblu\s*tooth\b", "bluetooth"),
+            (r"\bblutooth\b", "bluetooth"),
+            (r"\bbightness\b", "brightness"),
+            (r"\bbrighness\b", "brightness"),
+            (r"\bbright\s*ness\b", "brightness"),
+            (r"\bbrite\s*ness\b", "brightness"),
+            (r"\bwi\s*-?\s*fi\b", "wifi"),
+            (r"\bturn\s+of\b", "turn off"),
+        ]
+        for pat, rep in replacements:
+            t = re.sub(pat, rep, t, flags=re.IGNORECASE)
+
+        # Convert spoken percentages, e.g. "twenty percent" -> "20%".
+        number_word_pattern = (
+            r"(zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+            r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+            r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+            r"eighty|ninety|hundred|one\s+hundred)(?:[ -](one|two|three|"
+            r"four|five|six|seven|eight|nine))?"
+        )
+
+        def _to_percent(m: re.Match) -> str:
+            phrase = str(m.group(1) or "")
+            suffix = str(m.group(2) or "")
+            full = (phrase + (f" {suffix}" if suffix else "")).strip()
+            n = cls._spoken_number_to_int(full)
+            if n is None:
+                return str(m.group(0) or "")
+            n = max(0, min(100, int(n)))
+            return f"{n}%"
+
+        t = re.sub(rf"\b{number_word_pattern}\s*percent\b", _to_percent, t, flags=re.IGNORECASE)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    @staticmethod
     def _postprocess_pc_settings_actions(user_text: str, parsed: dict) -> dict:
         """Best-effort helper: open PC Settings pages safely.
 
@@ -3823,7 +3922,7 @@ class LLMAdapter:
                 parsed["actions"] = actions
                 return parsed
 
-        t = (user_text or "").strip().lower()
+        t = LLMAdapter._normalize_voice_control_text(user_text)
         if not t:
             parsed["actions"] = actions
             return parsed

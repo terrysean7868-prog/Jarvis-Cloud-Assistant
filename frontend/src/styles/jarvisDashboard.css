@@ -373,7 +373,7 @@
 }
 
 .jd-hexPickerWrap {
-  width: 190px;
+  /* width: 190px; */
   max-width: 100%;
   max-height: 100%;
   padding: 0;
@@ -381,6 +381,9 @@
   background: transparent;
   box-shadow: none;
   margin: auto;
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }
 
 .jd-metricsGrid {

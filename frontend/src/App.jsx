@@ -653,7 +653,7 @@ export default function App() {
 
         ws.onopen = () => {
           retry = 0;
-          addLog("system", "Realtime notifications connected.");
+          addLog("system", "Realtime channel connected.");
         };
 
         ws.onmessage = (evt) => {
@@ -1034,6 +1034,27 @@ export default function App() {
 
   // No "Enable Voice" button: voice is always on.
   // On mobile we unlock mic/STT on first user gesture.
+
+  const startWakeListeningNow = useCallback(() => {
+    if (!isAuthenticated) {
+      setShowAuthModal(true);
+      return;
+    }
+    if (isMobile && !voiceUnlocked) {
+      addLog("system", "Tap once to unlock microphone, then start wake listening.");
+      return;
+    }
+
+    wakeDisabledUntilRef.current = 0;
+    wakePermissionHintedRef.current = false;
+
+    try {
+      wakeRecognizer.current?.start();
+      addLog("system", `Wake listening active. Say 'Hey ${assistantNameRef.current || "Jarvis"}'.`);
+    } catch {
+      addLog("system", "Wake listener is already active.");
+    }
+  }, [addLog, isAuthenticated, isMobile, voiceUnlocked]);
 
   useEffect(() => {
     assistantNameRef.current = assistantName || "Jarvis";
@@ -2311,14 +2332,6 @@ export default function App() {
           }
         }
 
-      setSpeaking(true);
-      speak(finalSpokenResponse, () => {
-        setSpeaking(false);
-        setEmotion("calm");
-        try { wakeRecognizer.current?.start(); } catch {}
-        isHandlingCommand.current = false;
-      });
-
         // Handle UI-safe actions (like open_url) locally.
         for (const a of uiActions) {
           addLog("action", `${a.type} ${a.value || a.url || a.file_path || a.app_name || ""}`);
@@ -2329,6 +2342,15 @@ export default function App() {
           }
         }
       }
+
+      // Always finalize the voice turn, even for text-only responses without actions.
+      setSpeaking(true);
+      speak(finalSpokenResponse, () => {
+        setSpeaking(false);
+        setEmotion("calm");
+        try { wakeRecognizer.current?.start(); } catch {}
+        isHandlingCommand.current = false;
+      });
     } catch (err) {
       addLog("error", err?.message || String(err));
       setEmotion("critical");
@@ -2544,7 +2566,6 @@ export default function App() {
 
     let active = false;
     let startAttempts = 0;
-    let lastRestartLogAt = 0;
     let restartTimer = null;
 
     const scheduleStart = (ms, reason = "retry") => {
@@ -2572,10 +2593,6 @@ export default function App() {
         recognizer.start();
         active = true;
         startAttempts = 0;
-        if ((Date.now() - lastRestartLogAt) > 5_000 && reason !== "manual") {
-          lastRestartLogAt = Date.now();
-          addLog("system", "listener restarted");
-        }
       } catch (err) {
         startAttempts++;
         if (startAttempts < 6) {
@@ -3141,54 +3158,22 @@ export default function App() {
           <div style={{ pointerEvents: "none", background: "rgba(10,10,12,0.28)", color: "var(--jarvis-accent)", padding: "8px 14px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 10, minWidth: 220, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02)" }}>
             <div style={{ width: 10, height: 10, borderRadius: 999, background: emotion === "critical" ? "#ff4d4f" : emotion === "analyzing" ? "#ffd24d" : "#00ffc8", boxShadow: emotion === "critical" ? "0 0 10px rgba(255,77,79,0.45)" : emotion === "analyzing" ? "0 0 10px rgba(255,210,77,0.35)" : "0 0 10px rgba(0,255,200,0.45)" }} />
             <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 13, letterSpacing: 0.3 }}>
-              {emotion === "calm" && (speaking ? "Speaking" : (listening ? "Capturing" : (wakeListeningOnline ? "Wake listening" : "Idle")))}
+              {emotion === "calm" && (speaking ? "Responding" : (listening ? "Capturing command" : (wakeListeningOnline ? "Wake listener active" : "Wake listener paused")))}
               {emotion === "analyzing" && "Analyzing"}
               {emotion === "critical" && "Critical"}
             </div>
           </div>
           {!(activeDisplay === "autonomy" && String(autonomyTab || "").toLowerCase() === "anatomy") && (
             <div
-              onPointerDown={(e) => {
+              onClick={() => {
                 if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-                try { e.preventDefault(); } catch {}
-                try {
-                  if (typeof e.pointerId === "number" && e.currentTarget?.setPointerCapture) {
-                    e.currentTarget.setPointerCapture(e.pointerId);
-                  }
-                } catch {}
-                startHoldToTalk();
-              }}
-              onPointerUp={(e) => {
-                if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-                try { e.preventDefault(); } catch {}
-                try {
-                  if (typeof e.pointerId === "number" && e.currentTarget?.releasePointerCapture) {
-                    e.currentTarget.releasePointerCapture(e.pointerId);
-                  }
-                } catch {}
-                stopHoldToTalk();
-              }}
-              onPointerCancel={(e) => {
-                if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-                try {
-                  if (typeof e.pointerId === "number" && e.currentTarget?.releasePointerCapture) {
-                    e.currentTarget.releasePointerCapture(e.pointerId);
-                  }
-                } catch {}
-                stopHoldToTalk();
+                startWakeListeningNow();
               }}
               onKeyDown={(e) => {
                 if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
                 if (e.key === " " || e.key === "Enter") {
                   e.preventDefault();
-                  startHoldToTalk();
-                }
-              }}
-              onKeyUp={(e) => {
-                if (!isAuthenticated || (isMobile && !voiceUnlocked)) return;
-                if (e.key === " " || e.key === "Enter") {
-                  e.preventDefault();
-                  stopHoldToTalk();
+                  startWakeListeningNow();
                 }
               }}
               role={isAuthenticated ? "button" : undefined}
@@ -3197,7 +3182,7 @@ export default function App() {
               style={{ pointerEvents: "auto", background: "rgba(10,10,12,0.35)", color: "var(--jarvis-accent)", padding: "10px 18px", borderRadius: 999, backdropFilter: "blur(6px)", display: "flex", alignItems: "center", gap: 12, minWidth: 260, justifyContent: "center", boxShadow: "inset 0 0 20px rgba(255,255,255,0.02), 0 0 18px var(--jarvis-accent-glow)", border: "1px solid var(--jarvis-accent)", cursor: isAuthenticated ? "pointer" : "default" }}
             >
               <div style={{ fontFamily: "Inter, system-ui, sans-serif", fontSize: 14 }}>
-                {listening ? "Listening..." : speaking ? "Responding..." : `Say 'Hey ${assistantName || "Jarvis"}'`}
+                {`Say 'Hey ${assistantName || "Jarvis"}'`}
               </div>
 
             </div>

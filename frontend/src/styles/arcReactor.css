@@ -4,7 +4,7 @@
   position: relative;
   user-select: none;
   touch-action: none;
-  -webkit-tap-highlight-color: rgba(0,0,0,0);
+  -webkit-tap-highlight-color: #00000000;
   border-radius: 999px;
   overflow: hidden;
 }
@@ -26,7 +26,7 @@
   color: rgba(180, 255, 240, 0.95);
   font-size: 12px;
   letter-spacing: 0.6px;
-  text-shadow: 0 1px 6px rgba(0,0,0,0.5);
+  text-shadow: 0 1px 6px rgba(185, 185, 185, 0.5);
   pointer-events: none;
 }
 

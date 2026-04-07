@@ -245,11 +245,11 @@ export default function JarvisDashboard({
               <div className="jd-copyValue">{serverUrlDisplay}</div>
               <button className="jd-btn" onClick={() => handleCopy("Server URL", agentServerUrl)} disabled={!agentServerUrl}>Copy</button>
             </div>
-            <div className="jd-copyRow">
+            {/* <div className="jd-copyRow">
               <div className="jd-copyLabel">WS URL</div>
               <div className="jd-copyValue">{wsUrlDisplay}</div>
               <button className="jd-btn" onClick={() => handleCopy("WS URL", agentWsUrl)} disabled={!agentWsUrl}>Copy</button>
-            </div>
+            </div> */}
             <div className="jd-copyRow">
               <div className="jd-copyLabel">Agent token</div>
               <div className="jd-copyValue">{tokenDisplay}</div>
