@@ -28,6 +28,14 @@ class AuthTokens:
         self.issuer = env.get_str("JARVIS_JWT_ISSUER", "jarvis")
         self.ttl_seconds = 28800
         self.use_db_revocation = True
+        self._revocation_indexes_ready = False
+
+    def _ensure_revocation_indexes(self, col) -> None:
+        if self._revocation_indexes_ready:
+            return
+        col.create_index([("jti", 1)], unique=True)
+        col.create_index([("exp", 1)])
+        self._revocation_indexes_ready = True
 
     def issue(self, username: str, role: str = "user") -> str:
         if not self.secret:
@@ -63,11 +71,11 @@ class AuthTokens:
             # Optional revocation check
             if self.use_db_revocation:
                 try:
-                    db._ensure_connected()
+                    # Do not force reconnection here; verification is on the hot request path.
+                    # If DB is unavailable, skip revocation checks and keep tokens usable.
                     if db.db is not None:
                         col = db.db.auth_revoked_tokens
-                        col.create_index([("jti", 1)], unique=True)
-                        col.create_index([("exp", 1)])
+                        self._ensure_revocation_indexes(col)
                         jti = payload.get("jti")
                         if jti and col.find_one({"jti": jti}):
                             return False, None, None
@@ -95,8 +103,7 @@ class AuthTokens:
             if db.db is None:
                 return False
             col = db.db.auth_revoked_tokens
-            col.create_index([("jti", 1)], unique=True)
-            col.create_index([("exp", 1)])
+            self._ensure_revocation_indexes(col)
             col.update_one(
                 {"jti": payload.get("jti")},
                 {"$set": {"jti": payload.get("jti"), "exp": payload.get("exp"), "revoked_at": datetime.now(timezone.utc)}},

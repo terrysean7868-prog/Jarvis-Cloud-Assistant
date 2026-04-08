@@ -15,14 +15,15 @@ try:
 except Exception:  # pragma: no cover
     load_dotenv = None
 
-from src.config import runtime_defaults as rd
-from src.config.secrets import llm_secrets
-
 
 def _fetch_json(url: str, api_key: str, timeout: int) -> dict[str, Any]:
     req = urllib.request.Request(
         url,
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "jarvis-provider-check/1.0",
+            "Accept": "application/json",
+        },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", "ignore"))
@@ -69,7 +70,12 @@ def _check_provider(
 
 def main() -> int:
     if load_dotenv is not None:
-        load_dotenv()
+        # Force local .env precedence for deterministic local diagnostics.
+        # Without override=True, stale machine-level env vars can mask repo values.
+        load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=True)
+
+    from src.config import runtime_defaults as rd
+    from src.config.secrets import llm_secrets
 
     parser = argparse.ArgumentParser(
         description="Manual one-shot check for configured LLM providers (primary + backup)."
@@ -84,6 +90,11 @@ def main() -> int:
         "--show-models",
         action="store_true",
         help="Print first 20 model IDs from each provider.",
+    )
+    parser.add_argument(
+        "--require-backup",
+        action="store_true",
+        help="Fail when backup provider is unhealthy (strict mode).",
     )
     args = parser.parse_args()
 
@@ -118,9 +129,15 @@ def main() -> int:
     )
     print(out_backup)
 
-    # Exit non-zero if backup is not healthy, since that's usually the risky surprise.
+    # By default, treat healthy primary as operational success.
+    # Use --require-backup for strict HA checks.
     if ok_primary and ok_backup:
         print("\nRESULT: BOTH_PROVIDERS_OK")
+        return 0
+
+    if ok_primary and not ok_backup and not args.require_backup:
+        print("\nRESULT: PRIMARY_ONLY_OK")
+        print("Backup provider is unhealthy, but primary provider is operational.")
         return 0
 
     print("\nRESULT: PROVIDER_CHECK_FAILED")

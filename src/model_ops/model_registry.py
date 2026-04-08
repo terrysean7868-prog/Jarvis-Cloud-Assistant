@@ -12,12 +12,12 @@ def _default_registry() -> dict[str, Any]:
     return {
         "schema_version": 1,
         "updated_at": now_iso(),
-        "active_profile": "local_primary_api_backup",
+        "active_profile": "cloud_only",
         "active_models": {
-            "primary": "ollama_llama3_1_8b",
+            "primary": "openai_compatible_primary",
             "fallback": "openai_compatible_backup",
-            "code_debug": "ollama_qwen2_5_7b",
-            "embedding": "local_embedding_default",
+            "code_debug": "openai_compatible_primary",
+            "embedding": "remote_embedding_default",
         },
         "health": {},
         "last_benchmark": None,

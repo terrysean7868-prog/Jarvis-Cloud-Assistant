@@ -734,7 +734,14 @@ class ChatOrchestrator:
             blocked = [a for a in actions if (a or {}).get("type") in self.admin_only_action_types]
             allowed = [a for a in actions if (a or {}).get("type") not in self.admin_only_action_types]
             if blocked:
-                response["text"] = (response.get("text") or "") + "\n\n(Some actions require admin privileges and were skipped.)"
+                base = str(response.get("text") or "").strip()
+                if (not allowed) and re.search(
+                    r"\b(opening|switching|closing|applying|queued|execution queued|continuing with the next step)\b",
+                    base.lower(),
+                ):
+                    base = "I could not run that action with current permissions."
+                note = "(Some actions require admin privileges and were skipped.)"
+                response["text"] = (base + "\n\n" + note).strip() if base else note
             return allowed
 
         return actions
@@ -1014,6 +1021,30 @@ class ChatOrchestrator:
         # Permissions layer.
         actions = self._enforce_permissions(principal, role, response, actions)
         response["actions"] = actions
+
+        # Final web-policy guard at orchestrator level: if the adapter emitted
+        # web actions for a prompt that does not require lookup, drop them to
+        # keep local chat responsive and avoid needless 2-pass web loops.
+        try:
+            web_types = {"web_search", "fetch_url", "search"}
+            has_web_actions = any(
+                isinstance(a, dict) and str((a.get("type") or "").strip().lower()) in web_types
+                for a in (actions or [])
+            )
+            should_use_web = True
+            llm_obj = getattr(self.brain, "llm", None)
+            should_lookup_fn = getattr(llm_obj, "_should_use_web_lookup", None)
+            if callable(should_lookup_fn):
+                should_use_web = bool(should_lookup_fn(text))
+            if has_web_actions and not should_use_web:
+                actions = [
+                    a
+                    for a in (actions or [])
+                    if not (isinstance(a, dict) and str((a.get("type") or "").strip().lower()) in web_types)
+                ]
+                response["actions"] = actions
+        except Exception:
+            pass
 
         # Inline execute web actions so user actually sees the answer.
         async_out = await self._schedule_async_research_if_needed(

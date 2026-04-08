@@ -1414,6 +1414,18 @@ class LLMAdapter:
             "cached_best_response": "",
         }
         try:
+            # Fast path: keep trivial chat requests independent from DB health.
+            # This prevents avoidable latency/timeouts when Mongo is slow/unavailable.
+            try:
+                qtype_fast = self._knowledge_query_type(text)
+            except Exception:
+                qtype_fast = "general"
+            if (not include_rag) and qtype_fast in {"general", "project"}:
+                if self.learning_engine is not None:
+                    out["learning_hints"] = self.learning_engine.get_learning_hints(text, limit=2)
+                    out["cached_best_response"] = self.learning_engine.get_cached_best_response(text) or ""
+                return out
+
             db._ensure_connected()
             if db.db is None:
                 return out
@@ -1616,6 +1628,11 @@ class LLMAdapter:
         if str(response_mode or "").strip().lower() != "voice":
             return str(text or "").strip()
 
+        # Wake-word UX: keep a full friendly readiness line.
+        wake_word = str(user_text or "").strip().lower()
+        if re.match(r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s+up(?:\s+jarvis)?|jarvis\s+wake\s+up)[\s!?.]*$", wake_word):
+            return "Hello, I'm here. How can I help you?"
+
         txt = self._clean_conversational_noise(text)
         if not txt:
             return txt
@@ -1762,6 +1779,12 @@ class LLMAdapter:
         profile = self._classify_intent_profile(user_text)
         if str(profile.get("intent_type") or "") == "informational":
             explicit_execute = bool(re.search(r"\b(open|run|execute|launch|start|go\s+to|visit)\b", str(user_text or "").lower()))
+            explicit_research = bool(
+                re.search(
+                    r"\b(research|look\s+up|search\s+(for|online)?|latest|current|today|sources?|citations?|links?)\b",
+                    str(user_text or "").lower(),
+                )
+            )
             if not explicit_execute:
                 filtered_actions = []
                 for a in actions:
@@ -1770,10 +1793,35 @@ class LLMAdapter:
                     at = str(a.get("type") or "").strip().lower()
                     if at in {"open_app", "open_url", "execute_command", "device_action", "switch_app", "close_app"}:
                         continue
+                    if (not explicit_research) and at in {"web_search", "fetch_url", "search"}:
+                        continue
                     filtered_actions.append(a)
                 if filtered_actions != actions:
                     actions = filtered_actions
                     out["actions"] = filtered_actions
+
+        # Safety guard: for plain chat/greeting/informational prompts, do not emit
+        # typing-style execution actions unless user explicitly asked to type/write.
+        try:
+            intent_type = str(profile.get("intent_type") or "").strip().lower()
+            explicit_type_request = bool(
+                re.search(r"\b(type|write|paste|enter|fill|input|insert|replace\s+text)\b", str(user_text or "").lower())
+            )
+            if intent_type in {"informational", "ambiguous"} and not explicit_type_request:
+                filtered_actions = []
+                for a in actions:
+                    if not isinstance(a, dict):
+                        continue
+                    at = str(a.get("type") or "").strip().lower()
+                    if at in {"type_text", "press_key", "hotkey"}:
+                        continue
+                    filtered_actions.append(a)
+                if filtered_actions != actions:
+                    actions = filtered_actions
+                    out["actions"] = filtered_actions
+        except Exception:
+            pass
+
         if primary_intent != "informational_intent":
             txt = re.sub(r"(?im)^\s*I\s+found\s+this\s*:?\s*", "", txt).strip()
             txt = re.sub(r"(?im)^\s*Risks\s*/\s*assumptions\s*:?\s*", "", txt).strip()
@@ -3313,12 +3361,43 @@ class LLMAdapter:
                 "source": "deterministic-local-chat",
             }
 
+        if re.match(r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s+up(?:\s+jarvis)?|jarvis\s+wake\s+up)([\s!?.]*)$", tl):
+            return {
+                "text": "Hello, I am here. How can I help you?",
+                "actions": [],
+                "source": "deterministic-local-chat",
+            }
+
         if "what can you do" in tl or "capabilit" in tl:
             return {
                 "text": "I can answer questions, do quick research, and run connected PC actions like opening apps, URLs, screenshots, and safe automations when permissions allow.",
                 "actions": [],
                 "source": "deterministic-local-chat",
             }
+
+        # Deterministic one-line definitions for simple prompts.
+        m = re.match(r"^\s*what\s+is\s+(.+?)(?:\s+in\s+one\s+line|\s+in\s+a\s+line)?[\s?.!]*$", tl)
+        if m:
+            topic = str(m.group(1) or "").strip(" .,!?:;")
+            if topic:
+                definitions = {
+                    "python": "Python is a high-level programming language known for readability and versatility.",
+                    "api": "An API is a defined interface that lets software systems communicate with each other.",
+                    "ai": "AI is software that performs tasks that normally require human-like intelligence.",
+                    "machine learning": "Machine learning is a method where models learn patterns from data to make predictions.",
+                    "tcp": "TCP is a reliable transport protocol that delivers ordered data between networked systems.",
+                    "http": "HTTP is the protocol used for requesting and transferring web resources.",
+                    "dns": "DNS translates domain names into IP addresses so clients can reach internet services.",
+                }
+                line = definitions.get(topic)
+                if not line:
+                    topic_label = topic.upper() if len(topic) <= 5 and topic.isalpha() else topic.capitalize()
+                    line = f"{topic_label} is the concept or system referred to by that term."
+                return {
+                    "text": line,
+                    "actions": [],
+                    "source": "deterministic-local-chat",
+                }
 
         if re.search(r"\b(self\s*[-_]?update)\b", tl) and re.search(r"\b(explain|what\s+is|how|command|usage|mean|means)\b", tl):
             return {
@@ -3789,6 +3868,7 @@ class LLMAdapter:
         # Fast-path: greetings and simple small-talk → instant response, no LLM needed.
         _GREETING_PATTERNS = {
             r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day)|what'?s\s+up|sup|yo)[\s!?.,]*$": "Hey! How can I help you?",
+            r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s+up(?:\s+jarvis)?|jarvis\s+wake\s+up)[\s!?.,]*$": "Hello, I am here. How can I help you?",
             r"^how\s+are\s+you[\s!?.,]*$": "I'm running great! What can I do for you?",
             r"^(what'?s\s+your\s+name|who\s+are\s+you)[\s!?.,]*$": "I'm Jarvis, your AI assistant.",
             r"^(thanks|thank\s+you|ty|cheers|thx)[\s!?.,]*$": "You're welcome! Anything else?",
@@ -4904,6 +4984,17 @@ class LLMAdapter:
         if bool(getattr(rd, "GLOBAL_FACTUAL_MODE", False)):
             # Internal orchestration/system prompts must not trigger new web loops.
             if not (t.startswith("you are ") or ("provided web context" in t)):
+                # Keep simple definition/explanation prompts local for speed unless
+                # the user explicitly asks for current/sourced data.
+                simple_definition = bool(
+                    re.search(r"\b(what is|define|explain|meaning of)\b", t)
+                    and len(re.findall(r"[a-z0-9]+", t)) <= 12
+                )
+                explicit_source_or_fresh = bool(
+                    re.search(r"\b(latest|today|current|source|sources|citation|cite|link|links|online|internet)\b", t)
+                )
+                if simple_definition and not explicit_source_or_fresh:
+                    return False
                 if not any(t.startswith(m) for m in local_action_markers):
                     return True
 
@@ -5816,8 +5907,9 @@ Style tone: {tone}.
 
             prompt_windows = [1200, 800] if complexity == 0 else [2000, 1200, 800]
             budget_started = time.monotonic()
-            request_budget_s = min(float(self.provider_budget_s), 9.0) if complexity == 0 else float(self.provider_budget_s)
-            request_timeout_s = min(float(self.provider_timeout_s), 6.0) if complexity == 0 else float(self.provider_timeout_s)
+            # For simple chat, reserve enough time for backup provider attempts.
+            request_budget_s = min(float(self.provider_budget_s), 16.0) if complexity == 0 else float(self.provider_budget_s)
+            request_timeout_s = min(float(self.provider_timeout_s), 4.0) if complexity == 0 else float(self.provider_timeout_s)
             max_primary_attempts = 1 if complexity == 0 else len(prompt_windows)
 
             logger.info(
@@ -6123,6 +6215,13 @@ Style tone: {tone}.
             # and optional proactive follow-up suggestions when useful.
             try:
                 parsed = self._postprocess_proactive_followup(text, parsed)
+            except Exception:
+                pass
+
+            # Final guard: some later post-processors can reintroduce web actions.
+            # Re-apply policy to keep simple informational questions fast.
+            try:
+                parsed = self._postprocess_web_lookup_policy(user_text=text, parsed=parsed)
             except Exception:
                 pass
 

@@ -101,7 +101,7 @@ DEFAULT_MODELS: list[dict[str, Any]] = [
     {
         "model_id": "openai_compatible_backup",
         "display_name": "OpenAI-Compatible Backup",
-        "provider_type": "fallback",
+        "provider_type": "groq",
         "runtime_type": "fallback",
         "local_or_remote": "remote",
         "cost_profile": "paid",

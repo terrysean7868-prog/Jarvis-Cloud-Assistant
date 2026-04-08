@@ -24,6 +24,19 @@ def is_cloud_runtime() -> bool:
             return True
     except Exception:
         pass
+    hosted_markers = (
+        "RENDER",
+        "RENDER_SERVICE_ID",
+        "RENDER_EXTERNAL_URL",
+        "HEROKU_APP_NAME",
+        "DYNO",
+        "K_SERVICE",  # Cloud Run
+        "WEBSITE_SITE_NAME",  # Azure App Service
+        "RAILWAY_ENVIRONMENT",
+        "FLY_APP_NAME",
+    )
+    if any((os.getenv(k) or "").strip() for k in hosted_markers):
+        return True
     return False
 
 

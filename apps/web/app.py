@@ -373,7 +373,7 @@ except Exception:
 START_TS = time.time()
 
 # Production stability safeguards (process-local).
-GLOBAL_LLM_CALL_TIMEOUT_S = 20.0
+GLOBAL_LLM_CALL_TIMEOUT_S = 45.0
 GLOBAL_AGENT_RESPONSE_TIMEOUT_S = 8.0
 GLOBAL_TASK_EXEC_TIMEOUT_S = 25.0
 DELEGATED_MAX_RETRIES = 2
@@ -2485,28 +2485,28 @@ def _get_principal(session_id: str | None) -> dict:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired session. Please login again.",
             )
-        # Prefer authoritative role from the user store (MongoDB/file), so role changes apply immediately.
-        # Cache briefly to avoid repeated file/DB reads on hot endpoints.
-        role = None
-        try:
-            u = (username or "").strip().lower()
-            now = time.time()
-            cached = _ROLE_CACHE.get(u)
-            if cached and (now - cached[0]) < _ROLE_CACHE_TTL_S:
-                role = cached[1]
-            else:
-                # Only trust the user store if the user actually exists there.
-                # voice_auth.get_role() defaults to "user" for unknown users, which would
-                # incorrectly override a valid JWT role.
-                user_doc = voice_auth.get_user(username)
-                if user_doc:
-                    role = (user_doc.get("role") or "").strip().lower() or None
-                    if role:
-                        _ROLE_CACHE[u] = (now, str(role).strip().lower())
-        except Exception:
-            role = None
-        if not role:
-            role = ((payload or {}).get("role") or "user").strip().lower()
+        role = ((payload or {}).get("role") or "user").strip().lower()
+
+        # In cloud mode, trust JWT role claims for low-latency request handling.
+        # This avoids synchronous DB lookups on hot endpoints and keeps web UX responsive.
+        if not CLOUD_MODE:
+            # Prefer authoritative role from the user store (MongoDB/file), so local role
+            # changes apply immediately while preserving the JWT fallback path.
+            try:
+                u = (username or "").strip().lower()
+                now = time.time()
+                cached = _ROLE_CACHE.get(u)
+                if cached and (now - cached[0]) < _ROLE_CACHE_TTL_S:
+                    role = cached[1]
+                else:
+                    user_doc = voice_auth.get_user(username)
+                    if user_doc:
+                        store_role = (user_doc.get("role") or "").strip().lower() or None
+                        if store_role:
+                            role = store_role
+                            _ROLE_CACHE[u] = (now, store_role)
+            except Exception:
+                pass
         if role not in ("user", "admin"):
             role = "user"
         return {"username": username, "role": role, "auth_type": "jwt", "token": payload}
@@ -7352,7 +7352,8 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     # Persist normalized chat event (best effort, no impact on runtime path).
     try:
         if username or msg.user:
-            database.save_chat(
+            background_tasks.add_task(
+                database.save_chat,
                 user_input=msg.text,
                 bot_response=str((response or {}).get("text") or ""),
                 session_id=msg.session_id,
@@ -7370,7 +7371,8 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     # Controlled learning signal + periodic evaluator (best effort, suggestion-only).
     try:
         if learning_engine is not None:
-            learning_signal = learning_engine.log_response_quality(
+            background_tasks.add_task(
+                learning_engine.log_response_quality,
                 user_id=(username or msg.user or "user"),
                 query=str(msg.text or ""),
                 response_text=str((response or {}).get("text") or ""),
@@ -7382,9 +7384,7 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
                 task_result_status=str((response or {}).get("task_result_status") or (response or {}).get("status") or ""),
             )
             response["learning_signal"] = {
-                "quality_score": learning_signal.get("quality_score"),
-                "weak": learning_signal.get("weak"),
-                "response_outcome": learning_signal.get("response_outcome"),
+                "queued": True,
             }
             # Internally cooldown-gated to prevent loops/regressions.
             background_tasks.add_task(learning_engine.run_controlled_learning_cycle, lookback_hours=48)
@@ -7393,7 +7393,8 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
 
     # Learn user behavior preferences (execution vs explanation and verbosity) into user_preferences.
     try:
-        _learn_user_behavior_preferences(
+        background_tasks.add_task(
+            _learn_user_behavior_preferences,
             user_id=(username or msg.user),
             user_text=str(msg.text or ""),
             response_text=str((response or {}).get("text") or ""),
@@ -7417,7 +7418,8 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         routing = rdict.get("routing") if isinstance(rdict.get("routing"), dict) else {}
         fallback_used = bool(routing.get("fallback_used")) or source.startswith("fallback")
 
-        _record_intent_telemetry(
+        background_tasks.add_task(
+            _record_intent_telemetry,
             request_id=request_id,
             user_id=(username or msg.user),
             intent_type=intent_type,
@@ -7434,21 +7436,20 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
     except Exception:
         pass
 
-    # Persist voice command telemetry (MongoDB)
+    # Persist voice command telemetry in background to keep chat responses fast.
     try:
         if (msg.mode or "").strip().lower() == "voice" and (username or msg.user):
-            database._ensure_connected()
-            if database.db is not None:
-                database.save_voice_command(
-                    command_text=msg.text,
-                    command_type="voice",
-                    status="received",
-                    result={
-                        "user": (username or msg.user),
-                        "action_count": len(actions) if isinstance(actions, list) else 0,
-                        "mode": msg.mode,
-                    },
-                )
+            background_tasks.add_task(
+                database.save_voice_command,
+                command_text=msg.text,
+                command_type="voice",
+                status="received",
+                result={
+                    "user": (username or msg.user),
+                    "action_count": len(actions) if isinstance(actions, list) else 0,
+                    "mode": msg.mode,
+                },
+            )
     except Exception:
         # never break chat flow on telemetry
         pass

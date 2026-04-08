@@ -388,6 +388,57 @@ class JarvisBrain:
         except Exception:
             pass
 
+        # Ultra-fast path for deterministic local replies/actions.
+        # Run this before task-status scans and DB-heavy context hydration.
+        try:
+            deterministic = None
+            preparse = getattr(self.llm, "_preparse_deterministic_voice_actions", None)
+            quick_reply = getattr(self.llm, "_quick_local_chat_reply", None)
+
+            if callable(preparse):
+                cand = preparse(text)
+                if isinstance(cand, dict) and str(cand.get("text") or "").strip():
+                    deterministic = cand
+
+            if deterministic is None and callable(quick_reply):
+                cand = quick_reply(text)
+                if isinstance(cand, dict) and str(cand.get("text") or "").strip():
+                    deterministic = cand
+
+            if isinstance(deterministic, dict):
+                det_text = str(deterministic.get("text") or "").strip()
+                det_actions = deterministic.get("actions") if isinstance(deterministic.get("actions"), list) else []
+                source = str(deterministic.get("source") or "deterministic-local-chat")
+
+                self.memory.append({"role": "user", "text": text})
+                self.memory.append({"role": "assistant", "text": det_text})
+                if len(self.memory) > 50:
+                    self.memory.pop(0)
+
+                try:
+                    task_manager.save_wakeup_context(text, det_text, det_actions)
+                except Exception:
+                    pass
+
+                intent_type = "direct_action" if det_actions else "informational"
+                response_strategy = "immediate_execution" if det_actions else "explain_only"
+
+                return {
+                    "text": det_text,
+                    "actions": det_actions,
+                    "tool_results": [],
+                    "mode": mode,
+                    "source": source,
+                    "intent": intent_type,
+                    "intent_type": intent_type,
+                    "intent_depth": "low",
+                    "response_strategy": response_strategy,
+                    "proactive_followup_added": False,
+                    "user_preference_influenced": False,
+                }
+        except Exception:
+            pass
+
         # If any background research finished since the last user interaction, surface it now.
         research_notice = ""
         try:
@@ -1149,13 +1200,19 @@ class JarvisBrain:
             # Log chat
             task_manager.save_wakeup_context(text, response["text"], actions)
 
-            db.save_chat(
-                user_input=text,
-                bot_response=response["text"],
-                session_id=session_id,
-                intent="auto",
-                context={"actions": actions, "mode": mode}
-            )
+            try:
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        db.save_chat,
+                        user_input=text,
+                        bot_response=response["text"],
+                        session_id=session_id,
+                        intent="auto",
+                        context={"actions": actions, "mode": mode},
+                    )
+                )
+            except Exception:
+                pass
 
             # Return reply and tool results
             final_text = response["text"]

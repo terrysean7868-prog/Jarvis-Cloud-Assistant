@@ -7,6 +7,7 @@ from .deployment_profiles import get_profile
 from .model_catalog import get_model
 from .model_registry import load_registry
 from src.utils.db import db
+from src.config import runtime_defaults as rd
 
 
 def _complexity_score(text: str) -> int:
@@ -144,6 +145,19 @@ def resolve_route(text: str, mode: str = "chat", profile_name: str | None = None
     task = classify_task_type(text, mode=mode)
     reg = load_registry()
     active_profile = profile_name or str(reg.get("active_profile") or "local_primary_api_backup")
+    provider_mode = str(getattr(rd, "LLM_PROVIDER", "openai_compatible") or "openai_compatible").strip().lower()
+
+    # If runtime provider is API-based, avoid stale local-only profiles from old registries.
+    if provider_mode == "openai_compatible" and not profile_name:
+        if active_profile in {
+            "local_only",
+            "local_primary_api_backup",
+            "local_chat_cloud_reasoning",
+            "free_only_local_stack",
+            "hybrid_local_primary_cloud_fallback",
+        }:
+            active_profile = "cloud_only"
+
     profile = get_profile(active_profile) or {}
     complexity = _complexity_score(text)
 
@@ -164,6 +178,14 @@ def resolve_route(text: str, mode: str = "chat", profile_name: str | None = None
         field = "code_debug_model"
     model_id = str(profile.get(field) or (reg.get("active_models") or {}).get("primary") or "ollama_llama3_1_8b")
     fallback_model_id = str(profile.get("fallback_model") or (reg.get("active_models") or {}).get("fallback") or "local_tiny_fallback")
+
+    # Provider guardrails: map stale local model ids to remote-compatible ids when
+    # runtime is configured for OpenAI/Groq endpoints.
+    if provider_mode == "openai_compatible":
+        if model_id.startswith("ollama_") or model_id in {"local_tiny_fallback", ""}:
+            model_id = "openai_compatible_primary"
+        if fallback_model_id.startswith("ollama_") or fallback_model_id in {"local_tiny_fallback", ""}:
+            fallback_model_id = "openai_compatible_backup"
 
     model_id, adaptive_reason = _adaptive_override(task, model_id, fallback_model_id)
 
