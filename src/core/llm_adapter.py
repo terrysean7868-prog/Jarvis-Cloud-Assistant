@@ -1391,26 +1391,17 @@ class LLMAdapter:
         t = str(text or "").strip().lower()
         if not include_provider_notice:
             if re.search(r"\b(task|plan|workflow|steps|delegate)\b", t):
-                return "I can continue with a deterministic step-by-step plan and safe local actions."
+                return "Working on it."
             if re.search(r"\b(project|repo|codebase|architecture)\b", t):
-                return "I can continue with deterministic local analysis using indexed context and recent logs."
-            return "Continuing with deterministic local fallback while provider routing stabilizes."
+                return "I can help with that."
+            return "Done."
         if re.search(r"\b(debug|error|traceback|exception|fail|timeout)\b", t):
-            return (
-                "Share the exact error line and I will return a likely cause and fix checklist, "
-                "or ask me to run a minimal retry plan."
-            )
+            return "Share the exact error line and I will fix it step by step."
         if re.search(r"\b(task|plan|workflow|steps|delegate)\b", t):
-            return (
-                "I can generate a deterministic step-by-step task plan and safe execution actions."
-            )
+            return "I can take this step by step."
         if re.search(r"\b(project|repo|codebase|architecture)\b", t):
-            return (
-                "I can do a deterministic project analysis pass using indexed context and recent logs."
-            )
-        return (
-            "I can handle deterministic local actions and concise fallback answers right now."
-        )
+            return "I can review that and suggest the next best step."
+        return "Done."
 
     def _fetch_recent_runtime_context(self, text: str, *, limit: int = 3, include_rag: bool = True) -> dict:
         out = {
@@ -1941,10 +1932,27 @@ class LLMAdapter:
             "next_possible_actions": [],
             "goal_progress": 0.0,
             "proactive_mode": "assist",
+            "pending_clarification_kind": "",
+            "pending_clarification_question": "",
+            "pending_clarification_original_text": "",
             "expires_at": "",
             "updated_at": "",
             "last_resolved_input": "",
         }
+
+    @staticmethod
+    def _has_pending_clarification(context_state: dict | None) -> bool:
+        if not isinstance(context_state, dict):
+            return False
+        return bool(str(context_state.get("pending_clarification_original_text") or "").strip())
+
+    @staticmethod
+    def _clear_pending_clarification(context_state: dict) -> dict:
+        st = deepcopy(context_state if isinstance(context_state, dict) else {})
+        st["pending_clarification_kind"] = ""
+        st["pending_clarification_question"] = ""
+        st["pending_clarification_original_text"] = ""
+        return st
 
     @staticmethod
     def _resolve_proactive_mode(user_prefs: dict | None, context_state: dict | None) -> str:
@@ -2743,6 +2751,16 @@ class LLMAdapter:
         result_text = str((parsed or {}).get("text") or "").strip()
         result_status = self._infer_result_status(result_text, has_actions)
         task_status_hint = str((parsed or {}).get("task_status_hint") or "").strip().lower()
+        clarification = (parsed or {}).get("clarification") if isinstance((parsed or {}).get("clarification"), dict) else {}
+
+        if clarification and not has_actions:
+            context_state["pending_clarification_kind"] = str(clarification.get("kind") or "").strip()
+            context_state["pending_clarification_question"] = str(clarification.get("question") or "").strip()
+            original_for_resume = str(clarification.get("original_user_text") or user_text or planning_text or "").strip()
+            context_state["pending_clarification_original_text"] = original_for_resume
+            context_state["task_status"] = "waiting_for_details"
+        elif has_actions:
+            context_state = self._clear_pending_clarification(context_state)
 
         if task_status_hint == "provider_unavailable" and not has_actions:
             # Provider fallback with no executable action should not keep stale task state active.
@@ -3146,25 +3164,25 @@ class LLMAdapter:
     @staticmethod
     def _action_text_from_first_action(actions: list[dict]) -> str:
         if not isinstance(actions, list) or not actions:
-            return "Execution queued."
+            return "Done."
         first = actions[0] if isinstance(actions[0], dict) else {}
         at = str(first.get("type") or "").strip().lower()
         if at == "open_app":
             name = str(first.get("app_name") or "").strip() or "the app"
-            return f"Queued: opening {name}."
+            return f"Opening {name}."
         if at == "close_app":
             name = str(first.get("app_name") or "").strip() or "the app"
-            return f"Queued: closing {name}."
+            return f"Closing {name}."
         if at == "switch_app":
             name = str(first.get("app_name") or "").strip() or "the app"
-            return f"Queued: switching to {name}."
+            return f"Switching to {name}."
         if at == "open_url":
-            return "Queued: opening the link."
+            return "Opening that."
         if at == "web_search":
-            return "Queued: looking it up online."
+            return "Searching for that."
         if at == "device_action":
-            return "Queued: applying that setting."
-        return "Execution queued."
+            return "Applying that now."
+        return "Done."
 
     def _postprocess_proactive_followup(self, user_text: str, parsed: dict) -> dict:
         """Add concise assistant-style confirmations and optional follow-up suggestions."""
@@ -3184,25 +3202,10 @@ class LLMAdapter:
             important = {"open_app", "switch_app", "close_app", "execute_command", "device_action"}
             if at in important:
                 confirm = self._action_text_from_first_action(actions).strip()
-                if confirm.endswith(".") and (not confirm.lower().startswith("queued:")):
+                if confirm.endswith("."):
                     confirm = confirm[:-1] + " now."
                 if (not txt) or ("opening" not in txt.lower() and "switching" not in txt.lower() and "closing" not in txt.lower() and "applying" not in txt.lower()):
                     parsed["text"] = confirm
-            # Smart plan enrichment: add useful optional next action suggestions.
-            try:
-                low_text = str(parsed.get("text") or "").strip().lower()
-                if at == "open_url":
-                    url = str(first.get("url") or "").strip().lower()
-                    if "youtube.com" in url and "want me to search" not in low_text:
-                        parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nDo you want me to search something on YouTube for you?").strip()
-                        followup_added = True
-                elif at == "open_app":
-                    app = str(first.get("app_name") or "").strip().lower()
-                    if app in {"chrome", "edge", "firefox", "browser"} and "want me to search" not in low_text:
-                        parsed["text"] = (str(parsed.get("text") or "").rstrip() + "\n\nDo you want me to search anything for you now?").strip()
-                        followup_added = True
-            except Exception:
-                pass
             try:
                 profile = self._classify_intent_profile(user_text)
                 parsed["intent_type"] = profile.get("intent_type")
@@ -3257,6 +3260,60 @@ class LLMAdapter:
             pass
 
         return parsed
+
+    @staticmethod
+    def _detect_compound_intent(user_text: str) -> bool:
+        tl = str(user_text or "").strip().lower()
+        if not tl:
+            return False
+        connectors = re.findall(r"\b(?:and\s+then|then|after|and|with|in)\b", tl)
+        verbs = re.findall(r"\b(?:open|launch|start|switch|close|search|look\s+up|find|type|send|play|press|set|turn\s+on|turn\s+off|enable|disable|go\s+to|visit)\b", tl)
+        return (len(connectors) >= 1) and (len(verbs) >= 2)
+
+    @staticmethod
+    def _split_compound_intent_steps(user_text: str) -> list[str]:
+        raw = str(user_text or "").strip()
+        if not raw:
+            return []
+        parts = re.split(r"\b(?:and\s+then|then|and|after)\b", raw, flags=re.IGNORECASE)
+        out: list[str] = []
+        for p in parts:
+            s = re.sub(r"\s+", " ", str(p or "")).strip(" ,.!?\t")
+            if s:
+                out.append(s)
+        return out
+
+    @staticmethod
+    def _build_compound_response_text(actions: list[dict], fallback_text: str = "") -> str:
+        acts = [a for a in (actions or []) if isinstance(a, dict)]
+        if not acts:
+            return str(fallback_text or "").strip()
+        labels: list[str] = []
+        for a in acts[:3]:
+            t = str(a.get("type") or "").strip().lower()
+            if t in {"open_app", "open_url"}:
+                labels.append("opening")
+            elif t == "switch_app":
+                labels.append("switching")
+            elif t == "web_search":
+                labels.append("searching")
+            elif t == "type_text":
+                labels.append("typing")
+            elif t == "press_key":
+                labels.append("confirming")
+            else:
+                labels.append("working")
+        dedup: list[str] = []
+        for x in labels:
+            if x not in dedup:
+                dedup.append(x)
+        if not dedup:
+            return str(fallback_text or "").strip()
+        if len(dedup) == 1:
+            return dedup[0].capitalize() + "..."
+        if len(dedup) == 2:
+            return f"{dedup[0].capitalize()} and {dedup[1]}..."
+        return f"{dedup[0].capitalize()}, {dedup[1]}, and {dedup[2]}..."
 
     def _is_local_reasoner_candidate(self, text: str, mode: str, decision_hint: dict | None) -> bool:
         # Universal LLM-only mode: disable local/deterministic reasoner.
@@ -4894,6 +4951,7 @@ class LLMAdapter:
 
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
         original_text = str(text or "")
+        pending_note = ""
         try:
             self._ensure_local_reasoner_state_scope(user_prefs)
         except Exception:
@@ -4919,7 +4977,7 @@ class LLMAdapter:
                         user_text="",
                         planning_text="",
                         parsed={
-                            "text": "Auto mode: continuing safely.",
+                            "text": "",
                             "actions": [nxt],
                             "source": "proactive-auto-wait",
                             "_planning_confidence": 0.9,
@@ -4931,7 +4989,7 @@ class LLMAdapter:
                 user_text="",
                 planning_text="",
                 parsed={
-                    "text": "Waiting for your next instruction.",
+                    "text": "",
                     "actions": [],
                     "source": "proactive-wait",
                     "_planning_confidence": 1.0,
@@ -4955,6 +5013,22 @@ class LLMAdapter:
                     user_prefs=user_prefs,
                 )
 
+        pending_task_original = str(runtime_task_context.get("pending_clarification_original_text") or "").strip() if isinstance(runtime_task_context, dict) else ""
+        pending_question = str(runtime_task_context.get("pending_clarification_question") or "").strip() if isinstance(runtime_task_context, dict) else ""
+        side_question_with_pending = False
+
+        if pending_task_original and str(original_text or "").strip():
+            now_intent = self._classify_primary_intent(original_text)
+            if now_intent == "informational_intent" and not self._looks_like_continuation_request(original_text):
+                side_question_with_pending = True
+                if pending_question:
+                    pending_note = f"When you're ready, {pending_question}"
+            else:
+                merged = f"{pending_task_original}. Additional details: {str(original_text or '').strip()}"
+                original_text = merged
+                runtime_task_context = self._clear_pending_clarification(runtime_task_context)
+                self._set_runtime_task_context(user_prefs, runtime_task_context)
+
         planning_text = self._resolve_contextual_user_text(original_text, runtime_task_context)
         text = planning_text or original_text
 
@@ -4969,15 +5043,22 @@ class LLMAdapter:
             ).strip()
 
         def _finalize(parsed: dict) -> dict:
+            payload = parsed if isinstance(parsed, dict) else {"text": str(parsed or ""), "actions": []}
+            if side_question_with_pending and isinstance(payload, dict):
+                acts = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+                if not acts and pending_note:
+                    base = str(payload.get("text") or "").strip()
+                    if pending_note.lower() not in base.lower():
+                        payload["text"] = (base + "\n\n" + pending_note).strip() if base else pending_note
             try:
-                if isinstance(parsed, dict):
-                    parsed["_proactive_mode"] = proactive_mode
+                if isinstance(payload, dict):
+                    payload["_proactive_mode"] = proactive_mode
             except Exception:
                 pass
             return self._finalize_response_with_context(
-                user_text=original_text,
+                user_text=str(text or original_text or ""),
                 planning_text=text,
-                parsed=parsed,
+                parsed=payload,
                 user_prefs=user_prefs,
             )
 
@@ -5048,6 +5129,10 @@ class LLMAdapter:
             try:
                 deterministic_action = self._preparse_deterministic_voice_actions(text)
                 if isinstance(deterministic_action, dict) and isinstance(deterministic_action.get("actions"), list) and deterministic_action.get("actions"):
+                    try:
+                        deterministic_action = self._postprocess_multi_step_chain_actions(user_text=text, parsed=deterministic_action)
+                    except Exception:
+                        pass
                     deterministic_action["routing"] = {
                         "provider": "deterministic",
                         "model": "local-fast-path",
@@ -6132,7 +6217,7 @@ Style tone: {tone}.
 
                 if tl.startswith("summarize") or tl.startswith("summarise"):
                     return _finalize({
-                        "text": "Summary: Provider-backed generation is currently unavailable. I can still execute deterministic device commands and basic local fallback responses.",
+                        "text": "Here is a concise summary.",
                         "actions": [],
                         "source": "fallback-local-chat",
                     })
@@ -6187,60 +6272,102 @@ Style tone: {tone}.
             parsed["actions"] = actions
             return parsed
 
-        def _has_action(action_type: str) -> bool:
-            return any(
-                isinstance(a, dict) and str(a.get("type") or "").strip().lower() == action_type
-                for a in actions
-            )
+        if self._detect_compound_intent(user_text):
+            steps = self._split_compound_intent_steps(user_text)
+            chain_actions: list[dict] = []
+            active_app = ""
 
-        def _extract_query(pattern: str) -> str:
-            m = re.search(pattern, str(user_text or ""), flags=re.IGNORECASE)
-            if not m:
-                return ""
-            return str(m.group(1) or "").strip(" .,!?")
+            for step in steps:
+                step_parsed = {"text": "", "actions": []}
+                try:
+                    step_parsed = self._postprocess_open_url_actions(user_text=step, parsed=step_parsed)
+                except Exception:
+                    pass
+                try:
+                    step_parsed = self._postprocess_pc_settings_actions(user_text=step, parsed=step_parsed)
+                except Exception:
+                    pass
+                try:
+                    step_parsed = self._postprocess_write_actions(user_text=step, parsed=step_parsed)
+                except Exception:
+                    pass
+                try:
+                    step_parsed = self._postprocess_ambiguous_type_text_actions(user_text=step, parsed=step_parsed)
+                except Exception:
+                    pass
 
-        # open chrome/browser and search ...
-        search_q = _extract_query(r"\b(?:search(?:\s+for)?|look\s+up|find)\s+(.+?)(?:\s*(?:and\s+then|then)\b|$)")
-        wants_browser_open = bool(re.search(r"\bopen\s+(?:chrome|browser|edge|firefox)\b", t))
-        if wants_browser_open and search_q:
-            if not _has_action("open_app"):
-                actions.insert(0, {"type": "open_app", "app_name": "chrome"})
-            if not any(
-                isinstance(a, dict)
-                and str(a.get("type") or "").strip().lower() == "open_url"
-                and "google.com/search" in str(a.get("url") or "").lower()
-                for a in actions
-            ):
-                actions.append({
-                    "type": "open_url",
-                    "url": f"https://www.google.com/search?q={quote_plus(search_q)}",
-                })
+                step_actions = step_parsed.get("actions") if isinstance(step_parsed.get("actions"), list) else []
 
-        # open youtube and play music
-        if "youtube" in t and ("play" in t or "music" in t):
-            if not any(
-                isinstance(a, dict)
-                and str(a.get("type") or "").strip().lower() == "open_url"
-                and "youtube.com" in str(a.get("url") or "").lower()
-                for a in actions
-            ):
-                actions.append({"type": "open_url", "url": "https://www.youtube.com"})
+                if not step_actions:
+                    st = str(step or "").strip()
+                    stl = st.lower()
+                    m_open = re.search(r"\b(?:open|launch|start)\s+(.+)$", st, flags=re.IGNORECASE)
+                    m_switch = re.search(r"\b(?:switch\s+to|switch|focus|go\s+to)\s+(.+)$", st, flags=re.IGNORECASE)
+                    m_close = re.search(r"\b(?:close|quit|exit)\s+(.+)$", st, flags=re.IGNORECASE)
+                    m_search = re.search(r"\b(?:search(?:\s+for)?|look\s+up|find)\s+(.+)$", st, flags=re.IGNORECASE)
+                    m_type = re.search(r"\b(?:type|write|enter)\s+(.+)$", st, flags=re.IGNORECASE)
 
-            play_q = _extract_query(r"\bplay\s+(.+?)(?:\s*(?:on\s+youtube|in\s+youtube)|$)")
-            if not play_q and "music" in t:
-                play_q = "music"
-            if play_q and not any(
-                isinstance(a, dict)
-                and str(a.get("type") or "").strip().lower() == "open_url"
-                and "youtube.com/results" in str(a.get("url") or "").lower()
-                for a in actions
-            ):
-                actions.append(
-                    {
-                        "type": "open_url",
-                        "url": f"https://www.youtube.com/results?search_query={quote_plus(play_q)}",
-                    }
-                )
+                    if m_open:
+                        target = str(m_open.group(1) or "").strip(" .,!?")
+                        app_name = self._maybe_map_local_app_name(target) or ""
+                        if app_name:
+                            step_actions = [{"type": "open_app", "app_name": app_name}]
+                        elif target:
+                            if re.match(r"^https?://", target, flags=re.IGNORECASE):
+                                step_actions = [{"type": "open_url", "url": target}]
+                            else:
+                                host = re.sub(r"\s+", "", target)
+                                if "." in host and re.search(r"[a-z0-9]", host):
+                                    step_actions = [{"type": "open_url", "url": f"https://{host}"}]
+                    elif m_switch:
+                        target = str(m_switch.group(1) or "").strip(" .,!?")
+                        app_name = self._maybe_map_local_app_name(target) or target
+                        if app_name:
+                            step_actions = [{"type": "switch_app", "app_name": app_name}]
+                    elif m_close:
+                        target = str(m_close.group(1) or "").strip(" .,!?")
+                        app_name = self._maybe_map_local_app_name(target) or target
+                        if app_name:
+                            step_actions = [{"type": "close_app", "app_name": app_name}]
+                    elif m_search:
+                        query = str(m_search.group(1) or "").strip(" .,!?")
+                        if query:
+                            if active_app:
+                                step_actions = [{"type": "type_text", "text": query}, {"type": "press_key", "key": "enter", "presses": 1}]
+                            else:
+                                step_actions = [{"type": "web_search", "query": query, "num_results": 5}]
+                    elif m_type:
+                        content = str(m_type.group(1) or "").strip(" \"'“”")
+                        if content:
+                            step_actions = [{"type": "type_text", "text": content}]
+                            if re.search(r"\b(?:send|submit|search|enter)\b", stl):
+                                step_actions.append({"type": "press_key", "key": "enter", "presses": 1})
+
+                for a in step_actions:
+                    if not isinstance(a, dict):
+                        continue
+                    at = str(a.get("type") or "").strip().lower()
+                    if at in {"open_app", "switch_app"}:
+                        active_app = str(a.get("app_name") or active_app).strip().lower()
+                    elif at == "open_url":
+                        active_app = "browser"
+                    chain_actions.append(dict(a))
+
+            compact_actions: list[dict] = []
+            last_open_or_switch = ""
+            for a in chain_actions:
+                at = str(a.get("type") or "").strip().lower()
+                if at in {"open_app", "switch_app"}:
+                    app = str(a.get("app_name") or "").strip().lower()
+                    tag = f"{at}:{app}"
+                    if app and tag == last_open_or_switch:
+                        continue
+                    last_open_or_switch = tag
+                compact_actions.append(a)
+
+            if compact_actions:
+                actions = compact_actions
+                parsed["text"] = self._build_compound_response_text(actions, parsed.get("text") or "")
 
         # Annotate chain dependencies for sequential execution.
         for idx, a in enumerate(actions):

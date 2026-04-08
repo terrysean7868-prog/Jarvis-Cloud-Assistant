@@ -15,3 +15,6 @@ applyTo:
 - Preserve WebSocket, auth, and backend contract expectations when changing chat, autonomy, or device-control flows.
 - Keep browser API usage guarded and resilient to missing permissions or unsupported environments.
 - Prefer linking to [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/INSTALL.md](docs/INSTALL.md) rather than restating architecture or setup details.
+- When both lifecycle status and concrete `action_results` are present, prefer rendering/speaking the concrete results instead of queued/awaiting placeholders.
+- Keep delegated result UX aligned with backend normalized statuses (`ok`, `error`, `forbidden`) and `success`/`error` fields.
+- Preserve pending-requirement and pending-clarification continuity cues in UI messaging so users can resume interrupted tasks cleanly.

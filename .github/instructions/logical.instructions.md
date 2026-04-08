@@ -110,3 +110,10 @@ Make permission-grant resumes more explicit so queued tasks recover predictably 
 Keep timeout and retry messages more specific so users can tell whether the failure was auth, capability, agent offline, or execution timeout.
 Add more structured logging around provider fallback, delegated retries, and permission-blocked dispatches.
 Reduce status ambiguity in the frontend by deriving labels from the returned lifecycle hint and backend summary together rather than from one field alone.
+
+15. RECENT BEHAVIOR GUARDS
+Compound intent chaining: if one user sentence contains multiple executable intents joined by natural connectors (and/then/after), Jarvis should produce a full ordered action chain rather than stopping at the first step.
+Clarification continuity: when required details are missing, Jarvis should ask for the minimum missing information, persist pending clarification context, and resume the original task once details are provided.
+Side-question tolerance: if the user asks something unrelated while a task is waiting for details, Jarvis should answer the side question while keeping the original pending task recoverable.
+Human-facing response policy: avoid exposing provider/fallback/debug internals to users in normal response text.
+Execution result interpretation: classify delegated outcomes from normalized result fields (`success`, `error`, `status`) and treat idempotent outcomes (already/not found/no change needed) as successful where appropriate.

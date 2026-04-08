@@ -15,3 +15,6 @@ applyTo:
 - Prefer small, explicit Python changes that fit the existing async and Pydantic style.
 - Keep compatibility wrappers at the repository root unchanged unless a wrapper must be updated for compatibility.
 - Use [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/AGENT_UPDATE_GUIDE.md](docs/AGENT_UPDATE_GUIDE.md) for system boundaries, routing, and safe change paths.
+- Treat [src/core/llm_adapter.py](src/core/llm_adapter.py) as the behavior/intelligence layer: intent parsing, multi-step chaining, clarification memory, and response tone should be changed there first.
+- Maintain execution-result normalization in backend result paths: rely on canonical `success` and `error` semantics and preserve status mapping (`ok`, `error`, `forbidden`) for downstream UI/task updates.
+- Preserve clarification continuity behavior: when required details are missing, backend/adapter should store pending clarification context, resume the original task when details arrive, and allow side questions without losing pending state.

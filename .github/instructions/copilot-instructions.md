@@ -59,4 +59,11 @@ Primary references:
 - Desktop startup: health checks and packaging flow
 - Skills and autonomy: skill catalog, task manager, and autonomy endpoints
 
+### Current behavior expectations
+
+- Keep assistant responses natural and user-facing; do not surface provider/fallback/debug internals in normal chat responses.
+- Support compound intents in one sentence (for example: open + search, open + type) by producing complete ordered action chains instead of partial first-step execution.
+- Preserve runtime task continuity: clarification prompts should persist in context, resume original tasks when user supplies missing details, and tolerate unrelated side questions mid-task.
+- In delegated execution flows, prefer normalized result interpretation over free-form status text and keep result semantics consistent across backend and frontend.
+
 If you are unsure where logic belongs, read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) first, then edit the canonical implementation file for that surface.
