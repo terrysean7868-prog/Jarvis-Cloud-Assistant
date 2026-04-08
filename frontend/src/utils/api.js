@@ -39,7 +39,10 @@ try {
 
 export const API_URL = queryApi || (isLocalhost ? "" : prodBase);
 
-const DEFAULT_TIMEOUT = 20000;
+const DEFAULT_TIMEOUT = 30000;
+const CHAT_MAX_ATTEMPTS = 3;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function timeoutFetch(url, opts = {}, timeout = DEFAULT_TIMEOUT) {
   const controller = new AbortController();
@@ -67,34 +70,59 @@ async function throwHttpError(res) {
 }
 
 export async function sendMessage(text, mode = "chat", sessionId = null, timeoutMs = DEFAULT_TIMEOUT) {
-  try {
-    const res = await timeoutFetch(`${API_URL}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, mode, user: "user", session_id: sessionId }),
-    }, timeoutMs);
+  const retryTimeouts = [
+    Math.max(20000, Number(timeoutMs) || DEFAULT_TIMEOUT),
+    Math.max(45000, Number(timeoutMs) || DEFAULT_TIMEOUT),
+    Math.max(70000, Number(timeoutMs) || DEFAULT_TIMEOUT),
+  ];
 
-    if (!res.ok) {
-      await throwHttpError(res);
+  let lastError = null;
+
+  for (let attempt = 0; attempt < CHAT_MAX_ATTEMPTS; attempt += 1) {
+    const effectiveTimeout = retryTimeouts[Math.min(attempt, retryTimeouts.length - 1)];
+    try {
+      const res = await timeoutFetch(`${API_URL}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, mode, user: "user", session_id: sessionId }),
+      }, effectiveTimeout);
+
+      if (!res.ok) {
+        // Retry transient backend failures.
+        if ([429, 502, 503, 504].includes(res.status) && attempt < CHAT_MAX_ATTEMPTS - 1) {
+          await sleep(500 + attempt * 700);
+          continue;
+        }
+        await throwHttpError(res);
+      }
+
+      const data = await res.json();
+      return data;
+    } catch (err) {
+      lastError = err;
+      const isTimeout = err && err.name === "AbortError";
+      if (isTimeout && attempt < CHAT_MAX_ATTEMPTS - 1) {
+        await sleep(500 + attempt * 700);
+        continue;
+      }
+      if (attempt < CHAT_MAX_ATTEMPTS - 1) {
+        await sleep(500 + attempt * 700);
+        continue;
+      }
     }
-    const data = await res.json();
-    return data;
-  } catch (err) {
-    console.error("sendMessage error:", err);
-    const isTimeout = err && err.name === "AbortError";
-    const message = isTimeout
-      ? "Assistant request timed out while waiting for the backend response. Retrying may resume pending delegated work."
-      : (err?.message || "Assistant request failed due to a transport or backend error.");
-
-    // Return a consistent structure so callers can always render something.
-    return {
-      status: "failed",
-      mode: "client_fallback",
-      message,
-      text: message,
-      actions: [],
-    };
   }
+
+  console.error("sendMessage error:", lastError);
+  const message = "I could not complete that request right now. Please try again.";
+
+  // Return a consistent structure so callers can always render something.
+  return {
+    status: "failed",
+    mode: "client_fallback",
+    message,
+    text: message,
+    actions: [],
+  };
 }
 
 // (Capabilities endpoint removed)

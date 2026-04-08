@@ -43,7 +43,7 @@ const PermissionModal = lazy(() => import("./components/PermissionModal"));
 
 export default function App() {
   const WAKE_SESSION_MINUTES = useMemo(() => {
-    const raw = "15";
+    const raw = "45";
     const n = Number(raw);
     return Number.isFinite(n) ? Math.max(1, Math.min(n, 120)) : 15;
   }, []);
