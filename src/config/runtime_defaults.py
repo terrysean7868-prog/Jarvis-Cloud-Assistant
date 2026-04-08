@@ -95,12 +95,12 @@ AGENTIC_MAX_SUBTASKS: int = 6
 # -------------------------
 # LLM defaults (non-secret)
 # -------------------------
-LLM_PROVIDER: str = "ollama"  # "ollama" | "openai_compatible"
-PRIMARY_MODEL: str = "llama3.1:8b"
-PRIMARY_ENDPOINT: str = "http://127.0.0.1:11434/api/chat"
+LLM_PROVIDER: str = "openai_compatible"  # "ollama" | "openai_compatible"
+PRIMARY_MODEL: str = "gpt-4o-mini"
+PRIMARY_ENDPOINT: str = "https://api.openai.com/v1/chat/completions"
 
-BACKUP_MODEL: str = ""
-BACKUP_ENDPOINT: str = ""
+BACKUP_MODEL: str = "llama-3.1-8b-instant"
+BACKUP_ENDPOINT: str = "https://api.groq.com/openai/v1/chat/completions"
 
 PERSONA: str = "formal-gentle"
 SMART_MODEL: str = ""  # optional
@@ -167,7 +167,7 @@ AUTONOMY_ENABLED: bool = True
 AUTONOMY_POLL_INTERVAL_SECONDS: int = 20
 
 # OSS integrations (all optional)
-ENABLE_OLLAMA: bool = True
+ENABLE_OLLAMA: bool = False
 ENABLE_CHROMADB: bool = True
 ENABLE_WHISPER: bool = False
 ENABLE_OPENCV: bool = True
@@ -181,7 +181,7 @@ LOCAL_REASONER_PREWARM_RESULTS_PER_QUERY: int = 4
 LOCAL_REASONER_PREWARM_ANALYSIS_FIRST: bool = True
 
 WIKI_TRAINING_LANG: str = "en"
-WIKI_TRAINING_MAX_PAGES: int = 2
+WIKI_TRAINING_MAX_PAGES: int = 5
 WIKI_TRAINING_TOPICS: str = ""
 BACKGROUND_ANALYSIS_BATCH: int = 30
 

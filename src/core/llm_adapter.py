@@ -1509,8 +1509,51 @@ class LLMAdapter:
         parts = re.split(r"(?<=[.!?])\s+", s)
         return " ".join([p.strip() for p in parts[:max_sentences] if p.strip()]).strip()
 
-    def _naturalize_response_text(self, user_text: str, text: str, *, actions: list[dict] | None = None) -> str:
+    @staticmethod
+    def _clean_conversational_noise(text: str) -> str:
+        """Remove operational/log artifacts that should not be spoken as chat text."""
         txt = str(text or "").strip()
+        if not txt:
+            return ""
+
+        patterns = [
+            r"(?im)^\s*capturing\s+command\.{0,3}\s*$",
+            r"(?im)^\s*pc\s+actions?\s+delegated\s*\([^)]*\)\.?\s*$",
+            r"(?im)^\s*pc\s+action\s+completed\b[^\n]*$",
+            r"(?i)\bresults\s*:\s*\d+\s*ok\s*,\s*\d+\s*error\s*,\s*\d+\s*forbidden\b",
+            r"(?i)\bsource\s*:\s*delegated\s+work\b",
+        ]
+        for pat in patterns:
+            txt = re.sub(pat, " ", txt)
+
+        txt = re.sub(
+            r"(?i)\bi\s+can\s+handle\s+deterministic\s+local\s+actions\s+and\s+concise\s+fallback\s+answers\s+right\s+now\.?",
+            "I can still help with local actions right now.",
+            txt,
+        )
+        txt = re.sub(
+            r"(?i)\bwhat'?s\s+specific\s+task\s+would\s+you\s+like\s+to\s+focus\s+on[\s\S]*?let\s+me\s+know\b",
+            "What would you like to do next?",
+            txt,
+        )
+        txt = re.sub(r"(?i)\bdone\.\s*next\s*step\s*:\s*execution\s+queued\.[^\n]*", "", txt)
+        txt = re.sub(r"\s{2,}", " ", txt).strip(" \n\t.-")
+        if not txt:
+            return ""
+
+        # Deduplicate back-to-back repeated sentences.
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", txt) if p.strip()]
+        if not parts:
+            return txt
+        deduped: list[str] = []
+        for p in parts:
+            if deduped and p.lower() == deduped[-1].lower():
+                continue
+            deduped.append(p)
+        return " ".join(deduped).strip()
+
+    def _naturalize_response_text(self, user_text: str, text: str, *, actions: list[dict] | None = None) -> str:
+        txt = self._clean_conversational_noise(text)
         if not txt:
             return txt
 
@@ -1541,6 +1584,159 @@ class LLMAdapter:
                     txt += "."
                 txt += " If you want, I can give a short next-step plan."
 
+        return txt
+
+    @staticmethod
+    def _resolve_voice_personality(user_prefs: dict | None) -> str:
+        try:
+            if isinstance(user_prefs, dict):
+                vp = str(user_prefs.get("voice_personality") or user_prefs.get("voice_style") or "").strip().lower()
+                if vp in {"siri", "gemini", "warm", "professional", "natural"}:
+                    return vp
+                persona = str(user_prefs.get("persona") or "").strip().lower()
+                if persona in {"analyst", "formal-gentle", "friendly"}:
+                    return {
+                        "analyst": "professional",
+                        "formal-gentle": "siri",
+                        "friendly": "warm",
+                    }.get(persona, "natural")
+        except Exception:
+            pass
+        return "natural"
+
+    def _apply_voice_reply_style(
+        self,
+        *,
+        text: str,
+        user_text: str,
+        actions: list[dict] | None,
+        user_prefs: dict | None,
+        response_mode: str,
+    ) -> str:
+        if str(response_mode or "").strip().lower() != "voice":
+            return str(text or "").strip()
+
+        txt = self._clean_conversational_noise(text)
+        if not txt:
+            return txt
+
+        acts = actions if isinstance(actions, list) else []
+        low = txt.lower()
+        if re.search(r"\b(permission|forbidden|denied)\b", low):
+            return "I hit a permission block. Want me to try a safe alternative?"
+        if re.search(r"\b(offline|not connected|unavailable|queued_for_agent|awaiting_agent)\b", low):
+            return "Your device looks offline right now. I can queue this and run it when it reconnects."
+        if re.search(r"\b(timeout|timed out)\b", low):
+            return "That timed out. Want me to retry with a smaller step?"
+        if re.search(r"\b(fail|failed|error|unable|cannot|can't|could not)\b", low):
+            return "I could not finish that. Want me to retry now?"
+
+        voice_personality = self._resolve_voice_personality(user_prefs)
+
+        def _voice_contract(s: str) -> str:
+            out = str(s or "").strip()
+            if not out:
+                return out
+            repl = [
+                (r"\bI am\b", "I'm"),
+                (r"\bI will\b", "I'll"),
+                (r"\bI have\b", "I've"),
+                (r"\bdo not\b", "don't"),
+                (r"\bcannot\b", "can't"),
+                (r"\bcan not\b", "can't"),
+                (r"\bwill not\b", "won't"),
+            ]
+            for pat, rep in repl:
+                out = re.sub(pat, rep, out, flags=re.IGNORECASE)
+            return re.sub(r"\s{2,}", " ", out).strip()
+
+        def _pick(options: list[str], seed: str) -> str:
+            if not options:
+                return ""
+            idx = sum(ord(c) for c in str(seed or "")) % len(options)
+            return options[idx]
+
+        if acts:
+            first = acts[0] if acts and isinstance(acts[0], dict) else {}
+            at = str(first.get("type") or "").strip().lower()
+            lead = self._action_text_from_first_action(acts)
+            lead = self._first_sentences(lead, max_sentences=1)
+            lead = re.sub(r"(?i)^opening\s+that\.?$", "Opening that now.", lead)
+            lead = re.sub(r"(?i)^searching\s+for\s+that\.?$", "Searching that now.", lead)
+            lead = re.sub(r"(?i)^applying\s+that\s+now\.?$", "Applying that now.", lead)
+            lead = re.sub(r"\s{2,}", " ", lead).strip()
+            lead = _voice_contract(lead)
+            if lead and not lead.endswith((".", "!", "?")):
+                lead += "."
+
+            natural_tail = ""
+            if at in {"open_app", "open_url", "switch_app", "close_app"}:
+                natural_tail = _pick([
+                    "I'll stay with you for the next step.",
+                    "Tell me the next step when you're ready.",
+                    "Want me to continue after this opens?",
+                ], user_text)
+            elif at in {"device_action", "execute_command"}:
+                natural_tail = _pick([
+                    "I'll confirm once it finishes.",
+                    "I'll keep this moving step by step.",
+                    "Want me to continue automatically after this?",
+                ], user_text)
+            elif at == "web_search":
+                natural_tail = _pick([
+                    "I'll give you a short summary right after.",
+                    "I'll pull the key points for you.",
+                    "I'll keep it concise.",
+                ], user_text)
+
+            if voice_personality == "siri":
+                return lead if lead.endswith(".") else (lead + ".")
+            if voice_personality == "professional":
+                return (lead if lead.endswith(".") else (lead + ".")) + " " + _pick([
+                    "I'll confirm once it's complete.",
+                    "I'll share the result right away.",
+                ], user_text)
+            if voice_personality == "warm":
+                return (lead if lead.endswith(".") else (lead + ".")) + " " + _pick([
+                    "I'm here if you want the next step.",
+                    "Want me to keep going?",
+                ], user_text)
+            if voice_personality == "gemini":
+                return (lead if lead.endswith(".") else (lead + ".")) + " " + _pick([
+                    "I'll keep you updated.",
+                    "I'll continue as soon as you say go.",
+                ], user_text)
+
+            if natural_tail:
+                return f"{lead} {natural_tail}".strip()
+            return lead if lead.endswith(".") else (lead + ".")
+
+        txt = re.sub(r"(?i)\bif you want,? i can give a short next-step plan\.?", "", txt)
+        txt = re.sub(r"(?i)\bwhen you're ready,\s*", "", txt)
+        txt = re.sub(r"(?i)\bnext step:\s*", "Then ", txt)
+        txt = re.sub(r"(?i)\bauto mode:\s*", "", txt)
+        txt = txt.replace("\n", " ").strip()
+        txt = _voice_contract(txt)
+        max_sentences = 2 if self._classify_primary_intent(user_text) == "informational_intent" else 1
+        txt = self._first_sentences(txt, max_sentences=max_sentences)
+        txt = re.sub(r"\s{2,}", " ", txt).strip(" \t\n")
+        if len(txt) > 190:
+            txt = txt[:190].rstrip(" ,.;:") + "."
+        if txt and not txt.endswith((".", "?", "!")):
+            txt += "."
+
+        if voice_personality == "siri":
+            return txt
+        if voice_personality == "professional":
+            return txt
+        if voice_personality == "warm":
+            if not txt.endswith((".", "?", "!")):
+                txt += "."
+            return txt
+        if voice_personality == "gemini":
+            if not txt.endswith((".", "?", "!")):
+                txt += "."
+            return txt
         return txt
 
     def _sanitize_output_text(self, user_text: str, parsed: dict) -> dict:
@@ -2566,7 +2762,7 @@ class LLMAdapter:
         actions = parsed.get("actions") if isinstance(parsed, dict) else []
 
         if status in {"queued", "in_progress", "executing", "delegated"} and isinstance(actions, list) and actions:
-            return "Execution queued. I will report the result once the device responds."
+            return "I queued that action and will share the result as soon as the device responds."
 
         if status == "failed":
             options = ", ".join([str(x) for x in next_actions[:2]]) if next_actions else "retry with safer fallback"
@@ -2852,6 +3048,7 @@ class LLMAdapter:
 
         planning_confidence = out.pop("_planning_confidence", None)
         proactive_mode = out.pop("_proactive_mode", None)
+        response_mode = str(out.pop("_response_mode", "") or "").strip().lower()
 
         try:
             runtime_ctx = self._get_runtime_task_context(user_prefs)
@@ -2908,7 +3105,11 @@ class LLMAdapter:
             suggestion = self._suggest_next_task_step(runtime_ctx, out)
             txt = str(out.get("text") or "").strip()
             low = txt.lower()
-            if bool(runtime_ctx.get("task_active")) and suggestion and ("next step" not in low) and ("want me to continue" not in low):
+            out_actions = out.get("actions") if isinstance(out.get("actions"), list) else []
+            intent = self._classify_primary_intent(user_text)
+            continuation_like = self._looks_like_continuation_request(user_text)
+            should_append = bool(out_actions) or continuation_like or intent in {"action_intent", "clarification_intent"}
+            if bool(runtime_ctx.get("task_active")) and suggestion and should_append and ("next step" not in low) and ("want me to continue" not in low):
                 out["text"] = (txt + "\n\nNext step: " + suggestion).strip()
         except Exception:
             pass
@@ -2920,6 +3121,18 @@ class LLMAdapter:
                 str(out.get("text") or ""),
                 task_active=bool(runtime_ctx.get("task_active")),
                 mode=mode,
+            )
+        except Exception:
+            pass
+
+        try:
+            out_actions = out.get("actions") if isinstance(out.get("actions"), list) else []
+            out["text"] = self._apply_voice_reply_style(
+                text=str(out.get("text") or ""),
+                user_text=str(user_text or ""),
+                actions=out_actions,
+                user_prefs=user_prefs,
+                response_mode=response_mode,
             )
         except Exception:
             pass
@@ -5053,6 +5266,7 @@ class LLMAdapter:
             try:
                 if isinstance(payload, dict):
                     payload["_proactive_mode"] = proactive_mode
+                    payload["_response_mode"] = str(mode or "chat")
             except Exception:
                 pass
             return self._finalize_response_with_context(
