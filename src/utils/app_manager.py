@@ -393,20 +393,34 @@ class AppManager:
 
                 # Normal executables: run without shell for reliability.
                 if wait:
-                    result = subprocess.run(
-                        parsed,
-                        shell=False,
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout,
-                    )
+                    try:
+                        result = subprocess.run(
+                            parsed,
+                            shell=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout,
+                        )
+                    except FileNotFoundError:
+                        # Some commands rely on cmd/path resolution even without
+                        # explicit shell metacharacters. Fallback through cmd.
+                        result = subprocess.run(
+                            ["cmd.exe", "/c", cl],
+                            shell=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout,
+                        )
                     return {
                         "status": "success",
                         "stdout": result.stdout,
                         "stderr": result.stderr,
                         "returncode": result.returncode,
                     }
-                subprocess.Popen(parsed, shell=False)
+                try:
+                    subprocess.Popen(parsed, shell=False)
+                except FileNotFoundError:
+                    subprocess.Popen(["cmd.exe", "/c", cl], shell=False)
                 return {"status": "success", "stdout": "", "stderr": "", "returncode": 0}
 
             # Non-Windows: keep existing shell execution, but honor wait=False.

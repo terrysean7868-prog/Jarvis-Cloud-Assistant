@@ -1630,7 +1630,7 @@ class LLMAdapter:
 
         # Wake-word UX: keep a full friendly readiness line.
         wake_word = str(user_text or "").strip().lower()
-        if re.match(r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s+up(?:\s+jarvis)?|jarvis\s+wake\s+up)[\s!?.]*$", wake_word):
+        if re.match(r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s*up(?:\s+jarvis)?|jarvis\s+wake\s*up)[\s!?.]*$", wake_word):
             return "Hello, I'm here. How can I help you?"
 
         txt = self._clean_conversational_noise(text)
@@ -3361,7 +3361,7 @@ class LLMAdapter:
                 "source": "deterministic-local-chat",
             }
 
-        if re.match(r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s+up(?:\s+jarvis)?|jarvis\s+wake\s+up)([\s!?.]*)$", tl):
+        if re.match(r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s*up(?:\s+jarvis)?|jarvis\s+wake\s*up)([\s!?.]*)$", tl):
             return {
                 "text": "Hello, I am here. How can I help you?",
                 "actions": [],
@@ -3863,12 +3863,25 @@ class LLMAdapter:
         t = LLMAdapter._normalize_voice_control_text(t)
         tl = t.lower().strip()
 
+        ambiguous_pronoun_only = bool(
+            re.search(r"\b(open|close|switch|launch|start|run|execute|send|type|write)\b", tl)
+            and re.search(r"\b(it|this|that|something|anything|whatever|them|there)\b", tl)
+            and not re.search(r"\bhttps?://|\bwww\.|\b[a-z0-9\-]+\.(com|org|net|io|dev)\b", tl)
+            and not LLMAdapter._maybe_map_local_app_name(tl)
+        )
+        if ambiguous_pronoun_only:
+            return {
+                "text": "I can do that. Which app, site, or command do you want exactly?",
+                "actions": [],
+                "source": "deterministic-clarification",
+            }
+
         # Skill invocation: "run skill X" / "use X skill" / "skill X"
 
         # Fast-path: greetings and simple small-talk → instant response, no LLM needed.
         _GREETING_PATTERNS = {
             r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day)|what'?s\s+up|sup|yo)[\s!?.,]*$": "Hey! How can I help you?",
-            r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s+up(?:\s+jarvis)?|jarvis\s+wake\s+up)[\s!?.,]*$": "Hello, I am here. How can I help you?",
+            r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s*up(?:\s+jarvis)?|jarvis\s+wake\s*up)[\s!?.,]*$": "Hello, I am here. How can I help you?",
             r"^how\s+are\s+you[\s!?.,]*$": "I'm running great! What can I do for you?",
             r"^(what'?s\s+your\s+name|who\s+are\s+you)[\s!?.,]*$": "I'm Jarvis, your AI assistant.",
             r"^(thanks|thank\s+you|ty|cheers|thx)[\s!?.,]*$": "You're welcome! Anything else?",
@@ -3944,6 +3957,16 @@ class LLMAdapter:
                     return "src/core/llm_adapter.py"
 
                 if isinstance(parsed_cmd, dict) and parsed_cmd.get("action") in {"update", "edit"}:
+                    explicit_update_target = bool(
+                        re.search(r"\b(file|module|component|class|function)\b", tl)
+                        or re.search(r"\.[a-z0-9]{1,6}\b", tl)
+                    )
+                    if not explicit_update_target:
+                        return {
+                            "text": "Please specify the exact file or module you want to update.",
+                            "actions": [],
+                            "source": "deterministic-clarification",
+                        }
                     target = str(parsed_cmd.get("target") or "").strip()
                     description = str(parsed_cmd.get("description") or t).strip() or t
                     file_path = _map_target_path(target, t)
@@ -3971,27 +3994,11 @@ class LLMAdapter:
                         }],
                         "source": "deterministic-voice-self-update",
                     }
-
-                # Fallback for broad update phrasing without precise parse.
-                if re.search(r"\b(add|create|build|make)\b", tl):
-                    return {
-                        "text": "Preparing to add the requested feature.",
-                        "actions": [{
-                            "type": "self_add",
-                            "description": t,
-                            "feature_type": "module",
-                        }],
-                        "source": "deterministic-voice-self-update",
-                    }
-
+                # Do not auto-run broad developer/update commands without a precise parse.
                 return {
-                    "text": "Preparing to update assistant logic.",
-                    "actions": [{
-                        "type": "self_update",
-                        "description": t,
-                        "file_path": _map_target_path("", t),
-                    }],
-                    "source": "deterministic-voice-self-update",
+                    "text": "I can help update code, but please specify the exact file and change.",
+                    "actions": [],
+                    "source": "deterministic-clarification",
                 }
 
             # Project file/code discovery in voice mode.
@@ -4198,32 +4205,41 @@ class LLMAdapter:
 
         if close_verb:
             target = LLMAdapter._maybe_map_local_app_name(tl)
-            if not target:
-                # Heuristic: take words after the close verb.
-                m = re.search(r"\b(?:close|quit|exit)\b\s+(.*)$", tl)
-                target = (m.group(1).strip() if m else "")
-                target = LLMAdapter._maybe_map_local_app_name(target) or target
             if target:
                 parsed["actions"] = [{"type": "close_app", "app_name": target}]
                 parsed["text"] = f"Closing {target}."
                 parsed["source"] = "deterministic-voice"
                 return parsed
-            return None
+            return {
+                "text": "Which app should I close?",
+                "actions": [],
+                "source": "deterministic-clarification",
+            }
 
         if switch_verb:
             target = LLMAdapter._maybe_map_local_app_name(tl)
-            if not target:
-                m = re.search(r"\b(?:switch\s+to|switch|focus|go\s+to)\b\s+(.*)$", tl)
-                target = (m.group(1).strip() if m else "")
-                target = LLMAdapter._maybe_map_local_app_name(target) or target
             if target:
                 parsed["actions"] = [{"type": "switch_app", "app_name": target}]
                 parsed["text"] = f"Switching to {target}."
                 parsed["source"] = "deterministic-voice"
                 return parsed
-            return None
+            return {
+                "text": "Which app should I switch to?",
+                "actions": [],
+                "source": "deterministic-clarification",
+            }
 
         if open_verb:
+            has_explicit_url = bool(re.search(r"\bhttps?://|\bwww\.|\b[a-z0-9\-]+\.(com|org|net|io|dev)\b", tl))
+            has_local_app_target = bool(LLMAdapter._maybe_map_local_app_name(tl))
+            has_explicit_object = bool(re.search(r"\b(open|launch|start)\b\s+([a-z0-9][a-z0-9\s._-]{1,40})$", tl))
+            if not (has_explicit_url or has_local_app_target or has_explicit_object):
+                return {
+                    "text": "What should I open exactly? Please name the app or website.",
+                    "actions": [],
+                    "source": "deterministic-clarification",
+                }
+
             # If the user says "open X and type Y", keep the whole string so existing
             # postprocessors can add type_text. We don't require a strict format; we
             # just attempt the deterministic postprocessing pipeline.
@@ -5395,22 +5411,7 @@ class LLMAdapter:
             "response_strategy": intelligence_state.get("response_strategy"),
         }
 
-        try:
-            if intent_profile.get("intent_type") == "goal_oriented":
-                goal_plan = self._build_goal_oriented_plan_response(text, user_prefs=user_prefs)
-                if isinstance(goal_plan, dict):
-                    goal_plan["routing"] = {
-                        "provider": "deterministic",
-                        "model": "local-fast-path",
-                        "fallback_used": True,
-                    }
-                    try:
-                        goal_plan["emotion"] = goal_plan.get("emotion") or self._infer_emotion(goal_plan.get("text") or text)
-                    except Exception:
-                        pass
-                    return _finalize(goal_plan)
-        except Exception:
-            pass
+        # Keep goal-oriented responses model-driven to preserve real AI behavior.
 
         try:
             repeated = self._get_cached_response(original_text, max_age_s=240)
@@ -5451,42 +5452,30 @@ class LLMAdapter:
             except Exception:
                 pass
 
-        if primary_intent == "generation_intent":
-            try:
-                generated = self._build_direct_generation_response(text)
-                if isinstance(generated, dict):
-                    generated = self._postprocess_proactive_followup(text, generated)
-                    generated["routing"] = {
-                        "provider": "deterministic",
-                        "model": "local-fast-path",
-                        "fallback_used": True,
-                    }
-                    try:
-                        generated["emotion"] = generated.get("emotion") or self._infer_emotion(generated.get("text") or text)
-                    except Exception:
-                        pass
-                    return _finalize(generated)
-            except Exception:
-                pass
+        # Keep generation intents model-driven instead of deterministic canned output.
 
         quick = self._quick_local_chat_reply(text)
         if isinstance(quick, dict):
-            quick["routing"] = {
-                "provider": "deterministic",
-                "model": "local-fast-path",
-                "fallback_used": True,
-            }
-            try:
-                quick["emotion"] = quick.get("emotion") or self._infer_emotion(quick.get("text") or text)
-            except Exception:
-                pass
-            logger.info(
-                "[llm.fast_path] mode=%s source=%s text_preview=%s",
-                str(mode or "chat"),
-                str(quick.get("source") or "deterministic-local-chat"),
-                (text or "")[:80].replace("\n", " "),
-            )
-            return _finalize(quick)
+            quick_actions = quick.get("actions") if isinstance(quick.get("actions"), list) else []
+            quick_source = str(quick.get("source") or "").strip().lower()
+            allow_quick = bool(quick_actions) or (quick_source == "deterministic-greeting")
+            if allow_quick:
+                quick["routing"] = {
+                    "provider": "deterministic",
+                    "model": "local-fast-path",
+                    "fallback_used": True,
+                }
+                try:
+                    quick["emotion"] = quick.get("emotion") or self._infer_emotion(quick.get("text") or text)
+                except Exception:
+                    pass
+                logger.info(
+                    "[llm.fast_path] mode=%s source=%s text_preview=%s",
+                    str(mode or "chat"),
+                    str(quick.get("source") or "deterministic-local-chat"),
+                    (text or "")[:80].replace("\n", " "),
+                )
+                return _finalize(quick)
 
         """
         Generate a rich, humanlike structured response.

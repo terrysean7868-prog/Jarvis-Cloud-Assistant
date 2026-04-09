@@ -257,18 +257,30 @@ export default function App() {
 
   const buildRequirementDetails = useCallback((req) => {
     const requirement = req && typeof req === "object" ? req : {};
+    const typeRaw = String(requirement.requirement_type || "missing_requirement").trim().toLowerCase();
+    const typeLabelMap = {
+      missing_requirement: "Setup needed",
+      assistant_permission: "Assistant permission",
+      service_account_permission: "Service access",
+      browser_site_permission: "Browser permission",
+      third_party_app_permission: "External app authorization",
+      missing_user_information: "More information needed",
+      operating_system_audio_device: "Microphone access",
+    };
+    const typeLabel = typeLabelMap[typeRaw] || String(requirement.requirement_type || "Setup needed").replace(/_/g, " ");
+
     const lines = [];
-    lines.push(`Requirement Type: ${String(requirement.requirement_type || "missing_requirement").replace(/_/g, " ")}`);
-    lines.push(`Target: ${String(requirement.target_application || requirement.target || "system")}`);
-    lines.push(`Why: ${String(requirement.why || "This is required to continue the requested action.")}`);
+    lines.push(`Action status: ${typeLabel}`);
+    lines.push(`Where to check: ${String(requirement.target_application || requirement.target || "System settings")}`);
+    lines.push(`Reason: ${String(requirement.why || "A required setup step is still incomplete.")}`);
     const requiredBy = String(requirement.required_by || "user").trim().toLowerCase();
-    lines.push(`Who should act: ${requiredBy === "admin" ? "Administrator" : "Current user"}`);
+    lines.push(`Who can fix this: ${requiredBy === "admin" ? "Administrator" : "You"}`);
     const guidance = Array.isArray(requirement.guidance) ? requirement.guidance : [];
     if (guidance.length) {
-      lines.push("How to resolve:");
+      lines.push("Next steps:");
       guidance.forEach((step, idx) => lines.push(`${idx + 1}. ${String(step)}`));
     }
-    lines.push("Resume Behavior: Once resolved, I will resume the original task automatically.");
+    lines.push("After this is fixed, press 'I Fixed It' and I will continue the original task automatically.");
     return lines.join("\n");
   }, []);
 
@@ -277,8 +289,8 @@ export default function App() {
     const requirementType = String(requirement.requirement_type || opts?.requirementType || "missing_requirement");
     const target = String(requirement.target || opts?.target || "System");
     const permissionOrScope = String(requirement.permission_or_scope || opts?.permissionOrScope || "").trim() || null;
-    const title = opts?.title || `Requirement required: ${requirementType.replace(/_/g, " ")}`;
-    const message = opts?.message || String(opts?.rawMessage || "Additional permission or information is required to continue.");
+    const title = opts?.title || (requirementType === "missing_requirement" ? "Action needs setup" : `Action requires ${requirementType.replace(/_/g, " ")}`);
+    const message = opts?.message || String(opts?.rawMessage || "I need one small setup fix before I can continue this task.");
     const details = buildRequirementDetails({ ...requirement, requirement_type: requirementType, target, permission_or_scope: permissionOrScope });
     const prompt = {
       title,
@@ -1302,6 +1314,10 @@ export default function App() {
       `hi ${nm}`,
       `ok ${nm}`,
       `okay ${nm}`,
+      `wake up ${nm}`,
+      `wakeup ${nm}`,
+      `${nm} wake up`,
+      `${nm} wakeup`,
     ];
     for (const prefix of wakePrefixes) {
       if (t === prefix) return "";
@@ -1601,6 +1617,22 @@ export default function App() {
       setTimeout(() => setWakePulse(false), 900);
       if (!wakeRemainder) {
         addLog("system", "Wake word detected. Listening.");
+        try {
+          setEmotion("analyzing");
+          const wakePrompt = `wake up ${assistantNameRef.current || "Jarvis"}`;
+          const wakeRes = await sendMessage(wakePrompt, "voice", sessionId);
+          const wakeText = String(wakeRes?.text || wakeRes?.message || "").trim();
+          if (wakeText) {
+            addStructuredLog("response", wakeText, "text", null);
+            speak(wakeText, () => {
+              try { wakeRecognizer.current?.start(); } catch {}
+              isHandlingCommand.current = false;
+            });
+            return;
+          }
+        } catch (err) {
+          console.warn("Wake greeting backend call failed:", err);
+        }
         try { wakeRecognizer.current?.start(); } catch {}
         isHandlingCommand.current = false;
         return;
@@ -1654,7 +1686,15 @@ export default function App() {
     }
 
     // End the wake-session early.
-    if (/^(sleep|go to sleep|stop listening|stop|cancel|goodbye|bye|thanks\s+jarvis\s+stop)$/i.test(transcript.trim())) {
+    const idleCmd = transcript.trim();
+    const safeAssistantName = String(assistantNameRef.current || "Jarvis")
+      .trim()
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const stopListeningPattern = new RegExp(
+      `^(sleep|go to sleep|stop listening|stop|cancel|goodbye|bye|thanks\\s+${safeAssistantName}\\s+stop)$`,
+      "i"
+    );
+    if (stopListeningPattern.test(idleCmd)) {
       endWakeSessionWindow();
       addLog("system", "Going idle. Say the wake word to continue.");
       speak("Okay. Say the wake word when you need me.", () => {
@@ -2468,7 +2508,13 @@ export default function App() {
           }
 
           if (!trailingCommand) {
-            addLog("system", "Wake word detected. Listening.");
+            pendingTranscriptRef.current = `wake up ${nm}`;
+
+            // stop recognizer safely so backend greeting can run/speak without overlap
+            try { recognizer.stop(); } catch {}
+            active = false;
+
+            setTimeout(async () => await handleVoiceCommand(), 20);
             return;
           }
 

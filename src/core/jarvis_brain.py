@@ -410,32 +410,36 @@ class JarvisBrain:
                 det_actions = deterministic.get("actions") if isinstance(deterministic.get("actions"), list) else []
                 source = str(deterministic.get("source") or "deterministic-local-chat")
 
-                self.memory.append({"role": "user", "text": text})
-                self.memory.append({"role": "assistant", "text": det_text})
-                if len(self.memory) > 50:
-                    self.memory.pop(0)
+                # Keep this early fast-path only for strict wake/greeting control or
+                # explicit executable actions. Regular conversation should use model output.
+                allow_fast_path = bool(det_actions) or (source in {"deterministic-greeting"})
+                if allow_fast_path:
+                    self.memory.append({"role": "user", "text": text})
+                    self.memory.append({"role": "assistant", "text": det_text})
+                    if len(self.memory) > 50:
+                        self.memory.pop(0)
 
-                try:
-                    task_manager.save_wakeup_context(text, det_text, det_actions)
-                except Exception:
-                    pass
+                    try:
+                        task_manager.save_wakeup_context(text, det_text, det_actions)
+                    except Exception:
+                        pass
 
-                intent_type = "direct_action" if det_actions else "informational"
-                response_strategy = "immediate_execution" if det_actions else "explain_only"
+                    intent_type = "direct_action" if det_actions else "informational"
+                    response_strategy = "immediate_execution" if det_actions else "explain_only"
 
-                return {
-                    "text": det_text,
-                    "actions": det_actions,
-                    "tool_results": [],
-                    "mode": mode,
-                    "source": source,
-                    "intent": intent_type,
-                    "intent_type": intent_type,
-                    "intent_depth": "low",
-                    "response_strategy": response_strategy,
-                    "proactive_followup_added": False,
-                    "user_preference_influenced": False,
-                }
+                    return {
+                        "text": det_text,
+                        "actions": det_actions,
+                        "tool_results": [],
+                        "mode": mode,
+                        "source": source,
+                        "intent": intent_type,
+                        "intent_type": intent_type,
+                        "intent_depth": "low",
+                        "response_strategy": response_strategy,
+                        "proactive_followup_added": False,
+                        "user_preference_influenced": False,
+                    }
         except Exception:
             pass
 

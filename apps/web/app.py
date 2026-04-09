@@ -2426,37 +2426,15 @@ if (not CLOUD_MODE) and (not (auth_tokens.secret or "").strip()):
     except Exception:
         auth_tokens.secret = os.urandom(48).hex()
 
-PUBLIC_SERVER_URL = ""
+CLOUD_SERVER_URL = "https://jarvis-cloud-assistant.onrender.com"
+LOCAL_SERVER_URL = "http://127.0.0.1:18001"
+PUBLIC_SERVER_URL = CLOUD_SERVER_URL if CLOUD_MODE else LOCAL_SERVER_URL
 AGENT_TOKEN_TTL_SECONDS = 2592000  # 30d
 
 
 def _effective_server_url(request: Request | None) -> str:
-    """Best-effort server base URL for agent bootstrap payloads.
-
-    Priority:
-    1) Explicit JARVIS_PUBLIC_SERVER_URL (always wins)
-    2) In local/non-cloud mode, derive from the current request host/scheme
-    3) In cloud mode, derive from forwarded headers/request as fallback
-    """
-    if PUBLIC_SERVER_URL:
-        return PUBLIC_SERVER_URL
-
-    try:
-        if request is not None:
-            xf_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
-            xf_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
-            host = xf_host or (request.headers.get("host") or "").strip()
-            scheme = xf_proto or (request.url.scheme if request.url else "http")
-            if host:
-                return f"{scheme}://{host}".rstrip("/")
-            if request.base_url:
-                return str(request.base_url).rstrip("/")
-    except Exception:
-        pass
-
-    if CLOUD_MODE:
-        return "https://jarvis-cloud-assistant.onrender.com"
-    return "http://127.0.0.1:18001"
+    """Return fixed server base URL for agent bootstrap payloads."""
+    return PUBLIC_SERVER_URL
 
 
 def _is_local_request(request: Request | None) -> bool:
@@ -5726,16 +5704,6 @@ cors_origins = [
     "https://frontend.onrender.com",
     "https://jarvis-cloud-assistant.onrender.com"
 ]
-
-# Allow extra origins via env (comma-separated), e.g. for custom domains.
-try:
-    extra = ""
-    if extra:
-        for o in [x.strip() for x in extra.split(",")]:
-            if o and o not in cors_origins:
-                cors_origins.append(o)
-except Exception:
-    pass
 
 app.add_middleware(
     CORSMiddleware,

@@ -18,3 +18,5 @@ applyTo:
 - Treat [src/core/llm_adapter.py](src/core/llm_adapter.py) as the behavior/intelligence layer: intent parsing, multi-step chaining, clarification memory, and response tone should be changed there first.
 - Maintain execution-result normalization in backend result paths: rely on canonical `success` and `error` semantics and preserve status mapping (`ok`, `error`, `forbidden`) for downstream UI/task updates.
 - Preserve clarification continuity behavior: when required details are missing, backend/adapter should store pending clarification context, resume the original task when details arrive, and allow side questions without losing pending state.
+- Avoid hardcoded deployment hosts/origins in runtime logic; prefer environment-driven config (for example `JARVIS_PUBLIC_SERVER_URL`, `JARVIS_CORS_ORIGINS`) with explicit safe defaults.
+- When adding action aliases/wrappers (especially `device_action`), preserve compatibility with both wrapped and direct action types so cloud dispatch and PC agent stay contract-safe.

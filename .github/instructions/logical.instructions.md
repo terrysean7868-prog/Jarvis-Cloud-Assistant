@@ -110,6 +110,7 @@ Make permission-grant resumes more explicit so queued tasks recover predictably 
 Keep timeout and retry messages more specific so users can tell whether the failure was auth, capability, agent offline, or execution timeout.
 Add more structured logging around provider fallback, delegated retries, and permission-blocked dispatches.
 Reduce status ambiguity in the frontend by deriving labels from the returned lifecycle hint and backend summary together rather than from one field alone.
+Prefer environment-driven URLs/origins and assistant-name aware voice matching over hardcoded deployment domains or fixed wake-name literals.
 
 15. RECENT BEHAVIOR GUARDS
 Compound intent chaining: if one user sentence contains multiple executable intents joined by natural connectors (and/then/after), Jarvis should produce a full ordered action chain rather than stopping at the first step.

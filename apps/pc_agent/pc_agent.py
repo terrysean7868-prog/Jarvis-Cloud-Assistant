@@ -1539,7 +1539,7 @@ async def _execute_action(action: dict) -> dict:
     t = (action or {}).get("type")
 
     if t == "device_action":
-        name = (action or {}).get("name") or (action or {}).get("action") or ""
+        name = (action or {}).get("name") or (action or {}).get("action") or (action or {}).get("device_action") or ""
         name = str(name or "").strip().lower()
         if not name or name == "device_action":
             return {"status": "error", "action_type": "device_action", "message": "Invalid device action name"}
@@ -1556,6 +1556,27 @@ async def _execute_action(action: dict) -> dict:
                 params.setdefault(k, v)
 
         dres = resolve_and_execute(name, params)
+
+        # Compatibility fallback: some callers wrap native action types inside
+        # type=device_action (e.g. set_volume/open_url/set_wifi). If the
+        # semantic resolver cannot map them, dispatch by direct action type.
+        if not bool(dres.get("success")):
+            normalized_name = _normalize_device_action_name(name)
+            direct_type = normalized_name
+            if direct_type and direct_type != "device_action" and direct_type in set(_supported_actions_catalog()):
+                direct_action = {"type": direct_type, **params}
+                direct_res = await _execute_action(direct_action)
+                direct_status = _normalize_contract_status(str((direct_res or {}).get("status") or ""))
+                direct_ok = bool(direct_status == "completed" or bool((direct_res or {}).get("success")))
+                return {
+                    "status": "success" if direct_ok else "error",
+                    "action_type": "device_action",
+                    "device_action": direct_type,
+                    "message": str((direct_res or {}).get("message") or ("" if direct_ok else "Device action execution failed.")),
+                    "error": None if direct_ok else (direct_res or {}).get("error") or (direct_res or {}).get("message"),
+                    "result": direct_res,
+                }
+
         return {
             "status": "success" if bool(dres.get("success")) else "error",
             "action_type": "device_action",

@@ -1,8 +1,7 @@
 // src/utils/api.js
-// Priority:
-// 1) Query param override (?api_url=https://...)
-// 2) Development (localhost): use relative URLs via proxy
-// 3) Production: same-origin, with Render frontend fallback to backend service URL
+// Fixed URL strategy:
+// - Localhost UI uses relative URLs via dev proxy.
+// - Non-localhost UI uses the fixed cloud backend URL.
 const isLocalhost = (() => {
   try {
     const h = (window.location && window.location.hostname) || "";
@@ -12,32 +11,8 @@ const isLocalhost = (() => {
   }
 })();
 
-let queryBase = "";
-try {
-  if (typeof window !== "undefined" && window.location && window.location.search) {
-    const params = new URLSearchParams(window.location.search);
-    queryBase = String(params.get("api_url") || "").trim();
-  }
-} catch {}
-
-const isHttpUrl = (value) => /^https?:\/\//i.test(String(value || "").trim());
-const queryApi = isHttpUrl(queryBase) ? queryBase.replace(/\/$/, "") : "";
-
-let prodBase = "https://jarvis-cloud-assistant.onrender.com";
-try {
-  if (typeof window !== "undefined" && window.location && window.location.origin) {
-    const origin = window.location.origin;
-    // If the UI is hosted on a separate Render service, default the API to the known backend service.
-    // Prefer explicit REACT_APP_API_URL for custom domains / non-default setups.
-    if (/(jarvis-frontend|frontend)\.onrender\.com$/i.test(origin)) {
-      prodBase = "https://jarvis-cloud-assistant.onrender.com";
-    } else {
-      prodBase = origin;
-    }
-  }
-} catch {}
-
-export const API_URL = queryApi || (isLocalhost ? "" : prodBase);
+const CLOUD_API_URL = "https://jarvis-cloud-assistant.onrender.com";
+export const API_URL = isLocalhost ? "" : CLOUD_API_URL;
 
 const DEFAULT_TIMEOUT = 30000;
 const CHAT_MAX_ATTEMPTS = 3;

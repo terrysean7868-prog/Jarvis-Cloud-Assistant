@@ -18,3 +18,5 @@ applyTo:
 - When both lifecycle status and concrete `action_results` are present, prefer rendering/speaking the concrete results instead of queued/awaiting placeholders.
 - Keep delegated result UX aligned with backend normalized statuses (`ok`, `error`, `forbidden`) and `success`/`error` fields.
 - Preserve pending-requirement and pending-clarification continuity cues in UI messaging so users can resume interrupted tasks cleanly.
+- Avoid hardcoded backend hosts in frontend API code; support query/env overrides first and keep domain-specific fallbacks as last resort.
+- For wake/voice flows, avoid hardcoded assistant-name literals in command regex; use current assistant name state/ref so renamed assistants keep working.

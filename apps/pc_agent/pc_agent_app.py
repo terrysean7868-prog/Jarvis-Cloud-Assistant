@@ -1231,7 +1231,7 @@ def run_ui() -> int:
                 if safe_token and requested_device and token_device and token_device != requested_device:
                     try:
                         log_q.put_nowait(
-                            f"[{_now_hms()}] WARNING: agent_token is bound to device_id='{token_device}', but the selected device_id is '{requested_device}'. Clear the token and reconfigure the PC agent config for this device."
+                            f"[{_now_hms()}] WARNING: agent_token is bound to device_id='{token_device}', but the selected device_id is '{requested_device}'. Token was cleared automatically; configure a token for this device."
                         )
                     except Exception:
                         pass
@@ -1620,7 +1620,7 @@ def run_ui() -> int:
                 if safe_token and requested_device and token_device and token_device != requested_device:
                     msg = (
                         f"[{_now_hms()}] WARNING: agent_token is bound to device_id='{token_device}', "
-                        f"but the selected device_id is '{requested_device}'. Clear the token and reconfigure the PC agent config for this device."
+                        f"but the selected device_id is '{requested_device}'. Token was cleared automatically; configure a token for this device."
                     )
                     try:
                         log_q.put_nowait(msg)
