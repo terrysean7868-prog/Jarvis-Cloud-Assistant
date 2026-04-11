@@ -18,6 +18,22 @@
       "assistant_name": "Jarvis",
       "created_at": "2026-01-18T12:05:50.865660",
       "last_login": "2026-01-18T12:08:55.377896"
+    },
+    "hash_norm_test_user": {
+      "voice_hash": "edeed6f0d5690b56799453b4c448809212e54688913600b0a16e68906478d356",
+      "voice_samples": [
+        {
+          "hash": "edeed6f0d5690b56799453b4c448809212e54688913600b0a16e68906478d356",
+          "text": "open jarvis now",
+          "created_at": "2026-04-11T06:18:33.710525"
+        }
+      ],
+      "role": "user",
+      "assistant_name": "Jarvis",
+      "voice_bio_embeddings": [],
+      "created_at": "2026-04-11T06:18:33.710538",
+      "last_login": "2026-04-11T06:19:49.039688",
+      "updated_at": "2026-04-11T06:19:49.039128"
     }
   }
 }
