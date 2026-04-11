@@ -670,14 +670,20 @@ def _ops_telemetry_snapshot() -> dict[str, Any]:
 
 def _ops_alert_if_needed(snapshot: dict[str, Any]) -> None:
     try:
+        chat_total = int(snapshot.get("chat_total") or 0)
+        error_total = int(snapshot.get("error_total") or 0)
+        fallback_total = int(snapshot.get("fallback_total") or 0)
         fallback_rate = float(snapshot.get("fallback_rate") or 0.0)
         error_rate = float(snapshot.get("error_rate") or 0.0)
         queued = int(snapshot.get("queued_for_agent_count") or 0)
         pending = int(snapshot.get("pending_permission_count") or 0)
         queue_size = queued + pending
-        if fallback_rate > 0.40:
+        # Avoid noisy stability alerts on tiny samples during cold start.
+        if chat_total < 25:
+            return
+        if fallback_rate > 0.40 and fallback_total >= 8:
             logger.warning("[stability.alert] metric=fallback_rate value=%.3f threshold=0.40", fallback_rate)
-        if error_rate > 0.20:
+        if error_rate > 0.20 and error_total >= 8:
             logger.warning("[stability.alert] metric=error_rate value=%.3f threshold=0.20", error_rate)
         if queue_size > 100:
             logger.warning("[stability.alert] metric=queue_size value=%s threshold=100", queue_size)
@@ -7250,9 +7256,6 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
             timeout=GLOBAL_LLM_CALL_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
-        _ops_inc("chat_total")
-        _ops_inc("timeout_total")
-        _ops_inc("error_total")
         response = {
             "status": "failed",
             "source": "timeout_guard",
@@ -7269,8 +7272,6 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
             level="warning",
         )
     except Exception as e:
-        _ops_inc("chat_total")
-        _ops_inc("error_total")
         response = {
             "status": "failed",
             "source": "error_guard",
@@ -7536,6 +7537,7 @@ async def trigger_git_sync(req: dict | None = None):
 class GitHubConfig(BaseModel):
     repo_url: str | None = None
     username: str | None = None
+    token: str | None = None
     password: str | None = None
     ssh_key: str | None = None
     session_id: str | None = None
@@ -7564,6 +7566,8 @@ async def set_github_config(config: GitHubConfig):
             env_vars["GITHUB_REPO"] = config.repo_url
         if config.username:
             env_vars["GITHUB_USERNAME"] = config.username
+        if config.token:
+            env_vars["GITHUB_TOKEN"] = config.token
         if config.password:
             env_vars["GITHUB_PASSWORD"] = config.password
         if config.ssh_key:

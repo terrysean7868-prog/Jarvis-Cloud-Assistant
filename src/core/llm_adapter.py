@@ -44,6 +44,9 @@ class LLMAdapter:
     Supports GPT (OpenAI) and fallback to local training.
     """
 
+    # Strict global output cap to reduce TPM/rate-limit failures across providers.
+    STRICT_PROVIDER_MAX_TOKENS = 600
+
     def __init__(self):
         self.provider = str(getattr(rd, "LLM_PROVIDER", "openai_compatible") or "openai_compatible").strip().lower()
         # Primary: OpenAI (ChatGPT). Fallback: Groq (OpenAI-compatible endpoint).
@@ -1950,6 +1953,55 @@ class LLMAdapter:
         )
         return any(m in msg for m in transient_markers)
 
+    @staticmethod
+    def _is_rate_limit_error(err: Exception) -> bool:
+        msg = str(err or "").strip().lower()
+        if not msg:
+            return False
+        return (
+            "rate limit" in msg
+            or "rate_limit" in msg
+            or "429" in msg
+            or "too many requests" in msg
+        )
+
+    @staticmethod
+    def _extract_retry_after_seconds(err: Exception) -> float:
+        msg = str(err or "")
+        if not msg:
+            return 0.0
+        try:
+            m = re.search(r"try\s+again\s+in\s+([0-9]+(?:\.[0-9]+)?)s", msg, flags=re.IGNORECASE)
+            if m:
+                return max(0.0, float(m.group(1)))
+        except Exception:
+            pass
+        try:
+            m = re.search(r"retry[-_ ]?after[^0-9]*([0-9]+(?:\.[0-9]+)?)", msg, flags=re.IGNORECASE)
+            if m:
+                return max(0.0, float(m.group(1)))
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _model_token_cap(model_name: str | None) -> int | None:
+        """Return conservative max token cap for known free/on-demand models."""
+        m = str(model_name or "").strip().lower()
+        if not m:
+            return None
+        # Groq free/on-demand tier frequently rate-limits on TPM for this model.
+        if "llama-3.1-8b-instant" in m:
+            return 700
+        return None
+
+    def _effective_max_tokens_for_model(self, requested_max_tokens: int, model_name: str | None) -> int:
+        base = max(128, min(int(requested_max_tokens), int(self.max_max_tokens), int(self.STRICT_PROVIDER_MAX_TOKENS)))
+        cap = self._model_token_cap(model_name)
+        if isinstance(cap, int) and cap > 0:
+            return max(128, min(base, cap))
+        return base
+
     def _choose_model_for_request(self, text: str, mode: str) -> str:
         """Route to a stronger model for complex tasks when configured."""
         try:
@@ -2810,7 +2862,7 @@ class LLMAdapter:
         actions = parsed.get("actions") if isinstance(parsed, dict) else []
 
         if status in {"queued", "in_progress", "executing", "delegated"} and isinstance(actions, list) and actions:
-            return "I queued that action and will share the result as soon as the device responds."
+            return "Execution queued. I will share the result as soon as the device responds."
 
         if status == "failed":
             options = ", ".join([str(x) for x in next_actions[:2]]) if next_actions else "retry with safer fallback"
@@ -3473,7 +3525,7 @@ class LLMAdapter:
         if at == "web_search":
             return "Searching for that."
         if at == "device_action":
-            return "Applying that now."
+            return "Execution queued for that action."
         return "Done."
 
     def _postprocess_proactive_followup(self, user_text: str, parsed: dict) -> dict:
@@ -3498,6 +3550,11 @@ class LLMAdapter:
                     confirm = confirm[:-1] + " now."
                 if (not txt) or ("opening" not in txt.lower() and "switching" not in txt.lower() and "closing" not in txt.lower() and "applying" not in txt.lower()):
                     parsed["text"] = confirm
+            if at == "open_url":
+                url = str(first.get("url") or "").strip().lower()
+                if ("youtube.com" in url or "youtu.be" in url) and ("want me to search something" not in txt.lower()):
+                    base = txt or self._action_text_from_first_action(actions)
+                    parsed["text"] = (base.rstrip(".") + ". Want me to search something on YouTube?").strip()
             try:
                 profile = self._classify_intent_profile(user_text)
                 parsed["intent_type"] = profile.get("intent_type")
@@ -5971,7 +6028,10 @@ Style tone: {tone}.
                                         {"role": "system", "content": system_prompt},
                                         {"role": "user", "content": user_prompt},
                                     ],
-                                    max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
+                                    max_tokens=self._effective_max_tokens_for_model(
+                                        max(256, min(max_tokens, self.max_max_tokens)),
+                                        chosen_model,
+                                    ),
                                     temperature=temperature,
                                     model=chosen_model,
                                     endpoint=self.primary_endpoint,
@@ -5992,7 +6052,9 @@ Style tone: {tone}.
                         print(f"[LLM WARN] Primary provider failed (attempt {attempt + 1}): {e_primary}")
                         if attempt < (max_primary_attempts - 1):
                             try:
-                                backoff = min(0.25 * float(attempt + 1), 0.7)
+                                retry_after = self._extract_retry_after_seconds(e_primary) if self._is_rate_limit_error(e_primary) else 0.0
+                                # Keep waits bounded so budgeted requests do not stall too long.
+                                backoff = max(min(0.25 * float(attempt + 1), 0.7), min(retry_after, 2.5))
                                 if backoff > 0:
                                     await asyncio.sleep(backoff)
                             except Exception:
@@ -6055,7 +6117,10 @@ Style tone: {tone}.
                                     {"role": "system", "content": system_prompt},
                                     {"role": "user", "content": fallback_prompt},
                                 ],
-                                max_tokens=max(256, min(max_tokens, self.max_max_tokens)),
+                                max_tokens=self._effective_max_tokens_for_model(
+                                    max(256, min(max_tokens, self.max_max_tokens)),
+                                    fallback_model,
+                                ),
                                 temperature=temperature,
                                 model=fallback_model,
                                 endpoint=self.backup_endpoint,
@@ -6069,7 +6134,8 @@ Style tone: {tone}.
                         last_err = e_fallback
                         if fb_attempt < (fallback_attempts - 1):
                             try:
-                                backoff = min(0.3 * float(fb_attempt + 1), 0.8)
+                                retry_after = self._extract_retry_after_seconds(e_fallback) if self._is_rate_limit_error(e_fallback) else 0.0
+                                backoff = max(min(0.3 * float(fb_attempt + 1), 0.8), min(retry_after, 3.0))
                                 if backoff > 0:
                                     await asyncio.sleep(backoff)
                             except Exception:

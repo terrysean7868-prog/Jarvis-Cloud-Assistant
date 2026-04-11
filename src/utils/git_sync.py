@@ -36,7 +36,7 @@ def setup_ssh_trust():
     Prevents 'Host key verification failed' or 'REMOTE HOST IDENTIFICATION HAS CHANGED'.
     Only runs if SSH_KEY is configured. Silent fail on Windows/systems without ssh-keyscan.
     """
-    ssh_key = ""
+    ssh_key = str(os.getenv("SSH_KEY") or "").strip()
     if not ssh_key:
         return  # Silent skip if no SSH_KEY configured
 
@@ -133,12 +133,14 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):
     print(f"[GIT SYNC] Starting sync in: {repo_path}")
 
     # --- Environment setup ---
-    ssh_key = ""
-    github_repo = ""
-    github_user = ""
-    github_password = ""  # For HTTPS fallback
-    git_name = "Jarvis Cloud Assistant"
-    git_email = "jarvis@render.com"
+    ssh_key = str(os.getenv("SSH_KEY") or "").strip()
+    github_repo = str(os.getenv("GITHUB_REPO") or "").strip()
+    github_user = str(os.getenv("GITHUB_USERNAME") or "").strip()
+    # Prefer token over password for HTTPS auth.
+    github_token = str(os.getenv("GITHUB_TOKEN") or "").strip()
+    github_password = str(os.getenv("GITHUB_PASSWORD") or "").strip()
+    git_name = str(os.getenv("GIT_USER_NAME") or "Jarvis Cloud Assistant").strip() or "Jarvis Cloud Assistant"
+    git_email = str(os.getenv("GIT_USER_EMAIL") or "jarvis@render.com").strip() or "jarvis@render.com"
 
     # Try to get repo URL from env or construct it
     if not github_repo:
@@ -151,8 +153,8 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):
         except:
             pass
 
-    if not ssh_key and not github_password:
-        raise RuntimeError("[GIT SYNC] Missing SSH_KEY or GITHUB_PASSWORD in environment.")
+    if not ssh_key and not github_token and not github_password:
+        raise RuntimeError("[GIT SYNC] Missing SSH_KEY or GITHUB_TOKEN/GITHUB_PASSWORD in environment.")
     if not github_repo:
         raise RuntimeError("[GIT SYNC] Missing GITHUB_REPO and no existing remote found.")
 
@@ -168,27 +170,32 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):
         run("git branch -M main", cwd=repo_path, check=False)
 
     # --- Construct repo URL ---
-    if ssh_key:
-        # Extract repo name from URL if full URL provided
-        if "github.com" in github_repo:
-            if "/" in github_repo:
-                parts = github_repo.replace("https://github.com/", "").replace("git@github.com:", "").replace(".git", "")
-                if "/" in parts:
-                    github_user, repo_slug = parts.split("/", 1)
-                else:
-                    repo_slug = parts
-            else:
-                repo_slug = github_repo.replace(".git", "")
+    owner = github_user
+    repo_slug = ""
+    raw_repo = str(github_repo or "").strip().replace(".git", "")
+    if "github.com" in raw_repo:
+        normalized = raw_repo.replace("https://github.com/", "").replace("git@github.com:", "")
+        if "/" in normalized:
+            owner_part, repo_part = normalized.split("/", 1)
+            owner = owner_part.strip() or owner
+            repo_slug = repo_part.strip()
         else:
-            repo_slug = github_repo.split("/")[-1].replace(".git", "")
-        
-        repo_url = f"git@github.com:{github_user}/{repo_slug}.git"
+            repo_slug = normalized.strip()
+    elif "/" in raw_repo:
+        # Supports shorthand like "owner/repo".
+        owner_part, repo_part = raw_repo.split("/", 1)
+        owner = owner_part.strip() or owner
+        repo_slug = repo_part.strip()
     else:
-        # Use HTTPS with password
-        if "github.com" in github_repo:
-            repo_url = github_repo
-        else:
-            repo_url = f"https://github.com/{github_user}/{github_repo}.git"
+        repo_slug = raw_repo.strip()
+
+    if not owner or not repo_slug:
+        raise RuntimeError("[GIT SYNC] Invalid repository format. Use full GitHub URL or owner/repo.")
+
+    if ssh_key:
+        repo_url = f"git@github.com:{owner}/{repo_slug}.git"
+    else:
+        repo_url = f"https://github.com/{owner}/{repo_slug}.git"
 
     ensure_remote(repo_path, repo_url)
     print(f"[GIT SYNC] Using {'SSH' if ssh_key else 'HTTPS'} authentication ({repo_url})")
@@ -215,9 +222,10 @@ def git_sync(repo_path=".", commit_msg="Jarvis auto-sync", max_retries=5):
             f"-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
         )
     else:
-        # HTTPS with credentials
-        if github_user and github_password:
-            repo_url_with_auth = repo_url.replace("https://", f"https://{github_user}:{github_password}@")
+        # HTTPS with token/password credentials
+        credential_secret = github_token or github_password
+        if github_user and credential_secret:
+            repo_url_with_auth = repo_url.replace("https://", f"https://{github_user}:{credential_secret}@")
             run(f"git remote set-url origin {repo_url_with_auth}", cwd=repo_path, check=False)
 
     success = False
