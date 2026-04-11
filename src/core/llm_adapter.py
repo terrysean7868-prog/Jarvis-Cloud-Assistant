@@ -1198,6 +1198,26 @@ class LLMAdapter:
         except Exception:
             pass
 
+    def _mark_provider_cooldown(self, provider_name: str, *, cooldown_s: float, reason: str) -> None:
+        try:
+            name = str(provider_name or "").strip().lower()
+            if not name:
+                return
+            until = time.time() + max(1.0, float(cooldown_s))
+            self._provider_fail_until[name] = until
+            self._provider_fail_count[name] = max(
+                int(self._provider_fail_count.get(name) or 0),
+                int(self.provider_failure_threshold),
+            )
+            logger.warning(
+                "[llm.circuit.open] provider=%s reason=%s cooldown_s=%s",
+                name,
+                str(reason or "unknown"),
+                int(max(1.0, float(cooldown_s))),
+            )
+        except Exception:
+            pass
+
     def _mark_provider_success(self, provider_name: str) -> None:
         try:
             name = str(provider_name or "").strip().lower()
@@ -1966,6 +1986,76 @@ class LLMAdapter:
         )
 
     @staticmethod
+    def _is_model_access_error(err: Exception) -> bool:
+        msg = str(err or "").strip().lower()
+        if not msg:
+            return False
+        return (
+            "model_not_found" in msg
+            or "model does not exist" in msg
+            or "does not exist or you do not have access" in msg
+            or "you do not have access" in msg
+            or "unknown model" in msg
+        )
+
+    @staticmethod
+    def _is_quota_error(err: Exception) -> bool:
+        msg = str(err or "").strip().lower()
+        if not msg:
+            return False
+        return (
+            "insufficient_quota" in msg
+            or "exceeded your current quota" in msg
+            or "billing" in msg
+            or "quota" in msg
+        )
+
+    @staticmethod
+    def _is_auth_error(err: Exception) -> bool:
+        msg = str(err or "").strip().lower()
+        if not msg:
+            return False
+        return (
+            "invalid_api_key" in msg
+            or "incorrect api key" in msg
+            or "authentication" in msg
+            or "unauthorized" in msg
+            or "permission denied" in msg
+        )
+
+    @staticmethod
+    def _summarize_provider_error(err: Exception) -> str:
+        msg = str(err or "").strip().replace("\n", " ")
+        if len(msg) > 220:
+            return msg[:220].rstrip() + "..."
+        return msg
+
+    @staticmethod
+    def _backup_model_candidates(preferred: str | None) -> list[str]:
+        primary = str(preferred or "").strip()
+        # Keep a short, ordered candidate list for Groq/OpenAI-compatible fallback.
+        candidates = [
+            primary,
+            "llama-3.3-70b-versatile",
+            "llama-3.1-70b-versatile",
+            "llama3-8b-8192",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+        ]
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in candidates:
+            cc = str(c or "").strip()
+            if not cc:
+                continue
+            k = cc.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(cc)
+        return out
+
+    @staticmethod
     def _extract_retry_after_seconds(err: Exception) -> float:
         msg = str(err or "")
         if not msg:
@@ -2024,6 +2114,8 @@ class LLMAdapter:
             "ollama_qwen2_5_7b": "qwen2.5:7b",
             "openai_compatible_primary": primary_model or smart_model,
             "openai_compatible_backup": backup_model or primary_model,
+            # Legacy Groq model ID often unavailable on some accounts.
+            "llama-3.1-8b-instant": backup_model or "llama-3.3-70b-versatile",
             "local_tiny_fallback": "local-fast-path",
         }
         resolved = mapping.get(mid)
@@ -6043,13 +6135,34 @@ Style tone: {tone}.
                         break
                     except Exception as e_primary:
                         last_err = e_primary
+                        primary_label = "ollama" if chosen_provider in {"ollama", "local_model"} else "openai"
                         logger.warning(
                             "[llm.provider.fail] provider=%s attempt=%s error=%s",
-                            "ollama" if chosen_provider in {"ollama", "local_model"} else "openai",
+                            primary_label,
                             attempt + 1,
-                            str(e_primary),
+                            self._summarize_provider_error(e_primary),
                         )
-                        print(f"[LLM WARN] Primary provider failed (attempt {attempt + 1}): {e_primary}")
+                        if self._is_quota_error(e_primary):
+                            self._mark_provider_cooldown(
+                                primary_provider_name,
+                                cooldown_s=max(float(self.provider_cooldown_s), 900.0),
+                                reason="insufficient_quota",
+                            )
+                            break
+                        if self._is_auth_error(e_primary):
+                            self._mark_provider_cooldown(
+                                primary_provider_name,
+                                cooldown_s=max(float(self.provider_cooldown_s), 1800.0),
+                                reason="auth_error",
+                            )
+                            break
+                        if self._is_model_access_error(e_primary):
+                            self._mark_provider_cooldown(
+                                primary_provider_name,
+                                cooldown_s=max(float(self.provider_cooldown_s), 600.0),
+                                reason="model_access_error",
+                            )
+                            break
                         if attempt < (max_primary_attempts - 1):
                             try:
                                 retry_after = self._extract_retry_after_seconds(e_primary) if self._is_rate_limit_error(e_primary) else 0.0
@@ -6101,48 +6214,67 @@ Style tone: {tone}.
                 if remaining <= 0.0:
                     raise TimeoutError("provider budget exhausted before fallback response")
                 provider_source = "groq" if fallback_provider in {"groq", "openai_compatible", "openai"} else fallback_provider
-                routed_model = fallback_model
                 fallback_prompt = _build_user_prompt(prompt_windows[-1])
                 fallback_attempts = 2
-                for fb_attempt in range(fallback_attempts):
-                    elapsed = time.monotonic() - budget_started
-                    remaining = max(0.0, float(request_budget_s) - elapsed)
-                    if remaining <= 0.0:
-                        break
-                    logger.info("[llm.provider.start] provider=%s attempt=%s remaining_s=%.2f", provider_source, fb_attempt + 1, remaining)
-                    try:
-                        response = await asyncio.wait_for(
-                            self._call_openai(
-                                [
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": fallback_prompt},
-                                ],
-                                max_tokens=self._effective_max_tokens_for_model(
-                                    max(256, min(max_tokens, self.max_max_tokens)),
-                                    fallback_model,
-                                ),
-                                temperature=temperature,
-                                model=fallback_model,
-                                endpoint=self.backup_endpoint,
-                                api_key=self.backup_key,
-                            ),
-                            timeout=max(1.0, min(float(request_timeout_s), remaining)),
+                model_candidates = self._backup_model_candidates(fallback_model)
+                for candidate in model_candidates:
+                    routed_model = candidate
+                    for fb_attempt in range(fallback_attempts):
+                        elapsed = time.monotonic() - budget_started
+                        remaining = max(0.0, float(request_budget_s) - elapsed)
+                        if remaining <= 0.0:
+                            break
+                        logger.info(
+                            "[llm.provider.start] provider=%s model=%s attempt=%s remaining_s=%.2f",
+                            provider_source,
+                            candidate,
+                            fb_attempt + 1,
+                            remaining,
                         )
-                        self._mark_provider_success(fallback_provider)
+                        try:
+                            response = await asyncio.wait_for(
+                                self._call_openai(
+                                    [
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": fallback_prompt},
+                                    ],
+                                    max_tokens=self._effective_max_tokens_for_model(
+                                        max(256, min(max_tokens, self.max_max_tokens)),
+                                        candidate,
+                                    ),
+                                    temperature=temperature,
+                                    model=candidate,
+                                    endpoint=self.backup_endpoint,
+                                    api_key=self.backup_key,
+                                ),
+                                timeout=max(1.0, min(float(request_timeout_s), remaining)),
+                            )
+                            self._mark_provider_success(fallback_provider)
+                            break
+                        except Exception as e_fallback:
+                            last_err = e_fallback
+                            if self._is_model_access_error(e_fallback):
+                                logger.warning(
+                                    "[llm.provider.model_unavailable] provider=%s model=%s",
+                                    provider_source,
+                                    candidate,
+                                )
+                                break
+                            if fb_attempt < (fallback_attempts - 1):
+                                try:
+                                    retry_after = self._extract_retry_after_seconds(e_fallback) if self._is_rate_limit_error(e_fallback) else 0.0
+                                    backoff = max(min(0.3 * float(fb_attempt + 1), 0.8), min(retry_after, 3.0))
+                                    if backoff > 0:
+                                        await asyncio.sleep(backoff)
+                                except Exception:
+                                    pass
+                                continue
+                            break
+                    if response is not None:
                         break
-                    except Exception as e_fallback:
-                        last_err = e_fallback
-                        if fb_attempt < (fallback_attempts - 1):
-                            try:
-                                retry_after = self._extract_retry_after_seconds(e_fallback) if self._is_rate_limit_error(e_fallback) else 0.0
-                                backoff = max(min(0.3 * float(fb_attempt + 1), 0.8), min(retry_after, 3.0))
-                                if backoff > 0:
-                                    await asyncio.sleep(backoff)
-                            except Exception:
-                                pass
-                            continue
-                        self._mark_provider_failure(fallback_provider)
-                        raise
+                if response is None:
+                    self._mark_provider_failure(fallback_provider)
+                    raise last_err or Exception("Fallback provider failed")
             if chosen_provider in {"ollama", "local_model"} and isinstance(response, dict):
                 msg = response.get("message") or {}
                 content = str(msg.get("content") or "").strip()

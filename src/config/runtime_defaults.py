@@ -112,7 +112,7 @@ LLM_PROVIDER: str = "openai_compatible"  # "ollama" | "openai_compatible"
 PRIMARY_MODEL: str = "gpt-4o-mini"
 PRIMARY_ENDPOINT: str = "https://api.openai.com/v1/chat/completions"
 
-BACKUP_MODEL: str = "llama-3.1-8b-instant"
+BACKUP_MODEL: str = "llama-3.3-70b-versatile"
 BACKUP_ENDPOINT: str = "https://api.groq.com/openai/v1/chat/completions"
 
 PERSONA: str = "formal-gentle"

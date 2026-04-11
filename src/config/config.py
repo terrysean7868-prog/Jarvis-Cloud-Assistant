@@ -39,7 +39,7 @@ class Config:
             'endpoint': _PRIMARY_DEFAULT_ENDPOINT,
         },
         'backup': {
-            'name': 'llama-3.1-8b-instant',
+            'name': 'llama-3.3-70b-versatile',
             'api_key': llm_secrets().backup_api_key,
             'endpoint': 'https://api.groq.com/openai/v1/chat/completions',
         }
