@@ -15,6 +15,24 @@ from src.config import env
 
 logger = logging.getLogger(__name__)
 
+
+def _is_headless_environment() -> bool:
+    try:
+        # Linux/macOS headless check.
+        if os.name != "nt" and not os.getenv("DISPLAY") and not os.getenv("WAYLAND_DISPLAY"):
+            return True
+        # Common hosted/container markers where desktop automation is usually unavailable.
+        hosted_markers = (
+            "RENDER",
+            "RENDER_SERVICE_ID",
+            "K_SERVICE",
+            "DYNO",
+            "CI",
+        )
+        return any(bool((os.getenv(k) or "").strip()) for k in hosted_markers)
+    except Exception:
+        return False
+
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -36,7 +54,10 @@ try:
     PYAUTOGUI_AVAILABLE = True
 except (ImportError, KeyError, Exception):
     # KeyError happens on headless systems (no DISPLAY env var)
-    logger.warning("pyautogui not available (likely running on headless system)")
+    if _is_headless_environment():
+        logger.info("pyautogui unavailable in headless/hosted environment; GUI automation disabled")
+    else:
+        logger.warning("pyautogui not available; install it to enable GUI automation")
 
 try:
     import win32gui
@@ -45,7 +66,10 @@ try:
     PYWIN32_AVAILABLE = True
 except ImportError:
     PYWIN32_AVAILABLE = False
-    logger.warning("pywin32 not available for Windows automation")
+    if os.name == "nt":
+        logger.warning("pywin32 not available on Windows; window automation features are disabled")
+    else:
+        logger.info("pywin32 unavailable on non-Windows platform; Windows automation disabled")
 
 
 class SystemOperations:
