@@ -618,6 +618,15 @@ class JarvisBrain:
                 if ok and username:
                     operational_mode = voice_auth.get_operational_mode(username)
                     user_prefs = voice_auth.get_preferences(username) or {}
+                    # Include the per-user assistant name so the LLM adapter can
+                    # use the correct name in system prompts and intent patterns.
+                    try:
+                        u = voice_auth.get_user(username) or {}
+                        aname = (u.get("assistant_name") or "").strip()
+                        if aname:
+                            user_prefs["assistant_name"] = aname
+                    except Exception:
+                        pass
                 else:
                     operational_mode = self._anon_operational_mode
                     user_prefs = {}
