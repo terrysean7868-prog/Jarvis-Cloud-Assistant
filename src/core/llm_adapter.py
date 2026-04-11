@@ -631,6 +631,26 @@ class LLMAdapter:
         return t
 
     @staticmethod
+    def _resolve_assistant_name(user_prefs: dict | None, raw_name: str | None = None) -> tuple[str, str]:
+        """Return ``(display_name, escaped_lower)`` for the active assistant name.
+
+        ``display_name`` is the human-readable form (e.g. ``"Zara"``).
+        ``escaped_lower`` is the regex-escaped lowercase form ready for use in
+        patterns (e.g. ``"zara"``).
+
+        Prefers ``raw_name`` when supplied, then ``user_prefs["assistant_name"]``,
+        then falls back to ``"Jarvis"`` / ``"jarvis"``.
+        """
+        name = (
+            (raw_name or "").strip()
+            or str((user_prefs or {}).get("assistant_name") or "").strip()
+            or "Jarvis"
+        )
+        display = name or "Jarvis"
+        escaped = re.escape(display.lower() or "jarvis")
+        return display, escaped
+
+    @staticmethod
     def _extract_command_target_phrase(user_text: str) -> str:
         tl = (user_text or "").strip().lower()
         if not tl:
@@ -1400,7 +1420,7 @@ class LLMAdapter:
                 return True
         except Exception:
             pass
-        if re.match(r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+jarvis)?([\s!?.]*)$", t):
+        if re.match(r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+\w+)?([\s!?.]*)$", t):
             return True
         if re.match(r"^(what\s+is\s+)?(-?\d+)\s*([+\-*/])\s*(-?\d+)\??$", t):
             return True
@@ -1653,7 +1673,11 @@ class LLMAdapter:
 
         # Wake-word UX: keep a full friendly readiness line.
         wake_word = str(user_text or "").strip().lower()
-        if re.match(r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s*up(?:\s+jarvis)?|jarvis\s+wake\s*up)[\s!?.]*$", wake_word):
+        _, _aname = LLMAdapter._resolve_assistant_name(user_prefs)
+        if re.match(
+            rf"^({_aname}|hey\s+{_aname}|ok\s+{_aname}|okay\s+{_aname}|wake\s*up(?:\s+{_aname})?|{_aname}\s+wake\s*up)[\s!?.]*$",
+            wake_word,
+        ):
             return "Hello, I'm here. How can I help you?"
 
         txt = self._clean_conversational_noise(text)
@@ -3489,7 +3513,7 @@ class LLMAdapter:
         return None
 
     @staticmethod
-    def _quick_local_chat_reply(user_text: str) -> dict | None:
+    def _quick_local_chat_reply(user_text: str, assistant_name: str | None = None) -> dict | None:
         """Fast-path replies for common basic prompts.
 
         This avoids provider round-trips for trivial/local-safe chat prompts.
@@ -3498,14 +3522,21 @@ class LLMAdapter:
         if not tl:
             return None
 
-        if re.match(r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+jarvis)?([\s!?.]*)$", tl):
+        _, nm = LLMAdapter._resolve_assistant_name(None, raw_name=assistant_name)
+        if re.match(
+            rf"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))(\s+{nm})?([\s!?.]*)$",
+            tl,
+        ):
             return {
                 "text": "Hey, I am here. I can help with chat, research, and connected PC actions.",
                 "actions": [],
                 "source": "deterministic-local-chat",
             }
 
-        if re.match(r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s*up(?:\s+jarvis)?|jarvis\s+wake\s*up)([\s!?.]*)$", tl):
+        if re.match(
+            rf"^({nm}|hey\s+{nm}|ok\s+{nm}|okay\s+{nm}|wake\s*up(?:\s+{nm})?|{nm}\s+wake\s*up)([\s!?.]*)$",
+            tl,
+        ):
             return {
                 "text": "Hello, I am here. How can I help you?",
                 "actions": [],
@@ -3997,7 +4028,7 @@ class LLMAdapter:
         return ""
 
     @staticmethod
-    def _preparse_deterministic_voice_actions(user_text: str) -> dict | None:
+    def _preparse_deterministic_voice_actions(user_text: str, assistant_name: str | None = None) -> dict | None:
         """Deterministic intent parser for voice mode.
 
         Goal: when the user says a simple PC command, do the *obvious* thing without
@@ -4028,11 +4059,12 @@ class LLMAdapter:
         # Skill invocation: "run skill X" / "use X skill" / "skill X"
 
         # Fast-path: greetings and simple small-talk → instant response, no LLM needed.
+        display_name, nm = LLMAdapter._resolve_assistant_name(None, raw_name=assistant_name)
         _GREETING_PATTERNS = {
             r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day)|what'?s\s+up|sup|yo)[\s!?.,]*$": "Hey! How can I help you?",
-            r"^(jarvis|hey\s+jarvis|ok\s+jarvis|okay\s+jarvis|wake\s*up(?:\s+jarvis)?|jarvis\s+wake\s*up)[\s!?.,]*$": "Hello, I am here. How can I help you?",
+            rf"^({nm}|hey\s+{nm}|ok\s+{nm}|okay\s+{nm}|wake\s*up(?:\s+{nm})?|{nm}\s+wake\s*up)[\s!?.,]*$": "Hello, I am here. How can I help you?",
             r"^how\s+are\s+you[\s!?.,]*$": "I'm running great! What can I do for you?",
-            r"^(what'?s\s+your\s+name|who\s+are\s+you)[\s!?.,]*$": "I'm Jarvis, your AI assistant.",
+            r"^(what'?s\s+your\s+name|who\s+are\s+you)[\s!?.,]*$": f"I'm {display_name}, your AI assistant.",
             r"^(thanks|thank\s+you|ty|cheers|thx)[\s!?.,]*$": "You're welcome! Anything else?",
             r"^(bye|goodbye|see\s+you|cya|take\s+care)[\s!?.,]*$": "Goodbye! Have a great day.",
             r"^(ok|okay|got\s+it|sure|alright|fine|noted)[\s!?.,]*$": "Got it!",
@@ -5421,6 +5453,10 @@ class LLMAdapter:
     async def generate_response(self, text: str, context: str = "", mode="chat", capabilities=None, user_prefs: dict | None = None):
         original_text = str(text or "")
         pending_note = ""
+        # Resolve per-user assistant name so all deterministic paths use the correct name.
+        assistant_name: str = (
+            str((user_prefs or {}).get("assistant_name") or "Jarvis").strip() or "Jarvis"
+        )
         try:
             self._ensure_local_reasoner_state_scope(user_prefs)
         except Exception:
@@ -5582,7 +5618,7 @@ class LLMAdapter:
 
         if primary_intent == "action_intent":
             try:
-                deterministic_action = self._preparse_deterministic_voice_actions(text)
+                deterministic_action = self._preparse_deterministic_voice_actions(text, assistant_name=assistant_name)
                 if isinstance(deterministic_action, dict) and isinstance(deterministic_action.get("actions"), list) and deterministic_action.get("actions"):
                     try:
                         deterministic_action = self._postprocess_multi_step_chain_actions(user_text=text, parsed=deterministic_action)
@@ -5603,7 +5639,7 @@ class LLMAdapter:
 
         # Keep generation intents model-driven instead of deterministic canned output.
 
-        quick = self._quick_local_chat_reply(text)
+        quick = self._quick_local_chat_reply(text, assistant_name=assistant_name)
         if isinstance(quick, dict):
             quick_actions = quick.get("actions") if isinstance(quick.get("actions"), list) else []
             quick_source = str(quick.get("source") or "").strip().lower()
@@ -5815,7 +5851,7 @@ class LLMAdapter:
             pass
 
         system_prompt = f"""
-You are Jarvis.
+You are {assistant_name}.
 
 Be concise, accurate, and humanlike (warm/confident). Never reveal secrets. Never claim you executed actions unless the system confirms it.
 You must respect strict per-user/device permissions; if a request targets a PC/device, it must be the user's own authorized device.
@@ -6607,7 +6643,7 @@ Style tone: {tone}.
             # This keeps basic greetings, simple intents, and low-risk commands responsive
             # even when no external LLM is currently reachable.
             try:
-                deterministic = self._preparse_deterministic_voice_actions(text)
+                deterministic = self._preparse_deterministic_voice_actions(text, assistant_name=assistant_name)
                 if isinstance(deterministic, dict):
                     out = {
                         "text": str(deterministic.get("text") or "Done."),
