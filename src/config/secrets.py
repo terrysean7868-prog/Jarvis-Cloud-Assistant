@@ -20,12 +20,14 @@ Non-secret behavior toggles should live in `src/config/runtime_defaults.py`.
 class LLMSecrets:
     primary_api_key: Optional[str]
     backup_api_key: Optional[str]
+    self_hosted_api_key: Optional[str]
 
 
 def llm_secrets() -> LLMSecrets:
     primary = (env.get("OPENAI_API_KEY") or "").strip() or None
     backup = (env.get("GROQ_API_KEY") or "").strip() or None
-    return LLMSecrets(primary_api_key=primary, backup_api_key=backup)
+    self_hosted = (env.get("SELF_HOSTED_LLM_API_KEY") or "").strip() or None
+    return LLMSecrets(primary_api_key=primary, backup_api_key=backup, self_hosted_api_key=self_hosted)
 
 
 @dataclass(frozen=True)

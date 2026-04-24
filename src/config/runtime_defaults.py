@@ -112,6 +112,12 @@ LLM_PROVIDER: str = "openai_compatible"  # "ollama" | "openai_compatible"
 PRIMARY_MODEL: str = "gpt-4o-mini"
 PRIMARY_ENDPOINT: str = "https://api.openai.com/v1/chat/completions"
 
+# Cloud self-hosted OpenAI-compatible model endpoint (optional).
+# When enabled with a non-empty endpoint, LLMAdapter routes primary traffic here.
+SELF_HOSTED_LLM_ENABLED: bool = False
+SELF_HOSTED_LLM_ENDPOINT: str = "http://127.0.0.1:8010/v1/chat/completions"
+SELF_HOSTED_LLM_MODEL: str = "Qwen/Qwen2.5-7B-Instruct"
+
 BACKUP_MODEL: str = "llama-3.3-70b-versatile"
 BACKUP_ENDPOINT: str = "https://api.groq.com/openai/v1/chat/completions"
 

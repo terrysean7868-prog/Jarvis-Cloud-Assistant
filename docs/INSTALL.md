@@ -85,6 +85,11 @@ If desktop shows "Backend not ready at http://127.0.0.1:18001":
 
 - Render build uses `requirements/render.txt` (see `.render-build.sh`).
 
+## Cloud Owned Model (Self-Hosted)
+
+- To run your own OpenAI-compatible model service and train LoRA adapters, see:
+  - `docs/CLOUD_OWNED_MODEL.md`
+
 ## Autonomous OSS Stack (Optional, Recommended)
 
 Jarvis now includes an autonomous multi-agent runtime with optional open-source AI integrations.

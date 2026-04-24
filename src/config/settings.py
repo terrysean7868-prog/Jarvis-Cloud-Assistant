@@ -96,6 +96,11 @@ def load_settings() -> Settings:
 
     openai_api_key = (env.get_str("OPENAI_API_KEY", "") or "").strip()
     groq_api_key = (env.get_str("GROQ_API_KEY", "") or "").strip()
+    self_hosted_llm_enabled = bool(getattr(rd, "SELF_HOSTED_LLM_ENABLED", False))
+    self_hosted_llm_endpoint = (
+        (env.get_str("SELF_HOSTED_LLM_ENDPOINT", "") or "").strip()
+        or str(getattr(rd, "SELF_HOSTED_LLM_ENDPOINT", "") or "").strip()
+    )
     gemini_api_key = (env.get_str("GEMINI_API_KEY", "") or "").strip()
     mongodb_uri = (env.get_str("MONGODB_URI", "mongodb://localhost:27017/jarvis") or "").strip()
     mongodb_db_name = (env.get_str("MONGODB_DB_NAME", "jarvis_db") or "jarvis_db").strip() or "jarvis_db"
@@ -107,8 +112,9 @@ def load_settings() -> Settings:
     voice_max_samples = max(1, int(env.get_int("VOICE_MAX_SAMPLES", 5)))
     voice_text_similarity_threshold = max(0.1, min(0.99, float(env.get_float("VOICE_TEXT_SIMILARITY_THRESHOLD", 0.85))))
 
-    if not (openai_api_key or groq_api_key):
-        logger.warning("[settings] missing LLM keys: set OPENAI_API_KEY or GROQ_API_KEY")
+    self_hosted_ready = self_hosted_llm_enabled and bool(self_hosted_llm_endpoint)
+    if not (openai_api_key or groq_api_key or self_hosted_ready):
+        logger.warning("[settings] missing LLM provider config: set OPENAI_API_KEY, GROQ_API_KEY, or SELF_HOSTED_LLM_ENDPOINT")
     if not mongodb_uri:
         logger.warning("[settings] missing MONGODB_URI")
     if not jwt_secret:

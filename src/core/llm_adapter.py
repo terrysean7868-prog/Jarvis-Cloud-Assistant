@@ -56,13 +56,27 @@ class LLMAdapter:
         self.smart_model = (rd.SMART_MODEL or "").strip()
         self.fast_model = str(jarvis_settings.llm_fast_model or "").strip()
         self.smart_model_min_complexity = int(rd.SMART_MODEL_MIN_COMPLEXITY)
-        self.primary_key = llm_secrets().primary_api_key
+        _secrets = llm_secrets()
+        self.primary_key = _secrets.primary_api_key
         self.primary_endpoint = (rd.PRIMARY_ENDPOINT or "").strip()
 
         # Fallback provider (Groq). If primary fails, we attempt this once.
         self.backup_model = rd.BACKUP_MODEL
-        self.backup_key = llm_secrets().backup_api_key
+        self.backup_key = _secrets.backup_api_key
         self.backup_endpoint = (rd.BACKUP_ENDPOINT or "").strip()
+        self.self_hosted_enabled = bool(getattr(rd, "SELF_HOSTED_LLM_ENABLED", False))
+        self.self_hosted_endpoint = str(getattr(rd, "SELF_HOSTED_LLM_ENDPOINT", "") or "").strip()
+        self.self_hosted_model = str(getattr(rd, "SELF_HOSTED_LLM_MODEL", "") or "").strip()
+        self.self_hosted_key = _secrets.self_hosted_api_key
+        if self.self_hosted_enabled and self.self_hosted_endpoint:
+            # Cloud-native owned-model mode: route primary and fallback through your endpoint.
+            self.provider = "openai_compatible"
+            self.primary_endpoint = self.self_hosted_endpoint
+            self.primary_model = self.self_hosted_model or self.primary_model
+            self.primary_key = self.self_hosted_key
+            self.backup_endpoint = self.self_hosted_endpoint
+            self.backup_model = self.self_hosted_model or self.backup_model
+            self.backup_key = self.self_hosted_key
         self.cloud_mode = bool(jarvis_settings.cloud_mode)
         self.persona = rd.PERSONA
         self.session = None
@@ -1931,15 +1945,14 @@ class LLMAdapter:
         await self._ensure_session()
         resolved_key = api_key if api_key is not None else self.primary_key
         resolved_endpoint = endpoint if endpoint is not None else self.primary_endpoint
-        if not resolved_key:
+        if (not resolved_key) and self._endpoint_likely_requires_api_key(resolved_endpoint):
             raise Exception(
                 "Missing API key. Set OPENAI_API_KEY/PRIMARY_API_KEY for primary, "
                 "and GROQ_API_KEY/BACKUP_API_KEY for fallback."
             )
-        headers = {
-            "Authorization": f"Bearer {resolved_key}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Content-Type": "application/json"}
+        if resolved_key:
+            headers["Authorization"] = f"Bearer {resolved_key}"
         payload = {
             "model": (model or self.primary_model),
             "messages": messages,
@@ -1972,6 +1985,13 @@ class LLMAdapter:
             "server error",
         )
         return any(m in msg for m in transient_markers)
+
+    @staticmethod
+    def _endpoint_likely_requires_api_key(endpoint: str | None) -> bool:
+        u = str(endpoint or "").strip().lower()
+        if not u:
+            return False
+        return ("api.openai.com" in u) or ("api.groq.com" in u)
 
     @staticmethod
     def _is_rate_limit_error(err: Exception) -> bool:
@@ -6208,7 +6228,8 @@ Style tone: {tone}.
                     raise last_err or Exception(f"Backup provider cooling down: {fallback_provider}")
 
                 if not self.backup_key and fallback_provider in {"groq", "openai_compatible", "openai"}:
-                    raise last_err or Exception("Primary provider failed")
+                    if self._endpoint_likely_requires_api_key(self.backup_endpoint):
+                        raise last_err or Exception("Primary provider failed")
                 elapsed = time.monotonic() - budget_started
                 remaining = max(0.0, float(request_budget_s) - elapsed)
                 if remaining <= 0.0:
@@ -6216,7 +6237,10 @@ Style tone: {tone}.
                 provider_source = "groq" if fallback_provider in {"groq", "openai_compatible", "openai"} else fallback_provider
                 fallback_prompt = _build_user_prompt(prompt_windows[-1])
                 fallback_attempts = 2
-                model_candidates = self._backup_model_candidates(fallback_model)
+                if self.self_hosted_enabled and self.self_hosted_endpoint:
+                    model_candidates = [fallback_model]
+                else:
+                    model_candidates = self._backup_model_candidates(fallback_model)
                 for candidate in model_candidates:
                     routed_model = candidate
                     for fb_attempt in range(fallback_attempts):

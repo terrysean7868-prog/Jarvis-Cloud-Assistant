@@ -74,6 +74,7 @@ class JobScheduler:
         enable_local_reasoner_prewarm = bool(getattr(rd, "ENABLE_LOCAL_REASONER_PREWARM_JOB", False))
         enable_memory_optimization = bool(rd.ENABLE_MEMORY_OPTIMIZATION)
         enable_training_data_job = bool(rd.ENABLE_TRAINING_DATA_JOB)
+        enable_autotrain_job = bool(getattr(rd, "ENABLE_AUTOTRAIN_JOB", True))
         enable_progressive_llm_update_job = bool(getattr(rd, "ENABLE_PROGRESSIVE_LLM_UPDATE_JOB", False))
 
         # GitHub auto-sync every 5 minutes (off by default for hosted deploys)
@@ -98,6 +99,15 @@ class JobScheduler:
                 update_training_data,
                 interval_seconds=86400,
                 job_id="training_data_update"
+            )
+
+        # Run continuous self-training every 24 hours
+        if enable_autotrain_job:
+            from src.jobs.autotrain_job import run_auto_training_job
+            self.add_job(
+                run_auto_training_job,
+                interval_seconds=86400, # Runs every 24 hours
+                job_id="model_autotrain"
             )
         
         # Fetch web training data every 12 hours
