@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
-from src.config import env
+from . import env
 
 
 """Centralized access to secrets/credentials.
@@ -26,7 +27,9 @@ class LLMSecrets:
 def llm_secrets() -> LLMSecrets:
     primary = (env.get("OPENAI_API_KEY") or "").strip() or None
     backup = (env.get("GROQ_API_KEY") or "").strip() or None
-    self_hosted = (env.get("SELF_HOSTED_LLM_API_KEY") or "").strip() or None
+    # Optional key for self-hosted OpenAI-compatible endpoints.
+    # Read directly so strict env whitelisting can stay minimal.
+    self_hosted = (os.getenv("SELF_HOSTED_LLM_API_KEY") or "").strip() or None
     return LLMSecrets(primary_api_key=primary, backup_api_key=backup, self_hosted_api_key=self_hosted)
 
 

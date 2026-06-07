@@ -722,7 +722,7 @@ async def _fetch_wikipedia_training_data_async(topics, *, lang: str = "en", max_
             print("  ⚠️ MongoDB not connected; skipping Wikipedia training store")
             return 0
 
-        from src.internet.wikipedia_client import wikipedia_topic_summaries
+        from ..internet.wikipedia_client import wikipedia_topic_summaries
 
         saved = 0
         for topic in topics or []:
@@ -762,7 +762,7 @@ async def _fetch_wikipedia_training_data_async(topics, *, lang: str = "en", max_
 async def _fetch_training_data_async(topics):
     """Helper function to async fetch training data"""
     try:
-        from src.internet.internet import get_internet
+        from ..internet.internet import get_internet
         
         internet = await get_internet()
 

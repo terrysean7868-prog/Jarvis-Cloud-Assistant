@@ -5,10 +5,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
-from src.config import runtime_defaults as rd
-from src.internet.internet import get_internet
-from src.internet.web_scraper import close_scraper
-from src.utils.db import db
+from ..config import runtime_defaults as rd
+from ..internet.internet import get_internet
+from ..internet.web_scraper import close_scraper
+from ..utils.db import db
 
 
 def _normalize_alias(text: str) -> str:

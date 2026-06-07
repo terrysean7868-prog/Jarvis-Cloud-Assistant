@@ -8,16 +8,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
 
-from src.utils.db import db
-from src.core.llm_adapter import LLMAdapter
-from src.utils.task_manager import task_manager
-from src.config import runtime_defaults as rd
-from src.config.settings import settings as jarvis_settings
-from src.config.secrets import llm_secrets
+from ..utils.db import db
+from .llm_adapter import LLMAdapter
+from .capability_framework import CapabilityFramework
+from ..utils.task_manager import task_manager
+from ..config import runtime_defaults as rd
+from ..config.settings import settings as jarvis_settings
+from ..config.secrets import llm_secrets
 
 # MCP support (existing integration from prior patch)
 try:
-    from mcp import MCPClient
+    from mcp_server.server import MCPClient
 except Exception:
     MCPClient = None
 
@@ -27,6 +28,7 @@ class JarvisBrain:
 
     def __init__(self, llm: LLMAdapter, user_id="default"):
         self.llm = llm
+        self.capability_framework = CapabilityFramework()
         self.user_id = user_id
         self.memory: List[Dict[str, str]] = []
         self.last_mode = "interactive"
@@ -349,8 +351,8 @@ class JarvisBrain:
         # If Jarvis asked a clarifying question previously, treat the next short reply
         # as the answer and resume the original request.
         try:
-            from src.core.dialogue_state import get_dialogue_state_store, PendingClarification
-            from src.core.clarification_learning import get_clarification_learner, ClarificationExample
+            from .dialogue_state import get_dialogue_state_store, PendingClarification
+            from .clarification_learning import get_clarification_learner, ClarificationExample
 
             ds = get_dialogue_state_store()
             pending = ds.load_pending(session_id)
@@ -385,6 +387,50 @@ class JarvisBrain:
                     ds.clear_pending(session_id)
                     text = resumed
                     resumed_from_pending = True
+        except Exception:
+            pass
+
+        # Centralized capability framework routing (runs before legacy deterministic shortcuts)
+        # so basic operational intents map through one consistent module layer.
+        try:
+            framed = self.capability_framework.route_request(text, cloud_mode=bool(jarvis_settings.cloud_mode))
+            if isinstance(framed, dict) and str(framed.get("text") or "").strip():
+                clarification = framed.get("clarification") if isinstance(framed.get("clarification"), dict) else None
+                if isinstance(clarification, dict):
+                    kind = str(clarification.get("kind") or "generic").strip() or "generic"
+                    question = str(clarification.get("question") or framed.get("text") or "").strip()
+                    original_user_text = str(clarification.get("original_user_text") or text or "").strip()
+                    if question and original_user_text:
+                        try:
+                            from .dialogue_state import get_dialogue_state_store, PendingClarification
+
+                            ds = get_dialogue_state_store()
+                            ds.save_pending(
+                                session_id,
+                                PendingClarification(
+                                    kind=kind,
+                                    question=question,
+                                    original_user_text=original_user_text,
+                                    created_at=time.time(),
+                                ),
+                            )
+                        except Exception:
+                            pass
+
+                return {
+                    "text": framed.get("text") or "",
+                    "actions": framed.get("actions") if isinstance(framed.get("actions"), list) else [],
+                    "tool_results": [],
+                    "mode": mode,
+                    "source": framed.get("source") or "capability-framework",
+                    "intent": framed.get("intent") or "direct_action",
+                    "intent_type": framed.get("intent_type") or "direct_action",
+                    "intent_depth": framed.get("intent_depth") or "medium",
+                    "response_strategy": framed.get("response_strategy") or "immediate_execution",
+                    "proactive_followup_added": False,
+                    "user_preference_influenced": False,
+                    "module": framed.get("module") or "unknown",
+                }
         except Exception:
             pass
 
@@ -446,7 +492,7 @@ class JarvisBrain:
         # If any background research finished since the last user interaction, surface it now.
         research_notice = ""
         try:
-            from src.utils.task_manager import task_manager, TaskStatus
+            from ..utils.task_manager import task_manager, TaskStatus
 
             tasks = task_manager.get_all_tasks() or []
             # Find newest completed, unnotified research tasks for this user.
@@ -506,7 +552,7 @@ class JarvisBrain:
         try:
             if _is_research_status_question(text):
                 try:
-                    from src.utils.task_manager import task_manager, TaskStatus
+                    from ..utils.task_manager import task_manager, TaskStatus
 
                     tasks = task_manager.get_all_tasks() or []
                     active = []
@@ -580,7 +626,7 @@ class JarvisBrain:
             requested_mode = _parse_mode_switch_command(text)
             if requested_mode:
                 try:
-                    from src.utils.voice_auth import voice_auth
+                    from ..utils.voice_auth import voice_auth
 
                     if session_id and session_id != "default":
                         # Persist per-user (works for both DB + file-backed auth stores)
@@ -611,7 +657,7 @@ class JarvisBrain:
         user_prefs: dict = {}
         username = None
         try:
-            from src.utils.voice_auth import voice_auth
+            from ..utils.voice_auth import voice_auth
 
             if session_id and session_id != "default":
                 ok, username = voice_auth.validate_session(session_id)
@@ -737,7 +783,7 @@ class JarvisBrain:
             # Persist preferences for authenticated users; otherwise keep in-session only.
             if session_id and session_id != "default" and username:
                 try:
-                    from src.utils.voice_auth import voice_auth
+                    from ..utils.voice_auth import voice_auth
 
                     if verbosity:
                         voice_auth.set_preference(username, "verbosity", verbosity)
@@ -814,7 +860,7 @@ class JarvisBrain:
                 # Persist preferences for authenticated users when possible.
                 if username:
                     try:
-                        from src.utils.voice_auth import voice_auth
+                        from ..utils.voice_auth import voice_auth
                         voice_auth.set_preference(username, "language", lang_name)
                         voice_auth.set_preference(username, "language_code", lang_code)
                         langs = user_prefs.get("languages")
@@ -1059,7 +1105,7 @@ class JarvisBrain:
             # Skip when we just resumed from a clarification (we already have the answer).
             try:
                 if not resumed_from_pending:
-                    from src.core.clarification_learning import get_clarification_learner
+                    from .clarification_learning import get_clarification_learner
 
                     learner = get_clarification_learner()
                     text, _applied = learner.augment_request(session_id, text)
@@ -1122,7 +1168,7 @@ class JarvisBrain:
             agentic_enabled = bool(getattr(rd, "AGENTIC_LOOP", False))
             if agentic_enabled:
                 try:
-                    from src.core.agent_loop import get_agent_loop
+                    from .agent_loop import get_agent_loop
 
                     min_conf = float(getattr(rd, "AGENTIC_MIN_CONFIDENCE", 0.88))
                     max_sub = int(getattr(rd, "AGENTIC_MAX_SUBTASKS", 6))
@@ -1155,7 +1201,7 @@ class JarvisBrain:
                             new_mode = (a.get("mode") or a.get("new_mode") or "").strip().lower()
                             if new_mode:
                                 try:
-                                    from src.utils.voice_auth import voice_auth
+                                    from ..utils.voice_auth import voice_auth
 
                                     if session_id and session_id != "default":
                                         voice_auth.set_operational_mode(session_id, new_mode)
@@ -1242,7 +1288,7 @@ class JarvisBrain:
                     original_user_text = str(clarification.get("original_user_text") or "").strip() or (text or "")
 
                     if question and original_user_text:
-                        from src.core.dialogue_state import get_dialogue_state_store, PendingClarification
+                        from .dialogue_state import get_dialogue_state_store, PendingClarification
 
                         ds = get_dialogue_state_store()
                         ds.save_pending(

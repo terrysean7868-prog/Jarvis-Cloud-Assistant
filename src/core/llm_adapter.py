@@ -12,26 +12,26 @@ from urllib.parse import quote_plus
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
-from src.utils.db import db
-from src.config import runtime_defaults as rd
-from src.config.secrets import llm_secrets
-from src.config.settings import settings as jarvis_settings
+from ..utils.db import db
+from ..config import runtime_defaults as rd
+from ..config.secrets import llm_secrets
+from ..config.settings import settings as jarvis_settings
 
 logger = logging.getLogger(__name__)
 
 try:
-    from src.model_ops.runtime_router import resolve_route as model_ops_resolve_route
+    from ..model_ops.runtime_router import resolve_route as model_ops_resolve_route
 except Exception:
     model_ops_resolve_route = None
 
 try:
-    from src.learning import SelfLearningEngine
+    from ..learning import SelfLearningEngine
 except Exception:
     SelfLearningEngine = None
 
 # Import decision-making system
 try:
-    from src.core.decision_maker import ContextAwareDecisionMaker, initialize_decision_maker
+    from .decision_maker import ContextAwareDecisionMaker, initialize_decision_maker
     DECISION_MAKER_AVAILABLE = True
 except Exception:
     DECISION_MAKER_AVAILABLE = False
@@ -64,9 +64,9 @@ class LLMAdapter:
         self.backup_model = rd.BACKUP_MODEL
         self.backup_key = _secrets.backup_api_key
         self.backup_endpoint = (rd.BACKUP_ENDPOINT or "").strip()
-        self.self_hosted_enabled = bool(getattr(rd, "SELF_HOSTED_LLM_ENABLED", False))
-        self.self_hosted_endpoint = str(getattr(rd, "SELF_HOSTED_LLM_ENDPOINT", "") or "").strip()
-        self.self_hosted_model = str(getattr(rd, "SELF_HOSTED_LLM_MODEL", "") or "").strip()
+        self.self_hosted_enabled = bool(getattr(jarvis_settings, "self_hosted_llm_enabled", False))
+        self.self_hosted_endpoint = str(getattr(jarvis_settings, "self_hosted_llm_endpoint", "") or "").strip()
+        self.self_hosted_model = str(getattr(jarvis_settings, "self_hosted_llm_model", "") or "").strip()
         self.self_hosted_key = _secrets.self_hosted_api_key
         if self.self_hosted_enabled and self.self_hosted_endpoint:
             # Cloud-native owned-model mode: route primary and fallback through your endpoint.
@@ -4034,7 +4034,7 @@ class LLMAdapter:
 
         # If it matches a known local app key from AppManager, treat it as local.
         try:
-            from src.utils.app_manager import app_manager as _app_mgr
+            from ..utils.app_manager import app_manager as _app_mgr
 
             app_paths = getattr(_app_mgr, "app_paths", {}) or {}
             if p in app_paths:
@@ -4128,7 +4128,7 @@ class LLMAdapter:
             if wants_dev_update:
                 parsed_cmd = None
                 try:
-                    from src.utils.self_update import parse_voice_command
+                    from ..utils.self_update import parse_voice_command
 
                     parsed_cmd = parse_voice_command(t)
                 except Exception:
@@ -7304,14 +7304,28 @@ Style tone: {tone}.
             parsed["actions"] = actions
             return parsed
 
-        # Only do this for simple text editors (typing into UI makes sense).
+        # Only do this for editor-like apps where typing into UI makes sense.
         app_name = str(open_app.get("app_name") or "").strip().lower()
-        is_text_editor = any(k in app_name for k in ("notepad", "wordpad", "textedit", "word", "winword"))
+        is_text_editor = any(k in app_name for k in ("notepad", "wordpad", "textedit", "word", "winword", "outlook"))
         if not is_text_editor:
             parsed["actions"] = actions
             return parsed
 
-        draft = LLMAdapter._build_reasonable_draft(t)
+        is_email_flow = bool(re.search(r"\b(email|mail)\b", t_lower))
+        if "outlook" in app_name and is_email_flow:
+            has_new_mail_hotkey = any(
+                isinstance(a, dict)
+                and a.get("type") == "hotkey"
+                and (
+                    a.get("keys") == ["ctrl", "n"]
+                    or str(a.get("key") or "").strip().lower() == "ctrl+n"
+                )
+                for a in actions
+            )
+            if not has_new_mail_hotkey:
+                actions.append({"type": "hotkey", "keys": ["ctrl", "n"], "before_ms": 1400})
+
+        draft = LLMAdapter._build_email_compose_text(t) if is_email_flow else LLMAdapter._build_reasonable_draft(t)
         if not draft:
             parsed["actions"] = actions
             return parsed
@@ -7400,8 +7414,55 @@ Style tone: {tone}.
             parsed["actions"] = actions
             return parsed
 
-        if not LLMAdapter._email_intent_needs_details(tl):
+        wants_email_flow = bool(
+            re.search(r"\b(email|mail)\b", tl)
+            and re.search(r"\b(write|draft|compose|create|make|send)\b", tl)
+        )
+        if not wants_email_flow:
             parsed["actions"] = actions
+            return parsed
+
+        if not LLMAdapter._email_intent_needs_details(tl):
+            mentions_outlook = bool(re.search(r"\b(outlook|microsoft\s+outlook)\b", tl))
+            if not mentions_outlook:
+                parsed["actions"] = actions
+                return parsed
+
+            ensured: list[dict] = []
+            has_open_outlook = False
+            has_new_mail_hotkey = False
+            has_type_text = False
+            for a in actions:
+                if not isinstance(a, dict):
+                    continue
+                at = str(a.get("type") or "").strip().lower()
+                if at == "open_app" and "outlook" in str(a.get("app_name") or "").strip().lower():
+                    has_open_outlook = True
+                if at == "hotkey":
+                    keys = a.get("keys")
+                    key = str(a.get("key") or "").strip().lower()
+                    if keys == ["ctrl", "n"] or key == "ctrl+n":
+                        has_new_mail_hotkey = True
+                if at == "type_text":
+                    has_type_text = True
+                ensured.append(a)
+
+            if not has_open_outlook:
+                ensured.insert(0, {"type": "open_app", "app_name": "outlook"})
+            if not has_new_mail_hotkey:
+                ensured.append({"type": "hotkey", "keys": ["ctrl", "n"], "before_ms": 1400})
+            if not has_type_text:
+                ensured.append({
+                    "type": "type_text",
+                    "text": LLMAdapter._build_email_compose_text(user_text),
+                    "interval": 0.03,
+                    "before_ms": 900,
+                    "auto_generated": True,
+                })
+
+            parsed["actions"] = ensured
+            if not str(parsed.get("text") or "").strip():
+                parsed["text"] = "I will open Outlook and prepare the draft now."
             return parsed
 
         # Remove email generation/typing actions and ask for missing details.
@@ -7415,7 +7476,10 @@ Style tone: {tone}.
             filtered.append(a)
 
         base_text = (parsed.get("text") or "").strip()
-        question = "What should the email be about, and who should it go to? If it’s HR, which company and which role?"
+        question = (
+            "I can do that. Tell me 1) who it should go to, 2) what it should be about, "
+            "and 3) where to draft it (Outlook, Gmail, or plain draft)."
+        )
         if not base_text:
             parsed["text"] = question
         elif question.lower() in base_text.lower():
@@ -8029,3 +8093,53 @@ Style tone: {tone}.
             pass
 
         return f"Draft:\n{topic}\n"
+
+    @staticmethod
+    def _extract_email_fields(user_text: str) -> dict:
+        t = str(user_text or "").strip()
+        tl = t.lower()
+
+        recipient = ""
+        email_match = re.search(r"([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})", tl)
+        if email_match:
+            recipient = email_match.group(1).strip()
+        else:
+            role_match = re.search(
+                r"\b(?:to|for)\b(?:\s+[a-z0-9&._-]+){0,6}\s+(hr|human\s+resources|recruiter|hiring\s+manager|team|manager|boss)\b",
+                tl,
+            )
+            if role_match:
+                recipient = role_match.group(1).strip()
+
+        subject = ""
+        for pat in (
+            r"\bsubject\s*[:\-]\s*([^\n.,;]+)",
+            r"\babout\s+([^\n.,;]+)",
+            r"\bregarding\s+([^\n.,;]+)",
+            r"\bre:\s*([^\n.,;]+)",
+        ):
+            m = re.search(pat, tl)
+            if m:
+                subject = str(m.group(1) or "").strip()
+                break
+
+        body = ""
+        quoted = re.findall(r"[\"\u201c\u201d]([^\"\u201c\u201d]{8,1200})[\"\u201c\u201d]", t)
+        if quoted:
+            body = str(quoted[-1]).strip()
+        if not body and subject:
+            body = f"I hope you are doing well. I am writing regarding {subject}."
+
+        return {
+            "recipient": recipient,
+            "subject": subject,
+            "body": body,
+        }
+
+    @staticmethod
+    def _build_email_compose_text(user_text: str) -> str:
+        fields = LLMAdapter._extract_email_fields(user_text)
+        recipient = fields.get("recipient") or "[Recipient]"
+        subject = fields.get("subject") or "[Subject]"
+        body = fields.get("body") or LLMAdapter._build_reasonable_draft(user_text).strip()
+        return f"To: {recipient}\nSubject: {subject}\n\n{body}\n"

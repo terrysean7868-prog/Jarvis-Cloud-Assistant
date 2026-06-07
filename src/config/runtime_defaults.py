@@ -72,7 +72,7 @@ FETCH_URL_CACHE_SECONDS: int = 600
 
 # Inline execution/UX behavior for safe non-web actions.
 # These run synchronously in the chat response path so users get immediate outcomes.
-INLINE_NON_WEB_ACTION_TYPES_CSV: str = "create_task,stop_task,check_errors,check_render_logs,generate_email,find_files"
+INLINE_NON_WEB_ACTION_TYPES_CSV: str = "create_task,stop_task,check_errors,check_render_logs,generate_email,find_files,collect_dataset"
 APPEND_INLINE_ACTION_SUMMARY: bool = True
 
 
@@ -112,9 +112,11 @@ LLM_PROVIDER: str = "openai_compatible"  # "ollama" | "openai_compatible"
 PRIMARY_MODEL: str = "gpt-4o-mini"
 PRIMARY_ENDPOINT: str = "https://api.openai.com/v1/chat/completions"
 
-# Cloud self-hosted OpenAI-compatible model endpoint (optional).
-# When enabled with a non-empty endpoint, LLMAdapter routes primary traffic here.
-SELF_HOSTED_LLM_ENABLED: bool = False
+# Cloud self-hosted OpenAI-compatible model endpoint (primary by default).
+# Routes all LLM traffic through your fine-tuned custom model service.
+# The model service auto-loads LoRA adapters from models/jarvis-lora or models/jarvis_custom.
+# Ensure you've started the model service: python apps/model_service/server.py
+SELF_HOSTED_LLM_ENABLED: bool = True
 SELF_HOSTED_LLM_ENDPOINT: str = "http://127.0.0.1:8010/v1/chat/completions"
 SELF_HOSTED_LLM_MODEL: str = "Qwen/Qwen2.5-7B-Instruct"
 

@@ -7,7 +7,7 @@ import asyncio
 import json
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-from src.internet.web_scraper import WebScraper
+from ..internet.web_scraper import WebScraper
 
 
 class PCKnowledgeEngine:

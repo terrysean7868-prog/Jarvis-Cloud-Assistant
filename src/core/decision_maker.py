@@ -14,8 +14,8 @@ from datetime import datetime
 from pathlib import Path
 import psutil
 
-from src.utils.db import db
-from src.internet.web_scraper import WebScraper
+from ..utils.db import db
+from ..internet.web_scraper import WebScraper
 
 
 class PCConfiguration:

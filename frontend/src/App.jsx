@@ -441,6 +441,11 @@ export default function App() {
       switch_app: "switch app",
       open_url: "open link",
       open_path: "open folder",
+      generate_email: "draft email",
+      collect_dataset: "collect datasets",
+      create_task: "create task",
+      stop_task: "stop task",
+      n8n_webhook: "run webhook",
       type_text: "type text",
       press_key: "press keys",
       hotkey: "use shortcut",
@@ -587,6 +592,18 @@ export default function App() {
       hasResearchPayload ||
       hasTypeLike(/research|web_search|fetch_url/) ||
       /research complete|research finished|research ready/.test(textLower);
+
+    const isEmailFlow = hasTypeLike(/generate_email/) || /email draft|draft email|email generated/.test(textLower);
+    if (isEmailFlow) {
+      const hasFailure = actionResults.some((r) => {
+        const st = statusOf(r);
+        return st && !new Set(["success", "completed", "done", "ok", "saved", "applied", "learned"]).has(st);
+      });
+      if (hasFailure) {
+        return "Email drafting needs one more detail before I can complete it.";
+      }
+      return "Email draft is ready. Tell me where to write it, for example Outlook.";
+    }
 
     if (isResearch) {
       const topic = (response?.research_report?.topic || response?.research?.topic || "").toString().trim();

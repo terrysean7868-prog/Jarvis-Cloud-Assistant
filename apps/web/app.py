@@ -304,6 +304,14 @@ async def lifespan(_app: FastAPI):
     except Exception as e:
         print(f"[INFO] Stability monitor start failed: {e}")
 
+    # Start 24/7 background auto-tuning service
+    try:
+        from src.core.background_auto_tuning import start_background_auto_tuning
+        start_background_auto_tuning()
+        print("[OK] Background auto-tuning service started (24/7)")
+    except Exception as e:
+        print(f"[INFO] Background auto-tuning failed to start: {e}")
+
     print("[OK] Jarvis server started.")
 
     try:
@@ -7430,7 +7438,7 @@ async def chat_endpoint(msg: MessageIn, background_tasks: BackgroundTasks):
         # permission/start-agent UX. However, we *do* execute safe server-side actions
         # (e.g., task creation, email drafting) so they aren't silently ignored by the UI.
 
-        safe_server_action_types = {"create_task", "stop_task", "generate_email", "n8n_webhook"}
+        safe_server_action_types = {"create_task", "stop_task", "generate_email", "n8n_webhook", "collect_dataset"}
         actions = actions or []
         server_actions = [a for a in actions if isinstance(a, dict) and (a.get("type") in safe_server_action_types)]
         remaining_actions = [a for a in actions if not (isinstance(a, dict) and (a.get("type") in safe_server_action_types))]

@@ -15,28 +15,61 @@ import ast
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from src.utils.git_sync import git_sync
-from src.config.secrets import llm_secrets
-from src.utils.db import db
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from .git_sync import git_sync
+from ..config.secrets import llm_secrets
+from ..config.settings import settings as jarvis_settings
+from .db import db
 
 logger = logging.getLogger("jarvis.self_update")
 
-# Lazy-load OpenAI client to avoid errors during import if API key is not set
-_client = None
+def _self_hosted_model_config() -> tuple[str, str, Optional[str]]:
+    endpoint = str(getattr(jarvis_settings, "self_hosted_llm_endpoint", "") or "").strip()
+    if not endpoint:
+        endpoint = "http://127.0.0.1:8010/v1/chat/completions"
+    model = str(getattr(jarvis_settings, "self_hosted_llm_model", "") or "").strip()
+    if not model:
+        model = "Qwen/Qwen2.5-7B-Instruct"
+    api_key = llm_secrets().self_hosted_api_key
+    return endpoint, model, api_key
 
-def get_openai_client():
-    """Get or create OpenAI client (lazy-loaded)."""
-    global _client
-    if _client is None:
-        try:
-            from openai import OpenAI
-        except Exception as e:
-            raise RuntimeError(f"OpenAI SDK not available: {e}")
-        api_key = llm_secrets().primary_api_key
-        if not api_key:
-            raise RuntimeError("OpenAI API key not found in OPENAI_API_KEY or PRIMARY_API_KEY")
-        _client = OpenAI(api_key=api_key)
-    return _client
+
+def _call_self_hosted_chat_completion(*, system_prompt: str, user_prompt: str) -> str:
+    endpoint, model, api_key = _self_hosted_model_config()
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4000,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request = Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urlopen(request, timeout=180) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+        raise RuntimeError(f"Self-hosted model service error: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Self-hosted model service unavailable: {exc}") from exc
+
+    try:
+        data = json.loads(body)
+    except Exception as exc:
+        raise RuntimeError(f"Invalid self-hosted model response: {body[:500]}") from exc
+
+    try:
+        return str(data["choices"][0]["message"]["content"]).strip()
+    except Exception as exc:
+        raise RuntimeError(f"Unexpected self-hosted model response shape: {body[:500]}") from exc
 
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -229,17 +262,7 @@ Context: {context}
 Provide complete, production-ready code."""
 
     try:
-        client = get_openai_client()
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.3,
-            max_tokens=4000
-        )
-        code = response.choices[0].message.content
+        code = _call_self_hosted_chat_completion(system_prompt=system_prompt, user_prompt=user_prompt)
         blocks = extract_code_blocks(code)
         return blocks[0] if blocks else code
     except Exception as e:

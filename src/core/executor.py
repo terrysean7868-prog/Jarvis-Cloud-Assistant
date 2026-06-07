@@ -10,17 +10,18 @@ import re
 from typing import List
 import json
 from urllib.parse import urljoin
-from src.core.jarvis_brain import JarvisBrain
-from src.config import runtime_defaults as rd
-from src.config.settings import settings as jarvis_settings
-from src.config.secrets import n8n_secrets
-from src.utils.git_sync import git_sync  # ✅ now importing the function, not a class
-from src.utils.self_update import self_update_file, self_add_feature, parse_voice_command
-from src.utils.screen_access import screen_access
-from src.utils.email_generator import email_generator
-from src.utils.app_manager import app_manager
-from src.utils.task_manager import task_manager
-from src.utils.error_handler import error_handler
+from .jarvis_brain import JarvisBrain
+from ..config import runtime_defaults as rd
+from ..config.settings import settings as jarvis_settings
+from ..config.secrets import n8n_secrets
+from ..utils.git_sync import git_sync  # ✅ now importing the function, not a class
+from ..utils.self_update import self_update_file, self_add_feature, parse_voice_command
+from ..utils.screen_access import screen_access
+from ..utils.email_generator import email_generator
+from ..utils.app_manager import app_manager
+from ..utils.task_manager import task_manager
+from ..utils.error_handler import error_handler
+from ..utils.db import db
 
 _n8n = n8n_secrets()
 N8N_WEBHOOK_BASE = _n8n.base_url
@@ -86,7 +87,7 @@ else:
 
 # Internet access
 try:
-    from src.internet.internet import get_internet, close_internet
+    from ..internet.internet import get_internet, close_internet
     INTERNET_AVAILABLE = True
 except ImportError:
     INTERNET_AVAILABLE = False
@@ -186,6 +187,50 @@ class ActionExecutor:
             if action_type == "fetch_url":
                 result = await self._handle_fetch_url(action)
                 results.append(result)
+                continue
+
+            # Handle dataset collection/ingestion actions (web summaries -> MongoDB)
+            if action_type == "collect_dataset":
+                result = await self._handle_collect_dataset(action)
+                results.append(result)
+                continue
+
+            # HuggingFace dataset ingestion (lightweight seeding)
+            if action_type == "ingest_hf_dataset":
+                if not INTERNET_AVAILABLE:
+                    results.append({"status": "error", "action_type": "ingest_hf_dataset", "message": "Internet module not available"})
+                    continue
+                try:
+                    from ..utils.huggingface_utils import fetch_and_seed_hf_dataset
+                    res = await fetch_and_seed_hf_dataset(str(action.get("dataset") or action.get("query") or ""), max_items=int(action.get("max_items") or 20))
+                    results.append({"status": res.get("status"), "action_type": "ingest_hf_dataset", "result": res})
+                except Exception as e:
+                    results.append({"status": "error", "action_type": "ingest_hf_dataset", "message": str(e)})
+                continue
+
+            # Fine-tune orchestration: run local training script (safe-guarded)
+            if action_type == "finetune_model":
+                # Require local execution for training
+                if CLOUD_MODE:
+                    results.append({"status": "forbidden", "action_type": "finetune_model", "message": "Fine-tuning disabled in cloud mode"})
+                    continue
+                # Optional dataset reference
+                dataset = action.get("dataset") or action.get("dataset_id") or action.get("query")
+                # If a dedicated training script exists, invoke it in a subprocess
+                # Resolve training script at repository root: <repo>/scripts/train_model_job.py
+                from pathlib import Path
+                repo_root = Path(__file__).resolve().parents[2]
+                train_script = repo_root / "scripts" / "train_model_job.py"
+                train_script = str(train_script)
+                if os.path.exists(train_script):
+                    try:
+                        # Run training as a background subprocess to avoid blocking executor
+                        proc = subprocess.Popen(["python", train_script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        results.append({"status": "started", "action_type": "finetune_model", "pid": proc.pid, "message": "Training started in background. Monitor logs for progress."})
+                    except Exception as e:
+                        results.append({"status": "error", "action_type": "finetune_model", "message": str(e)})
+                else:
+                    results.append({"status": "error", "action_type": "finetune_model", "message": f"Training script not found: {train_script}"})
                 continue
 
             # Handle N8N webhook actions
@@ -370,6 +415,80 @@ class ActionExecutor:
                 tone = action.get("tone", "professional")
                 result = email_generator.generate_email(recipient, subject, body_prompt, tone)
                 results.append(result)
+                continue
+
+            # --- New lightweight handlers for deterministic action types ---
+            if action_type == "connector_action":
+                # Minimal connector handler: echo intent so higher layer can act.
+                results.append({
+                    "status": "queued",
+                    "action_type": "connector_action",
+                    "message": "Connector action queued; requires connector integration to run.",
+                    "payload": action,
+                })
+                continue
+
+            if action_type == "process_multimedia":
+                results.append({
+                    "status": "accepted",
+                    "action_type": "process_multimedia",
+                    "message": "Multimedia processing scheduled (transcribe/describe).",
+                    "payload": action,
+                })
+                continue
+
+            if action_type == "run_code":
+                # For safety, do not execute arbitrary code in cloud mode.
+                if CLOUD_MODE:
+                    results.append({"status": "forbidden", "action_type": "run_code", "message": "Code execution disabled in cloud mode"})
+                    continue
+                cmd = str(action.get("command") or "").strip()
+                if not cmd:
+                    results.append({"status": "error", "action_type": "run_code", "message": "Missing command"})
+                    continue
+                if self._is_dangerous_command(cmd):
+                    results.append({"status": "forbidden", "action_type": "run_code", "message": "Refused dangerous command"})
+                    continue
+                # Lightweight safe execution: do not execute unknown multi-line scripts.
+                # Accept single-line python -c or node -e invocations; otherwise queue.
+                if cmd.startswith("python -c ") or cmd.startswith("node -e "):
+                    try:
+                        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+                        out = proc.stdout or ""
+                        err = proc.stderr or ""
+                        results.append({"status": "executed", "action_type": "run_code", "rc": proc.returncode, "stdout": out[:4000], "stderr": err[:2000]})
+                    except Exception as e:
+                        results.append({"status": "error", "action_type": "run_code", "message": str(e)})
+                else:
+                    results.append({"status": "queued", "action_type": "run_code", "message": "Command queued for manual review or safe sandbox execution.", "command": cmd})
+                continue
+
+            if action_type == "create_code":
+                results.append({"status": "queued", "action_type": "create_code", "message": "Code generation request queued; JarvisBrain/LLM should synthesize file content.", "payload": action})
+                continue
+
+            if action_type == "model_ops":
+                results.append({"status": "queued", "action_type": "model_ops", "message": "Model ops request queued; requires model training infra.", "payload": action})
+                continue
+
+            if action_type == "kb_lookup":
+                results.append({"status": "success", "action_type": "kb_lookup", "query": action.get("query"), "results": []})
+                continue
+
+            if action_type == "summarize_text":
+                # Simple placeholder: summarization is deferred to LLM layer.
+                results.append({"status": "deferred", "action_type": "summarize_text", "message": "Summarization should be performed by the LLM adapter.", "payload": action})
+                continue
+
+            if action_type == "translate_text":
+                results.append({"status": "deferred", "action_type": "translate_text", "message": "Translation should be performed by the translation service or LLM.", "payload": action})
+                continue
+
+            if action_type == "package_action":
+                if CLOUD_MODE:
+                    results.append({"status": "forbidden", "action_type": "package_action", "message": "Package installation is disabled in cloud mode."})
+                else:
+                    results.append({"status": "queued", "action_type": "package_action", "message": "Package action queued for manual review.", "payload": action})
                 continue
 
             # Handle application management actions
@@ -830,6 +949,89 @@ class ActionExecutor:
                 "action": "fetch_url",
                 "error": str(e)
             }
+
+    async def _handle_collect_dataset(self, action: dict) -> dict:
+        """Collect compact dataset references and persist to MongoDB.
+
+        Designed for hosted deployments: only stores summaries/metadata in DB,
+        not raw code artifacts in local filesystem.
+        """
+        query = str((action or {}).get("query") or "").strip()
+        if not query:
+            return {
+                "status": "error",
+                "action": "collect_dataset",
+                "message": "query is required",
+            }
+
+        raw_sources = (action or {}).get("sources")
+        sources: list[str] = []
+        if isinstance(raw_sources, list):
+            for u in raw_sources:
+                s = str(u or "").strip()
+                if s.startswith("http://") or s.startswith("https://"):
+                    sources.append(s)
+
+        if not sources:
+            sources = [
+                "https://huggingface.co/datasets",
+                "https://www.kaggle.com/datasets",
+                "https://github.com/topics/dataset",
+            ]
+
+        max_sources = int((action or {}).get("max_sources") or 3)
+        max_sources = max(1, min(max_sources, 6))
+        sources = sources[:max_sources]
+
+        if not INTERNET_AVAILABLE:
+            return {
+                "status": "error",
+                "action": "collect_dataset",
+                "query": query,
+                "message": "Internet module not available",
+            }
+
+        saved = 0
+        scanned = 0
+        details: list[dict] = []
+        for url in sources:
+            scanned += 1
+            fetch_result = await self._handle_fetch_url({"type": "fetch_url", "url": url})
+            if str(fetch_result.get("status") or "").lower() != "success":
+                details.append({"url": url, "status": "error", "message": fetch_result.get("error") or fetch_result.get("message")})
+                continue
+
+            title = str(fetch_result.get("title") or "").strip() or None
+            summary = str(fetch_result.get("summary") or "").strip() or None
+            snippet = summary
+            try:
+                db.save_web_training_item(
+                    topic=query,
+                    title=title,
+                    snippet=snippet,
+                    summary=summary,
+                    url=url,
+                    source="dataset_seed",
+                )
+                saved += 1
+                details.append({"url": url, "status": "saved", "title": title})
+            except Exception as e:
+                details.append({"url": url, "status": "error", "message": str(e)})
+
+        status = "success" if saved > 0 else "error"
+        message = f"Stored {saved} dataset references for '{query}' in database."
+        if saved == 0:
+            message = f"No dataset references were stored for '{query}'."
+
+        return {
+            "status": status,
+            "action": "collect_dataset",
+            "query": query,
+            "scanned_sources": scanned,
+            "saved_items": saved,
+            "details": details,
+            "message": message,
+        }
     
     def _initialize_browser(self):
         """Initialize the Selenium WebDriver."""

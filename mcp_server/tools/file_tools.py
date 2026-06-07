@@ -3,6 +3,23 @@ import shutil
 from pathlib import Path
 from mcp.server.types import ToolResponse
 
+# Define the base directory for all file operations (project root)
+SANDBOX_BASE = Path(".").resolve()
+
+def validate_path(path: str) -> tuple[bool, str]:
+    """
+    Validate that the given path is within the sandbox and safe to access.
+    Returns (is_valid, error_message)
+    """
+    try:
+        resolved = Path(path).resolve()
+        # Check if path is within sandbox
+        if not str(resolved).startswith(str(SANDBOX_BASE)):
+            return False, f"Path {path} is outside project directory"
+        return True, ""
+    except Exception as e:
+        return False, f"Invalid path: {str(e)}"
+
 def register_file_tools(server):
 
     @server.tool(
@@ -11,6 +28,10 @@ def register_file_tools(server):
     )
     async def read_file(path: str) -> ToolResponse:
         """Read and return file contents"""
+        valid, error = validate_path(path)
+        if not valid:
+            return ToolResponse(content=f"ERROR: {error}", is_error=True)
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -24,6 +45,10 @@ def register_file_tools(server):
     )
     async def write_file(path: str, content: str) -> ToolResponse:
         """Write or overwrite a file with content"""
+        valid, error = validate_path(path)
+        if not valid:
+            return ToolResponse(content=f"ERROR: {error}", is_error=True)
+
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
@@ -38,6 +63,10 @@ def register_file_tools(server):
     )
     async def patch_file(path: str, search: str, replace: str) -> ToolResponse:
         """Replace text in a file"""
+        valid, error = validate_path(path)
+        if not valid:
+            return ToolResponse(content=f"ERROR: {error}", is_error=True)
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = f.read()
@@ -56,6 +85,10 @@ def register_file_tools(server):
     )
     async def list_files(directory: str) -> ToolResponse:
         """List directory contents"""
+        valid, error = validate_path(directory)
+        if not valid:
+            return ToolResponse(content=f"ERROR: {error}", is_error=True)
+
         try:
             items = []
             for item in Path(directory).iterdir():
@@ -74,6 +107,10 @@ def register_file_tools(server):
     )
     async def delete_file(path: str) -> ToolResponse:
         """Delete a file"""
+        valid, error = validate_path(path)
+        if not valid:
+            return ToolResponse(content=f"ERROR: {error}", is_error=True)
+
         try:
             Path(path).unlink()
             return ToolResponse(content=f"OK: File deleted {path}")
@@ -86,6 +123,10 @@ def register_file_tools(server):
     )
     async def delete_directory(path: str) -> ToolResponse:
         """Delete a directory and all contents"""
+        valid, error = validate_path(path)
+        if not valid:
+            return ToolResponse(content=f"ERROR: {error}", is_error=True)
+
         try:
             shutil.rmtree(path)
             return ToolResponse(content=f"OK: Directory deleted {path}")
@@ -98,6 +139,10 @@ def register_file_tools(server):
     )
     async def create_directory(path: str) -> ToolResponse:
         """Create directory structure"""
+        valid, error = validate_path(path)
+        if not valid:
+            return ToolResponse(content=f"ERROR: {error}", is_error=True)
+
         try:
             Path(path).mkdir(parents=True, exist_ok=True)
             return ToolResponse(content=f"OK: Directory created {path}")
@@ -110,63 +155,17 @@ def register_file_tools(server):
     )
     async def copy_file(source: str, destination: str) -> ToolResponse:
         """Copy a file"""
+        valid_src, error_src = validate_path(source)
+        valid_dst, error_dst = validate_path(destination)
+
+        if not valid_src:
+            return ToolResponse(content=f"ERROR: {error_src}", is_error=True)
+        if not valid_dst:
+            return ToolResponse(content=f"ERROR: {error_dst}", is_error=True)
+
         try:
             Path(destination).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
             return ToolResponse(content=f"OK: Copied {source} to {destination}")
         except Exception as e:
             return ToolResponse(content=f"ERROR copying {source} to {destination}: {e}", is_error=True)
-
-    @server.tool(
-        name="cleanup_project",
-        description="Remove unnecessary files and directories from the project"
-    )
-    async def cleanup_project(base_path: str = ".") -> ToolResponse:
-        """Clean up unnecessary project files"""
-        try:
-            cleanup_items = [
-                "__pycache__",
-                ".pytest_cache",
-                "*.pyc",
-                ".egg-info",
-                "node_modules",
-                ".DS_Store",
-                "*.log",
-            ]
-            
-            removed = []
-            base = Path(base_path)
-            
-            # Remove common unnecessary directories
-            for pattern in ["__pycache__", ".pytest_cache", ".egg-info"]:
-                for item in base.rglob(pattern):
-                    if item.is_dir():
-                        try:
-                            shutil.rmtree(item)
-                            removed.append(f"DIR: {item}")
-                        except:
-                            pass
-            
-            # Remove .pyc files
-            for item in base.rglob("*.pyc"):
-                try:
-                    item.unlink()
-                    removed.append(f"FILE: {item}")
-                except:
-                    pass
-            
-            # Remove log files
-            for item in base.rglob("*.log"):
-                try:
-                    item.unlink()
-                    removed.append(f"FILE: {item}")
-                except:
-                    pass
-            
-            result = f"OK: Cleanup complete\nRemoved {len(removed)} items:\n" + "\n".join(removed[:20])
-            if len(removed) > 20:
-                result += f"\n... and {len(removed) - 20} more items"
-            
-            return ToolResponse(content=result)
-        except Exception as e:
-            return ToolResponse(content=f"ERROR during cleanup: {e}", is_error=True)

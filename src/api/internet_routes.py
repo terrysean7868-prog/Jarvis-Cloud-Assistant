@@ -25,7 +25,7 @@ def build_internet_router(require_voice_session: Callable[[str | None], Any]) ->
     async def search_web(req: SearchRequest):
         require_voice_session(req.session_id)
         try:
-            from src.internet.internet import InternetAccess
+            from ..internet.internet import InternetAccess
 
             internet = InternetAccess()
             await internet.initialize()
@@ -44,7 +44,7 @@ def build_internet_router(require_voice_session: Callable[[str | None], Any]) ->
     async def fetch_webpage(req: FetchRequest):
         require_voice_session(req.session_id)
         try:
-            from src.internet.internet import InternetAccess
+            from ..internet.internet import InternetAccess
 
             internet = InternetAccess()
             await internet.initialize()
@@ -62,7 +62,7 @@ def build_internet_router(require_voice_session: Callable[[str | None], Any]) ->
     async def search_and_summarize(req: SearchRequest):
         require_voice_session(req.session_id)
         try:
-            from src.internet.internet import InternetAccess
+            from ..internet.internet import InternetAccess
 
             internet = InternetAccess()
             await internet.initialize()
@@ -81,7 +81,7 @@ def build_internet_router(require_voice_session: Callable[[str | None], Any]) ->
     async def get_news_endpoint(topic: str = "latest", num_results: int = 5, session_id: str | None = None):
         require_voice_session(session_id)
         try:
-            from src.internet.internet import InternetAccess
+            from ..internet.internet import InternetAccess
 
             internet = InternetAccess()
             await internet.initialize()
