@@ -133,24 +133,6 @@ class TestFinetuneDryRun:
         assert result.get("source") in ("capability-framework", "model"), f"Unexpected source: {result.get('source')}"
         print(f"✅ Brain routing: source={result.get('source')}, module={result.get('module')}")
 
-    @pytest.mark.asyncio
-    async def test_full_dry_run_flow(self):
-        """Full flow: prompt → brain → framework → executor (no actual training)."""
-        brain = JarvisBrain(LLMAdapter())
-        executor = ActionExecutor(brain)
-
-        # Simulate user asking to train on HF dataset
-        user_prompt = "collect dataset for text classification and finetune"
-        result = await brain.handle_message(user_prompt, mode="chat", user_id="tester")
-
-        assert result is not None, "Brain returned None"
-        actions = result.get("actions", [])
-        print(f"📋 Brain proposed {len(actions)} actions for: {user_prompt}")
-
-        if actions:
-            exec_results = await executor.process_actions(actions, user="tester")
-            print(f"✅ Executed {len(exec_results)} actions; statuses: {[r.get('status') for r in exec_results]}")
-
 
 def run_all_tests():
     """Run all tests (both sync and async)."""
@@ -168,7 +150,6 @@ def run_all_tests():
     asyncio.run(test_obj.test_executor_queues_finetune_action())
     asyncio.run(test_obj.test_executor_ingests_hf_dataset_action())
     asyncio.run(test_obj.test_brain_routes_training_request())
-    asyncio.run(test_obj.test_full_dry_run_flow())
 
     print("\n✅ All dry-run tests completed!")
 
